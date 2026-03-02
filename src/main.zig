@@ -22,7 +22,7 @@ fn defaultThreadContext() *ThreadContext {
     return &g_thread_contexts[0];
 }
 
-var g_thread_contexts: [MaxThreads]ThreadContext = undefined;
+var g_thread_contexts: [MaxThreads]ThreadContext = [_]ThreadContext{.{}} ** MaxThreads;
 var g_thread_count: usize = 0;
 var g_use_headers: bool = false;
 
