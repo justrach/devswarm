@@ -1,13 +1,13 @@
 {
-  "name": "gitagent",
+  "name": "mycelium",
   "version": "0.0.0",
-  "description": "MCP server providing AI agents with structured GitHub operations via the gh CLI",
-  "keywords": ["mcp", "github", "ai", "claude", "codex", "gitagent"],
+  "description": "Orchestrate AI coding agents (Claude Code, Codex, Gemini CLI) with GitHub ops, swarm spawning, and code graph intelligence — over MCP",
+  "keywords": ["mcp", "github", "ai", "claude", "codex", "swarm", "agents", "orchestration"],
   "homepage": "https://github.com/justrach/codedb",
   "repository": { "type": "git", "url": "https://github.com/justrach/codedb.git" },
   "license": "AGPL-3.0",
   "bin": {
-    "gitagent": "run.js",
+    "mycelium": "run.js",
     "gitagent-mcp": "run.js"
   },
   "scripts": {
