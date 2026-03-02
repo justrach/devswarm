@@ -109,6 +109,42 @@ Add to your Claude Code config (`~/.claude.json`):
 }
 ```
 
+## Distribution and Installation
+
+If you want an off-the-shelf install path (no local Zig build), track:
+
+- Homebrew tap + formula release
+- npm/bun install via a JS wrapper package that downloads matching `gitagent-mcp` binaries
+- GitHub release artifacts with checksums
+
+### Current install baseline
+
+At the moment, the repository supports source build and local run. The packaging pipeline is tracked in:
+
+- https://github.com/justrach/codedb/issues/144
+- https://github.com/justrach/codedb/issues/145
+- https://github.com/justrach/codedb/issues/146
+- https://github.com/justrach/codedb/issues/147
+
+Suggested target for end-users once packaging ships:
+
+```bash
+# Homebrew (planned)
+brew tap justrach/codedb
+brew install gitagent-mcp
+
+# npm / bun (planned)
+npm install -g @justrach/gitagent-mcp
+bun add -g @justrach/gitagent-mcp
+```
+
+Until those distributions are shipped, use source mode:
+
+```bash
+zig build
+./zig-out/bin/gitagent-mcp
+```
+
 ## Tools
 
 ### Planning
