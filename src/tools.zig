@@ -102,6 +102,8 @@ pub const Tool = enum {
     run_zig_infra,
     // Swarm — parallel multi-agent execution
     run_swarm,
+    // Iterative review-fix loop
+    review_fix_loop,
 };
 
 // ── Step 2: Tool schemas ──────────────────────────────────────────────────────
@@ -142,7 +144,8 @@ pub const tools_list =
     \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"}},"required":[]}},
     \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
-    \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"}},"required":["prompt"]}}
+    \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"}},"required":["prompt"]}},
+    \\{"name":"review_fix_loop","description":"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review criteria"},"max_iterations":{"type":"integer","description":"Maximum review-fix cycles (default 3, max 5)"}},"required":[]}}
     \\]}
 ;
 
@@ -202,6 +205,8 @@ pub fn dispatch(
         .run_zig_infra         => handleRunZigInfra(alloc, args, out),
         // Swarm
         .run_swarm             => handleRunSwarm(alloc, args, out),
+        // Iterative review-fix loop
+        .review_fix_loop       => handleReviewFixLoop(alloc, args, out),
     }
 }
 
@@ -1837,4 +1842,101 @@ fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         break :blk .read_only;
     };
     swarm.runSwarm(alloc, prompt, max_agents, out, policy);
+}
+
+fn handleReviewFixLoop(
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+) void {
+    const cas = @import("codex_appserver.zig");
+    const swarm = @import("swarm.zig");
+
+    const default_review_prompt =
+        "Review the current branch for correctness and memory safety. " ++
+        "Check: errdefer on every allocation, RwLock ordering, " ++
+        "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
+        "PPR push rule correctness, and missing test coverage. " ++
+        "Lead with concrete findings, include file:line references. " ++
+        "If you find NO issues, respond with exactly: NO_ISSUES_FOUND";
+    const review_prompt = mj.getStr(args, "prompt") orelse default_review_prompt;
+
+    const max_iter: u32 = blk: {
+        if (args.get("max_iterations")) |v| {
+            if (v == .integer and v.integer > 0)
+                break :blk @intCast(@min(v.integer, 5));
+        }
+        break :blk 3;
+    };
+
+    // Start JSON output
+    out.appendSlice(alloc, "{\"iterations\":[") catch return;
+
+    var converged = false;
+    var i: u32 = 0;
+    while (i < max_iter) : (i += 1) {
+        if (i > 0) out.appendSlice(alloc, ",") catch {};
+
+        out.appendSlice(alloc, "{\"iteration\":") catch {};
+        const iter_str = std.fmt.allocPrint(alloc, "{d}", .{i + 1}) catch "?";
+        defer alloc.free(iter_str);
+        out.appendSlice(alloc, iter_str) catch {};
+
+        // ── Phase 1: Review (read-only) ───────────────────────────────────
+        var review_out: std.ArrayList(u8) = .empty;
+        defer review_out.deinit(alloc);
+        cas.runTurnPolicy(alloc, review_prompt, &review_out, .read_only);
+
+        out.appendSlice(alloc, ",\"review\":\"") catch {};
+        mj.writeEscaped(alloc, out, review_out.items);
+        out.appendSlice(alloc, "\"") catch {};
+
+        // Check convergence: reviewer found no issues
+        const review_text = review_out.items;
+        if (std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null or
+            review_text.len == 0)
+        {
+            converged = true;
+            out.appendSlice(alloc, ",\"fix\":null}") catch {};
+            break;
+        }
+
+        // ── Phase 2: Fix (writable) ───────────────────────────────────────
+        const preamble = swarm.buildPreamble(alloc);
+        defer if (preamble.len > 0) alloc.free(preamble);
+
+        const fix_prompt = std.fmt.allocPrint(alloc,
+            "{s}" ++
+            "You are a code fixer. The following review findings were reported. " ++
+            "Fix ALL issues listed below. Use zigread to read files, zigpatch to edit, " ++
+            "and zigdiff to verify each fix. Do not introduce new functionality — " ++
+            "only fix the reported issues.\n\n" ++
+            "REVIEW FINDINGS:\n{s}",
+            .{ preamble, review_text },
+        ) catch {
+            out.appendSlice(alloc, ",\"fix\":\"OOM: fix prompt\"}") catch {};
+            break;
+        };
+        defer alloc.free(fix_prompt);
+
+        var fix_out: std.ArrayList(u8) = .empty;
+        defer fix_out.deinit(alloc);
+        cas.runTurnPolicy(alloc, fix_prompt, &fix_out, .writable);
+
+        out.appendSlice(alloc, ",\"fix\":\"") catch {};
+        mj.writeEscaped(alloc, out, fix_out.items);
+        out.appendSlice(alloc, "\"}") catch {};
+    }
+
+    // Close JSON
+    out.appendSlice(alloc, "],\"total_iterations\":") catch {};
+    const total = std.fmt.allocPrint(alloc, "{d}", .{i + @as(u32, if (converged) 1 else 0)}) catch "?";
+    defer alloc.free(total);
+    out.appendSlice(alloc, total) catch {};
+
+    if (converged) {
+        out.appendSlice(alloc, ",\"converged\":true}") catch {};
+    } else {
+        out.appendSlice(alloc, ",\"converged\":false}") catch {};
+    }
 }
