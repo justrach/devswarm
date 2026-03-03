@@ -473,17 +473,29 @@ test "agent_sdk: readLine returns null on immediate EOF" {
 
 /// Returns true if `claude` is reachable on the current PATH.
 /// Returns true if `claude` is reachable on the current PATH.
+/// Returns true if `claude` is reachable on the current PATH.
 fn claudeAvailable(alloc: std.mem.Allocator) bool {
     var probe = std.process.Child.init(&.{ "claude", "--version" }, alloc);
     probe.stdin_behavior  = .Close;
     probe.stdout_behavior = .Close;
     probe.stderr_behavior = .Close;
-    // No env_map override — inherit shell PATH so `claude` is found normally.
-    probe.spawn() catch return false;
-    const term = probe.wait() catch return false;
+    probe.spawn() catch |err| {
+        std.debug.print("\n[claudeAvailable] spawn failed: {}\n", .{err});
+        return false;
+    };
+    const term = probe.wait() catch |err| {
+        std.debug.print("\n[claudeAvailable] wait failed: {}\n", .{err});
+        return false;
+    };
     return switch (term) {
-        .Exited => |c| c == 0,
-        else    => false,
+        .Exited => |c| blk: {
+            std.debug.print("\n[claudeAvailable] exit code: {d}\n", .{c});
+            break :blk c == 0;
+        },
+        else => blk: {
+            std.debug.print("\n[claudeAvailable] unexpected term: {}\n", .{term});
+            break :blk false;
+        },
     };
 }
 
@@ -491,7 +503,13 @@ test "integration: agent_sdk round-trip — haiku replies to a simple prompt" {
     // Spawns real `claude -p`, hits the Claude API, verifies we get a response.
     // Skipped automatically when `claude` is unavailable or auth is missing.
     const alloc = std.testing.allocator;
-    if (!claudeAvailable(alloc)) return; // soft skip
+    std.debug.print("\n[integration] checking claude availability...\n", .{});
+    const available = claudeAvailable(alloc);
+    std.debug.print("[integration] available={}\n", .{available});
+    if (!available) {
+        std.debug.print("[integration] skipping — claude not found on PATH\n", .{});
+        return;
+    }
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
