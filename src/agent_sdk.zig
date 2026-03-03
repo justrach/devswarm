@@ -90,10 +90,10 @@ fn tryClaudeAgent(
         argv_buf[argc] = at;               argc += 1;
     }
 
-    if (opts.model) |m| {
-        argv_buf[argc] = "--model"; argc += 1;
-        argv_buf[argc] = m;         argc += 1;
-    }
+    // Default to sonnet-4-6; caller can override via opts.model.
+    const model = opts.model orelse "claude-sonnet-4-6";
+    argv_buf[argc] = "--model"; argc += 1;
+    argv_buf[argc] = model;     argc += 1;
 
     // Inherit the full environment but strip CLAUDECODE so that claude's
     // nested-session guard doesn't fire when running inside Claude Code.
