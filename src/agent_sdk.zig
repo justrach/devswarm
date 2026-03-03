@@ -472,16 +472,13 @@ test "agent_sdk: readLine returns null on immediate EOF" {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Returns true if `claude` is reachable on the current PATH.
+/// Returns true if `claude` is reachable on the current PATH.
 fn claudeAvailable(alloc: std.mem.Allocator) bool {
-    var env_map = std.process.getEnvMap(alloc) catch return false;
-    defer env_map.deinit();
-    env_map.remove("CLAUDECODE");
-
     var probe = std.process.Child.init(&.{ "claude", "--version" }, alloc);
     probe.stdin_behavior  = .Close;
     probe.stdout_behavior = .Close;
     probe.stderr_behavior = .Close;
-    probe.env_map = &env_map;
+    // No env_map override — inherit shell PATH so `claude` is found normally.
     probe.spawn() catch return false;
     const term = probe.wait() catch return false;
     return switch (term) {
