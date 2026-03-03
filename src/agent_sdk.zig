@@ -1,0 +1,274 @@
+// agent_sdk.zig — Claude Code CLI agent transport
+//
+// Spawns `claude -p <prompt> --output-format stream-json` to run a Claude
+// agent turn with full SDK features: tool allowlists, permission modes, and
+// streaming text extraction.
+//
+// Falls back automatically to codex_appserver.zig when `claude` is not on
+// PATH, or when AGENT_SDK_BACKEND=codex is set in the environment.
+//
+// Streaming output format (NDJSON, one object per line):
+//   {"type":"system","subtype":"init",...}
+//   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}],...},...}
+//   {"type":"result","subtype":"success","result":"<final text>",...}
+
+const std = @import("std");
+const mj  = @import("mcp").json;
+
+/// Options for a Claude agent run via `claude -p`.
+pub const AgentOptions = struct {
+    /// Comma-separated tool allowlist, e.g. "Bash,Read,Edit".
+    /// Null means all tools are permitted.
+    allowed_tools: ?[]const u8 = null,
+    /// Permission mode: "default" | "acceptEdits" | "bypassPermissions"
+    permission_mode: ?[]const u8 = null,
+    /// Override working directory (default: inherits from spawning process).
+    cwd: ?[]const u8 = null,
+    /// Convenience flag: allow file writes.
+    /// Maps to "bypassPermissions" when permission_mode is null.
+    writable: bool = false,
+};
+
+/// Run one agent turn. Writes the agent's final text reply to `out`.
+///
+/// Prefers `claude -p` (Claude Code CLI) when available.
+/// Falls back to `codex app-server` (codex_appserver.zig) otherwise.
+/// Set AGENT_SDK_BACKEND=codex to force the fallback path.
+pub fn runAgent(
+    alloc: std.mem.Allocator,
+    prompt: []const u8,
+    opts: AgentOptions,
+    out: *std.ArrayList(u8),
+) void {
+    if (tryClaudeAgent(alloc, prompt, opts, out)) return;
+    // Fallback: codex_appserver
+    const cas = @import("codex_appserver.zig");
+    const policy: cas.SandboxPolicy = if (opts.writable) .writable else .read_only;
+    cas.runTurnPolicy(alloc, prompt, out, policy);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Attempts to run the turn via `claude -p`. Returns false when claude is
+/// unavailable so the caller can fall back to codex_appserver.
+fn tryClaudeAgent(
+    alloc: std.mem.Allocator,
+    prompt: []const u8,
+    opts: AgentOptions,
+    out: *std.ArrayList(u8),
+) bool {
+    // Honour AGENT_SDK_BACKEND=codex to force the legacy codex path.
+    const backend = std.process.getEnvVarOwned(alloc, "AGENT_SDK_BACKEND") catch "";
+    defer if (backend.len > 0) alloc.free(backend);
+    if (std.mem.eql(u8, backend, "codex")) return false;
+
+    const perm_mode: []const u8 =
+        opts.permission_mode orelse if (opts.writable) "bypassPermissions" else "default";
+
+    // Build argv in a fixed-size stack buffer (12 slots is sufficient).
+    var argv_buf: [12][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = "claude";           argc += 1;
+    argv_buf[argc] = "-p";               argc += 1;
+    argv_buf[argc] = prompt;             argc += 1;
+    argv_buf[argc] = "--output-format";  argc += 1;
+    argv_buf[argc] = "stream-json";      argc += 1;
+    argv_buf[argc] = "--permission-mode"; argc += 1;
+    argv_buf[argc] = perm_mode;           argc += 1;
+
+    if (opts.allowed_tools) |at| {
+        // `--allowedTools` accepts a comma-separated list, e.g. "Bash,Read,Edit".
+        argv_buf[argc] = "--allowedTools"; argc += 1;
+        argv_buf[argc] = at;               argc += 1;
+    }
+
+    var child = std.process.Child.init(argv_buf[0..argc], alloc);
+    child.stdin_behavior  = .Close;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Close;
+    if (opts.cwd) |cwd| child.cwd = cwd;
+
+    child.spawn() catch return false;
+    defer _ = child.wait() catch {};
+    defer _ = child.kill() catch {};
+
+    const proc_out = child.stdout orelse return false;
+    streamClaudeOutput(alloc, proc_out, out);
+    return true;
+}
+
+/// Reads NDJSON from `claude -p --output-format stream-json`.
+/// Extracts the agent's final text from the `{"type":"result"}` event.
+/// Falls back to accumulated assistant-message text if no result event arrives.
+/// Reads NDJSON from `claude -p --output-format stream-json`.
+/// Extracts the agent's final text from the `{"type":"result"}` event.
+/// Falls back to accumulated assistant-message text if no result event arrives.
+fn streamClaudeOutput(
+    alloc: std.mem.Allocator,
+    file: std.fs.File,
+    out: *std.ArrayList(u8),
+) void {
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found_result = false;
+
+    while (!found_result) {
+        const line = readLine(alloc, file) orelse break;
+        defer alloc.free(line);
+        parseClaudeLine(alloc, line, out, &accumulated, &found_result);
+    }
+
+    if (!found_result and accumulated.items.len > 0) {
+        out.appendSlice(alloc, accumulated.items) catch {};
+    }
+}
+
+/// Read one newline-delimited line from `file`. Returns null on EOF or error.
+/// Caller owns the returned slice.  Lines larger than 8 MiB are dropped.
+fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
+    var buf: [1]u8 = undefined;
+    var line: std.ArrayList(u8) = .empty;
+    while (true) {
+        const n = file.read(&buf) catch { line.deinit(alloc); return null; };
+        if (n == 0) {
+            if (line.items.len == 0) { line.deinit(alloc); return null; }
+            return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+        }
+        if (buf[0] == '\n') {
+            return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+        }
+        line.append(alloc, buf[0]) catch { line.deinit(alloc); return null; };
+        if (line.items.len > 8 * 1024 * 1024) { line.deinit(alloc); return null; }
+    }
+}
+
+fn parseClaudeLine(
+    alloc: std.mem.Allocator,
+    line: []const u8,
+    out: *std.ArrayList(u8),
+    accumulated: *std.ArrayList(u8),
+    found_result: *bool,
+) void {
+    const s = std.mem.trimRight(u8, line, "\r");
+    if (s.len == 0) return;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+
+    const type_val = obj.get("type") orelse return;
+    const type_str = switch (type_val) {
+        .string => |sv| sv,
+        else => return,
+    };
+
+    if (std.mem.eql(u8, type_str, "result")) {
+        // {"type":"result","subtype":"success","result":"<final text>",...}
+        if (obj.get("result")) |rv| {
+            if (rv == .string) {
+                out.appendSlice(alloc, rv.string) catch {};
+                found_result.* = true;
+            }
+        }
+    } else if (std.mem.eql(u8, type_str, "assistant")) {
+        // Accumulate assistant text as fallback when result event is absent.
+        extractAssistantText(alloc, obj, accumulated);
+    }
+}
+
+fn extractAssistantText(
+    alloc: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    buf: *std.ArrayList(u8),
+) void {
+    const msg = obj.get("message") orelse return;
+    if (msg != .object) return;
+    const content = msg.object.get("content") orelse return;
+    if (content != .array) return;
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        const t = item.object.get("type") orelse continue;
+        if (t != .string or !std.mem.eql(u8, t.string, "text")) continue;
+        const text = item.object.get("text") orelse continue;
+        if (text != .string) continue;
+        buf.appendSlice(alloc, text.string) catch {};
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+test "agent_sdk: parseClaudeLine extracts result text" {
+    const alloc = std.testing.allocator;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found = false;
+
+    const line =
+        \\{"type":"result","subtype":"success","is_error":false,"result":"Hello world","session_id":"s1"}
+    ;
+    parseClaudeLine(alloc, line, &out, &accumulated, &found);
+
+    try std.testing.expect(found);
+    try std.testing.expectEqualStrings("Hello world", out.items);
+}
+
+test "agent_sdk: parseClaudeLine accumulates assistant text" {
+    const alloc = std.testing.allocator;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found = false;
+
+    const line =
+        \\{"type":"assistant","message":{"id":"m1","type":"message","role":"assistant","content":[{"type":"text","text":"partial response"}],"stop_reason":null},"session_id":"s1"}
+    ;
+    parseClaudeLine(alloc, line, &out, &accumulated, &found);
+
+    try std.testing.expect(!found);
+    try std.testing.expect(out.items.len == 0);
+    try std.testing.expectEqualStrings("partial response", accumulated.items);
+}
+
+test "agent_sdk: parseClaudeLine ignores system init events" {
+    const alloc = std.testing.allocator;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found = false;
+
+    parseClaudeLine(alloc,
+        \\{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}
+    , &out, &accumulated, &found);
+
+    try std.testing.expect(!found);
+    try std.testing.expect(out.items.len == 0);
+    try std.testing.expect(accumulated.items.len == 0);
+}
+
+test "agent_sdk: parseClaudeLine handles malformed JSON gracefully" {
+    const alloc = std.testing.allocator;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found = false;
+
+    parseClaudeLine(alloc, "not json at all", &out, &accumulated, &found);
+
+    try std.testing.expect(!found);
+    try std.testing.expect(out.items.len == 0);
+}
