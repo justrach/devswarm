@@ -453,10 +453,19 @@ fn handleCreateIssue(
     argv.appendSlice(alloc, &.{ "gh", "issue", "create", "--repo", currentRepo(), "--title", title, "--body", body }) catch return;
 
     var has_status = false;
+    // Track skipped labels for warnings
+    var skipped: std.ArrayList([]const u8) = .empty;
+    defer skipped.deinit(alloc);
+
     if (args.get("labels")) |lv| {
         if (lv == .array) {
             for (lv.array.items) |lbl| {
                 if (lbl != .string) continue;
+                // Check if label exists in the repo cache; skip if missing
+                if (cache.getLabel(lbl.string) == null and !std.mem.startsWith(u8, lbl.string, "status:") and !std.mem.startsWith(u8, lbl.string, "priority:")) {
+                    skipped.appendSlice(alloc, &.{lbl.string}) catch {};
+                    continue;
+                }
                 argv.appendSlice(alloc, &.{ "--label", lbl.string }) catch return;
                 if (std.mem.startsWith(u8, lbl.string, "status:")) has_status = true;
             }
@@ -489,7 +498,20 @@ fn handleCreateIssue(
     mj.writeEscaped(alloc, out, url);
     out.appendSlice(alloc, "\",\"title\":\"") catch return;
     mj.writeEscaped(alloc, out, title);
-    out.appendSlice(alloc, "\"}") catch {};
+    out.appendSlice(alloc, "\"") catch {};
+
+    // Include warnings for skipped labels
+    if (skipped.items.len > 0) {
+        out.appendSlice(alloc, ",\"warnings\":[") catch {};
+        for (skipped.items, 0..) |s, i| {
+            if (i > 0) out.appendSlice(alloc, ",") catch {};
+            out.appendSlice(alloc, "\"label not found: ") catch {};
+            mj.writeEscaped(alloc, out, s);
+            out.appendSlice(alloc, "\"") catch {};
+        }
+        out.appendSlice(alloc, "]") catch {};
+    }
+    out.appendSlice(alloc, "}") catch {};
 }
 
 fn handleCreateIssuesBatch(
@@ -2075,6 +2097,50 @@ fn handleRunAgent(
         return;
     };
 
+    // Build context-enriched prompt: branch, issue, recent commits
+    const enriched = blk: {
+        var ctx: std.ArrayList(u8) = .empty;
+        defer ctx.deinit(alloc);
+
+        // Current branch
+        if (gh.run(alloc, &.{ "git", "branch", "--show-current" })) |br| {
+            defer br.deinit(alloc);
+            const branch = std.mem.trim(u8, br.stdout, " \t\n\r");
+            if (branch.len > 0) {
+                ctx.appendSlice(alloc, "CONTEXT: branch=") catch {};
+                ctx.appendSlice(alloc, branch) catch {};
+                // Parse issue number from branch name
+                if (state.parseIssueNumber(branch)) |n| {
+                    var nb: [16]u8 = undefined;
+                    const ns = std.fmt.bufPrint(&nb, ", issue=#{d}", .{n}) catch "";
+                    ctx.appendSlice(alloc, ns) catch {};
+                }
+                ctx.appendSlice(alloc, "\n") catch {};
+            }
+        } else |_| {}
+
+        // Recent commits
+        if (gh.run(alloc, &.{ "git", "log", "-3", "--oneline" })) |lr| {
+            defer lr.deinit(alloc);
+            const log = std.mem.trim(u8, lr.stdout, " \t\n\r");
+            if (log.len > 0) {
+                ctx.appendSlice(alloc, "RECENT COMMITS:\n") catch {};
+                ctx.appendSlice(alloc, log) catch {};
+                ctx.appendSlice(alloc, "\n") catch {};
+            }
+        } else |_| {}
+
+        if (ctx.items.len > 0) {
+            ctx.appendSlice(alloc, "\n") catch {};
+            ctx.appendSlice(alloc, prompt) catch {};
+            break :blk alloc.dupe(u8, ctx.items) catch null;
+        }
+        break :blk null;
+    };
+    defer if (enriched) |e| alloc.free(e);
+
+    const final_prompt = enriched orelse prompt;
+
     const opts: sdk.AgentOptions = .{
         .allowed_tools   = mj.getStr(args, "allowed_tools"),
         .permission_mode = mj.getStr(args, "permission_mode"),
@@ -2087,5 +2153,5 @@ fn handleRunAgent(
         },
     };
 
-    sdk.runAgent(alloc, prompt, opts, out);
+    sdk.runAgent(alloc, final_prompt, opts, out);
 }
