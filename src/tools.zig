@@ -104,6 +104,8 @@ pub const Tool = enum {
     run_swarm,
     // Iterative review-fix loop
     review_fix_loop,
+    // Claude Agent SDK — single agent turn with tool/permission controls
+    run_agent,
 };
 
 // ── Step 2: Tool schemas ──────────────────────────────────────────────────────
@@ -145,7 +147,8 @@ pub const tools_list =
     \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
     \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"}},"required":["prompt"]}},
-    \\{"name":"review_fix_loop","description":"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review criteria"},"max_iterations":{"type":"integer","description":"Maximum review-fix cycles (default 3, max 5)"}},"required":[]}}
+    \\{"name":"review_fix_loop","description":"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review criteria"},"max_iterations":{"type":"integer","description":"Maximum review-fix cycles (default 3, max 5)"}},"required":[]}},
+    \\{"name":"run_agent","description":"Run a single Claude agent turn via the Claude Code CLI (`claude -p`). Supports tool allowlists, permission modes, and model selection. Falls back to codex app-server if `claude` is not on PATH. Set AGENT_SDK_BACKEND=codex to force the legacy backend.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The task or question for the agent"},"model":{"type":"string","description":"Model alias or full ID (default: claude-sonnet-4-6). Use \"opus\" or \"claude-opus-4-6\" for hardest tasks, \"haiku\" for fast/cheap."},"allowed_tools":{"type":"string","description":"Comma-separated Claude Code tool allowlist, e.g. \"Bash,Read,Edit\". Omit to allow all tools."},"permission_mode":{"type":"string","enum":["default","acceptEdits","bypassPermissions"],"description":"Permission mode for file and shell operations"},"writable":{"type":"boolean","description":"Allow file writes (maps to bypassPermissions when permission_mode is unset)"},"cwd":{"type":"string","description":"Working directory override (default: current repo path)"}},"required":["prompt"]}}
     \\]}
 ;
 
@@ -207,6 +210,8 @@ pub fn dispatch(
         .run_swarm             => handleRunSwarm(alloc, args, out),
         // Iterative review-fix loop
         .review_fix_loop       => handleReviewFixLoop(alloc, args, out),
+        // Claude Agent SDK
+        .run_agent             => handleRunAgent(alloc, args, out),
     }
 }
 
@@ -1956,4 +1961,31 @@ fn handleReviewFixLoop(
     } else {
         out_json.appendSlice(alloc, ",\"converged\":false}") catch return;
     }
+}
+
+fn handleRunAgent(
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+) void {
+    const sdk = @import("agent_sdk.zig");
+
+    const prompt = mj.getStr(args, "prompt") orelse {
+        writeErr(alloc, out, "run_agent requires a prompt argument");
+        return;
+    };
+
+    const opts: sdk.AgentOptions = .{
+        .allowed_tools   = mj.getStr(args, "allowed_tools"),
+        .permission_mode = mj.getStr(args, "permission_mode"),
+        .cwd             = mj.getStr(args, "cwd"),
+        .model           = mj.getStr(args, "model"),
+        .writable        = blk: {
+            if (args.get("writable")) |v|
+                if (v == .bool) break :blk v.bool;
+            break :blk false;
+        },
+    };
+
+    sdk.runAgent(alloc, prompt, opts, out);
 }
