@@ -32,7 +32,11 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // zig build test
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const test_filter = b.option([]const u8, "test-filter", "Filter tests by name substring");
+    const exe_tests = b.addTest(.{
+        .root_module = exe.root_module,
+        .filters     = if (test_filter) |f| &.{f} else &.{},
+    });
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
