@@ -34,12 +34,20 @@ const WRITABLE_PREAMBLE =
     \\  zigcreate FILE --content "..."   # create new file
     \\  zigdiff FILE                     # verify edit landed correctly
     \\
+    \\CODEDB GRAPH TOOLS (if codedb binary is on PATH):
+    \\  codedb outline FILE              # structural outline with symbols
+    \\  codedb deps FILE                 # reverse dependencies (who imports this file)
+    \\  codedb symbol NAME               # find all definitions of a symbol
+    \\  codedb search "query"            # full-text search across indexed files
+    \\  codedb hot                       # recently modified files
+    \\
     \\RULES:
     \\  - NEVER use sed, awk, patch, tee, echo/printf redirects (>, >>), or heredocs to write files
     \\  - NEVER write raw diff/patch syntax into source files
     \\  - Always zigread before zigpatch; always zigdiff after zigpatch
     \\  - One focused change per file; do not rewrite files wholesale
     \\  - Cite file:line for every finding
+    \\  - Prefer zigpatch -s SYMBOL for multi-iteration edits (immune to line drift)
     \\
     \\MCP TOOLS (available when muonry is in ~/.codex/config.toml): mcp__muonry__read, mcp__muonry__search, mcp__muonry__edit
     \\
@@ -180,6 +188,22 @@ pub fn runSwarm(
         if (w.allocated_prompt) |p| alloc.free(p);
     }
 
+    // ── Phase 3b: Capture file manifest for writable swarms ──────────────
+    var manifest: []const u8 = "";
+    var manifest_alloc: ?[]u8 = null;
+    defer if (manifest_alloc) |m| alloc.free(m);
+    if (policy == .writable) {
+        const gh = @import("gh.zig");
+        if (gh.run(alloc, &.{ "git", "diff", "--stat", "HEAD" })) |dr| {
+            defer dr.deinit(alloc);
+            const trimmed = std.mem.trim(u8, dr.stdout, " \t\n\r");
+            if (trimmed.len > 0) {
+                manifest_alloc = alloc.dupe(u8, trimmed) catch null;
+                if (manifest_alloc) |m| manifest = m;
+            }
+        } else |_| {}
+    }
+
     // ── Phase 4: Build synthesis prompt from worker results ───────────────
     var synth: std.ArrayList(u8) = .empty;
     defer synth.deinit(alloc);
@@ -198,6 +222,13 @@ pub fn runSwarm(
         synth.appendSlice(alloc, w.out.items) catch {};
         synth.appendSlice(alloc, "\n\n") catch {};
         w.out.deinit(std.heap.page_allocator);
+    }
+
+    // Include file manifest in synthesis if available
+    if (manifest.len > 0) {
+        synth.appendSlice(alloc, "## Files Changed\n```\n") catch {};
+        synth.appendSlice(alloc, manifest) catch {};
+        synth.appendSlice(alloc, "\n```\n\n") catch {};
     }
 
     synth.appendSlice(alloc, "Synthesize the above into a final answer.") catch {};
