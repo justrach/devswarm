@@ -68,6 +68,7 @@ pub const ResolvedAgent = struct {
     system_prompt: []const u8,   // assembled: role + mode + tool preamble
     writable: bool,
     allowed_tools: ?[]const u8,
+    permission_mode: ?[]const u8,
     max_turns: ?u32,
     cwd: ?[]const u8,
     mode: AgentMode,

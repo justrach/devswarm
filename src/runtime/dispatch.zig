@@ -37,8 +37,9 @@ fn spawnClaude(
 ) void {
     const sdk = @import("../agent_sdk.zig");
 
-    const perm_mode: []const u8 =
-        if (resolved.writable) "bypassPermissions" else "default";
+    const perm_mode =
+        resolved.permission_mode orelse
+        (if (resolved.writable) "bypassPermissions" else "default");
 
     const opts: sdk.AgentOptions = .{
         .model           = resolved.model,

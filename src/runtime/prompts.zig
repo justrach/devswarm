@@ -89,8 +89,19 @@ pub fn toolPreamble(tier: ToolTier) []const u8 {
     };
 }
 
+/// Static marker for prompt-assembly OOM fallback.
+/// Not allocator-owned; callers must not free it.
+pub const ASSEMBLE_OOM_SENTINEL = "__PROMPTS_ASSEMBLE_OOM__";
+
+/// Free a prompt produced by assemble().
+/// Skips the static OOM sentinel.
+pub fn freeAssembled(alloc: std.mem.Allocator, prompt: []const u8) void {
+    if (prompt.ptr == ASSEMBLE_OOM_SENTINEL.ptr and prompt.len == ASSEMBLE_OOM_SENTINEL.len) return;
+    alloc.free(prompt);
+}
+
 /// Assemble the full system prompt from role + mode + tool tier.
-/// Caller owns the returned slice.
+/// Caller owns the returned slice unless the OOM sentinel is returned.
 pub fn assemble(
     alloc: std.mem.Allocator,
     role_name: ?[]const u8,
@@ -113,7 +124,7 @@ pub fn assemble(
     return std.fmt.allocPrint(alloc,
         "{s}\n{s}\n\n{s}\nTask:\n",
         .{ role_prompt, mode_line, tool_pre },
-    ) catch alloc.dupe(u8, tool_pre) catch "";
+    ) catch alloc.dupe(u8, tool_pre) catch ASSEMBLE_OOM_SENTINEL;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -132,7 +143,7 @@ test "prompts: toolPreamble returns correct preamble for each tier" {
 test "prompts: assemble includes role, mode, and tools" {
     const alloc = std.testing.allocator;
     const result = assemble(alloc, "finder", .smart, .zig_tools);
-    defer alloc.free(result);
+    defer freeAssembled(alloc, result);
 
     // Should contain role prompt
     try std.testing.expect(std.mem.indexOf(u8, result, "code finder") != null);
@@ -145,7 +156,7 @@ test "prompts: assemble includes role, mode, and tools" {
 test "prompts: assemble with null role still includes mode and tools" {
     const alloc = std.testing.allocator;
     const result = assemble(alloc, null, .rush, .standard);
-    defer alloc.free(result);
+    defer freeAssembled(alloc, result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "fast") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "rg") != null);
@@ -154,8 +165,7 @@ test "prompts: assemble with null role still includes mode and tools" {
 test "prompts: assemble with unknown role falls back gracefully" {
     const alloc = std.testing.allocator;
     const result = assemble(alloc, "nonexistent_role", .deep, .zig_tools);
-    defer alloc.free(result);
-
+    defer freeAssembled(alloc, result);
     // Should still have mode + tools, just no role prompt
     try std.testing.expect(std.mem.indexOf(u8, result, "thorough") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "zigrep") != null);

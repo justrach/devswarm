@@ -222,7 +222,7 @@ pub const tools_list =
     \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"}},"required":["prompt"]}},
     \\{"name":"review_fix_loop","description":"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review criteria"},"max_iterations":{"type":"integer","description":"Maximum review-fix cycles (default 3, max 5)"}},"required":[]}},
     \\{"name":"run_agent","description":"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The task or question for the agent"},"model":{"type":"string","description":"Model alias or full ID (default: claude-sonnet-4-6). Use \"opus\" for hardest tasks, \"haiku\" for fast/cheap."},"role":{"type":"string","description":"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor"},"mode":{"type":"string","enum":["smart","rush","deep","free"],"description":"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)"},"allowed_tools":{"type":"string","description":"Comma-separated tool allowlist, e.g. \"Bash,Read,Edit\". Omit to allow all tools."},"permission_mode":{"type":"string","enum":["default","acceptEdits","bypassPermissions"],"description":"Permission mode for file and shell operations"},"writable":{"type":"boolean","description":"Allow file writes (maps to bypassPermissions when permission_mode is unset)"},"cwd":{"type":"string","description":"Working directory override (default: current repo path)"}},"required":["prompt"]}},
-    \\{"name":"run_task","description":"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Task description — what needs to be done"},"preset":{"type":"string","enum":["finder_fixer","reviewer_fixer","explore_report","architect_build","custom"],"description":"Chain preset (default: auto-select based on task)"},"mode":{"type":"string","enum":["smart","rush","deep","free"],"description":"Agent mode for all agents in the chain"},"max_agents":{"type":"integer","description":"Max agents to spawn (default: preset-determined)"},"writable":{"type":"boolean","description":"Override write access (default: role-determined)"}},"required":["task"]}}
+    \\{"name":"run_task","description":"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Task description — what needs to be done"},"preset":{"type":"string","enum":["finder_fixer","reviewer_fixer","explore_report","architect_build","custom"],"description":"Chain preset (default: auto-select based on task)"},"mode":{"type":"string","enum":["smart","rush","deep","free"],"description":"Agent mode for all agents in the chain"},"max_agents":{"type":"integer","description":"Max agents to spawn (default: preset-determined)"},"writable":{"type":"boolean","description":"Override write access (default: role-determined)"},"permission_mode":{"type":"string","enum":["default","acceptEdits","bypassPermissions"],"description":"Permission mode for file and shell operations"}},"required":["task"]}}
     \\]}
 ;
 
@@ -2237,13 +2237,14 @@ fn handleRunAgent(
 
     // Build AgentRequest from MCP params
     const req: rt.AgentRequest = .{
-        .prompt        = final_prompt,
-        .role          = mj.getStr(args, "role"),
-        .mode          = mj.getStr(args, "mode"),
-        .model         = mj.getStr(args, "model"),
-        .allowed_tools = mj.getStr(args, "allowed_tools"),
-        .cwd           = mj.getStr(args, "cwd"),
-        .writable      = blk: {
+        .prompt          = final_prompt,
+        .role            = mj.getStr(args, "role"),
+        .mode            = mj.getStr(args, "mode"),
+        .model           = mj.getStr(args, "model"),
+        .allowed_tools   = mj.getStr(args, "allowed_tools"),
+        .permission_mode = mj.getStr(args, "permission_mode"),
+        .cwd             = mj.getStr(args, "cwd"),
+        .writable        = blk: {
             if (args.get("writable")) |v|
                 if (v == .bool) break :blk v.bool;
             break :blk null;
@@ -2252,7 +2253,7 @@ fn handleRunAgent(
 
     // resolve() picks backend + model + tools; dispatch() spawns
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
-    defer alloc.free(resolved.system_prompt);
+    defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
 
     rt.dispatch.dispatch(alloc, resolved, final_prompt, out);
 }
@@ -2282,18 +2283,20 @@ fn runChainStep(
     role: []const u8,
     mode: ?[]const u8,
     writable_override: ?bool,
+    permission_mode: ?[]const u8,
     prompt: []const u8,
     step_out: *std.ArrayList(u8),
 ) void {
     const rt = @import("runtime.zig");
     const req: rt.AgentRequest = .{
-        .prompt  = prompt,
-        .role    = role,
-        .mode    = mode,
-        .writable = writable_override,
+        .prompt          = prompt,
+        .role            = role,
+        .mode            = mode,
+        .writable        = writable_override,
+        .permission_mode = permission_mode,
     };
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
-    defer alloc.free(resolved.system_prompt);
+    defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
     rt.dispatch.dispatch(alloc, resolved, prompt, step_out);
 }
 
@@ -2313,6 +2316,7 @@ fn handleRunTask(
             if (v == .bool) break :blk v.bool;
         break :blk null;
     };
+    const permission_mode = mj.getStr(args, "permission_mode");
 
     // Determine preset
     const preset: ChainPreset = blk: {
@@ -2347,42 +2351,45 @@ fn handleRunTask(
             ) catch task;
             defer if (finder_prompt.ptr != task.ptr) alloc.free(finder_prompt);
 
-            runChainStep(alloc, "finder", mode, false, finder_prompt, &finder_out);
+            runChainStep(alloc, "finder", mode, false, permission_mode, finder_prompt, &finder_out);
 
             out.appendSlice(alloc, "{\"role\":\"finder\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, finder_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
-            // Step 2: fixer (writable) — apply changes based on findings
-            var fixer_out: std.ArrayList(u8) = .empty;
-            defer fixer_out.deinit(alloc);
+            if (std.mem.trim(u8, finder_out.items, " \t\n\r").len == 0) {
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: finder returned empty output\"}") catch return;
+            } else {
+                // Step 2: fixer (writable) — apply changes based on findings
+                var fixer_out: std.ArrayList(u8) = .empty;
+                defer fixer_out.deinit(alloc);
+                const fixer_prompt = std.fmt.allocPrint(alloc,
+                    "Fix the following task based on these findings. " ++
+                    "Read files before editing, verify each edit.\n\n" ++
+                    "TASK: {s}\n\nFINDINGS:\n{s}", .{ task, finder_out.items },
+                ) catch task;
+                defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-            const fixer_prompt = std.fmt.allocPrint(alloc,
-                "Fix the following task based on these findings. " ++
-                "Read files before editing, verify each edit.\n\n" ++
-                "TASK: {s}\n\nFINDINGS:\n{s}", .{ task, finder_out.items },
-            ) catch task;
-            defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
+                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, &fixer_out);
 
-            runChainStep(alloc, "fixer", mode, writable_override orelse true, fixer_prompt, &fixer_out);
-
-            out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
-            mj.writeEscaped(alloc, out, fixer_out.items);
-            out.appendSlice(alloc, "\"}") catch return;
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
+                mj.writeEscaped(alloc, out, fixer_out.items);
+                out.appendSlice(alloc, "\"}") catch return;
+            }
         },
         .reviewer_fixer => {
             // Step 1: reviewer (read-only) — find issues
             var review_out: std.ArrayList(u8) = .empty;
             defer review_out.deinit(alloc);
 
-            runChainStep(alloc, "reviewer", mode, false, task, &review_out);
+            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
             // Check convergence
-            if (std.mem.indexOf(u8, review_out.items, "NO_ISSUES_FOUND") != null) {
+            if (std.mem.indexOf(u8, review_out.items, "NO_ISSUES_FOUND") != null or std.mem.trim(u8, review_out.items, " \t\n\r").len == 0) {
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"No issues to fix\"}") catch return;
             } else {
                 // Step 2: fixer (writable) — fix found issues
@@ -2394,7 +2401,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                runChainStep(alloc, "fixer", mode, writable_override orelse true, fixer_prompt, &fixer_out);
+                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, &fixer_out);
 
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2406,34 +2413,37 @@ fn handleRunTask(
             var explore_out: std.ArrayList(u8) = .empty;
             defer explore_out.deinit(alloc);
 
-            runChainStep(alloc, "explorer", mode, false, task, &explore_out);
+            runChainStep(alloc, "explorer", mode, false, permission_mode, task, &explore_out);
 
             out.appendSlice(alloc, "{\"role\":\"explorer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, explore_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
-            // Step 2: synthesizer (read-only) — summarize findings
-            var synth_out: std.ArrayList(u8) = .empty;
-            defer synth_out.deinit(alloc);
+            if (std.mem.trim(u8, explore_out.items, " \t\n\r").len == 0) {
+                out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"Skipped: explorer returned empty output\"}") catch return;
+            } else {
+                // Step 2: synthesizer (read-only) — summarize findings
+                var synth_out: std.ArrayList(u8) = .empty;
+                defer synth_out.deinit(alloc);
+                const synth_prompt = std.fmt.allocPrint(alloc,
+                    "Synthesize these exploration findings into a clear report.\n\n" ++
+                    "TASK: {s}\n\nFINDINGS:\n{s}", .{ task, explore_out.items },
+                ) catch task;
+                defer if (synth_prompt.ptr != task.ptr) alloc.free(synth_prompt);
 
-            const synth_prompt = std.fmt.allocPrint(alloc,
-                "Synthesize these exploration findings into a clear report.\n\n" ++
-                "TASK: {s}\n\nFINDINGS:\n{s}", .{ task, explore_out.items },
-            ) catch task;
-            defer if (synth_prompt.ptr != task.ptr) alloc.free(synth_prompt);
+                runChainStep(alloc, "synthesizer", mode, false, permission_mode, synth_prompt, &synth_out);
 
-            runChainStep(alloc, "synthesizer", mode, false, synth_prompt, &synth_out);
-
-            out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"") catch return;
-            mj.writeEscaped(alloc, out, synth_out.items);
-            out.appendSlice(alloc, "\"}") catch return;
+                out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"") catch return;
+                mj.writeEscaped(alloc, out, synth_out.items);
+                out.appendSlice(alloc, "\"}") catch return;
+            }
         },
         .architect_build => {
             // Step 1: architect (read-only) — design plan
             var arch_out: std.ArrayList(u8) = .empty;
             defer arch_out.deinit(alloc);
 
-            runChainStep(alloc, "architect", "deep", false, task, &arch_out);
+            runChainStep(alloc, "architect", "deep", false, permission_mode, task, &arch_out);
 
             out.appendSlice(alloc, "{\"role\":\"architect\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, arch_out.items);
@@ -2449,7 +2459,7 @@ fn handleRunTask(
             ) catch task;
             defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-            runChainStep(alloc, "fixer", mode, writable_override orelse true, fixer_prompt, &fixer_out);
+            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, &fixer_out);
 
             out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2459,7 +2469,7 @@ fn handleRunTask(
             var review_out: std.ArrayList(u8) = .empty;
             defer review_out.deinit(alloc);
 
-            runChainStep(alloc, "reviewer", mode, false, task, &review_out);
+            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
@@ -2470,7 +2480,7 @@ fn handleRunTask(
             var step_out: std.ArrayList(u8) = .empty;
             defer step_out.deinit(alloc);
 
-            runChainStep(alloc, "fixer", mode, writable_override orelse true, task, &step_out);
+            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, task, &step_out);
 
             out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, step_out.items);

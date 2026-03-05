@@ -41,9 +41,9 @@ pub fn probe(alloc: std.mem.Allocator) Backends {
     if (g_probed) return g_backends;
 
     // Check for AGENT_SDK_BACKEND=codex override
-    const env_backend = std.process.getEnvVarOwned(alloc, "AGENT_SDK_BACKEND") catch "";
-    defer if (env_backend.len > 0) alloc.free(env_backend);
-
+    const env_backend_owned = std.process.getEnvVarOwned(alloc, "AGENT_SDK_BACKEND") catch null;
+    defer if (env_backend_owned) |v| alloc.free(v);
+    const env_backend = env_backend_owned orelse "";
     if (std.mem.eql(u8, env_backend, "codex")) {
         // User explicitly wants codex only
         g_backends.codex = true;
@@ -57,9 +57,9 @@ pub fn probe(alloc: std.mem.Allocator) Backends {
         g_backends.claude = true;
     } else |_| {
         // Try via login shell (same pattern as agent_sdk.zig)
-        const shell = std.process.getEnvVarOwned(alloc, "SHELL") catch
-            alloc.dupe(u8, "/bin/zsh") catch "";
-        defer if (shell.len > 0) alloc.free(shell);
+        const shell_owned = std.process.getEnvVarOwned(alloc, "SHELL") catch null;
+        defer if (shell_owned) |sh| alloc.free(sh);
+        const shell = shell_owned orelse "/bin/zsh";
         if (shell.len > 0) {
             if (gh.run(alloc, &.{ shell, "-lc", "claude --version" })) |r| {
                 r.deinit(alloc);
@@ -73,9 +73,9 @@ pub fn probe(alloc: std.mem.Allocator) Backends {
         r.deinit(alloc);
         g_backends.codex = true;
     } else |_| {
-        const shell = std.process.getEnvVarOwned(alloc, "SHELL") catch
-            alloc.dupe(u8, "/bin/zsh") catch "";
-        defer if (shell.len > 0) alloc.free(shell);
+        const shell_owned = std.process.getEnvVarOwned(alloc, "SHELL") catch null;
+        defer if (shell_owned) |sh| alloc.free(sh);
+        const shell = shell_owned orelse "/bin/zsh";
         if (shell.len > 0) {
             if (gh.run(alloc, &.{ shell, "-lc", "codex --version" })) |r| {
                 r.deinit(alloc);

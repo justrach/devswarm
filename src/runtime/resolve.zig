@@ -89,14 +89,17 @@ pub fn resolve(
         break :blk null;
     };
 
-    // 7. Resolve max_turns
+    // 7. Resolve permission mode (explicit MCP param only)
+    const permission_mode: ?[]const u8 = request.permission_mode;
+
+    // 8. Resolve max_turns
     const max_turns: ?u32 = blk: {
         if (request.max_turns) |mt| break :blk mt;
         if (role_spec) |rs| break :blk rs.max_turns;
         break :blk null;
     };
 
-    // 8. Assemble system prompt
+    // 9. Assemble system prompt
     const system_prompt = prompts.assemble(
         alloc,
         request.role,
@@ -105,15 +108,16 @@ pub fn resolve(
     );
 
     return .{
-        .backend       = backend,
-        .model         = model,
-        .system_prompt = system_prompt,
-        .writable      = writable,
-        .allowed_tools = allowed_tools,
-        .max_turns     = max_turns,
-        .cwd           = request.cwd,
-        .mode          = mode,
-        .role          = request.role,
+        .backend         = backend,
+        .model           = model,
+        .system_prompt   = system_prompt,
+        .writable        = writable,
+        .allowed_tools   = allowed_tools,
+        .permission_mode = permission_mode,
+        .max_turns       = max_turns,
+        .cwd             = request.cwd,
+        .mode            = mode,
+        .role            = request.role,
     };
 }
 
@@ -133,7 +137,7 @@ test "resolve: default mode is smart, default model is sonnet" {
     const tools = ToolAvailability{};
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expectEqual(AgentMode.smart, r.mode);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", r.model);
@@ -148,7 +152,7 @@ test "resolve: explicit mode=deep uses opus" {
     const tools = ToolAvailability{};
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expectEqual(AgentMode.deep, r.mode);
     try std.testing.expectEqualStrings("claude-opus-4-6", r.model);
@@ -161,7 +165,7 @@ test "resolve: role=fixer sets writable" {
     const tools = ToolAvailability{};
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expect(r.writable);
     try std.testing.expectEqualStrings("fixer", r.role.?);
@@ -174,7 +178,7 @@ test "resolve: explicit writable=false overrides role" {
     const tools = ToolAvailability{};
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expect(!r.writable);
 }
@@ -186,7 +190,7 @@ test "resolve: model alias 'opus' expands to full ID" {
     const tools = ToolAvailability{};
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expectEqualStrings("claude-opus-4-6", r.model);
 }
@@ -199,7 +203,7 @@ test "resolve: grid overrides mode for known roles" {
     const tools = ToolAvailability{};
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expectEqualStrings("claude-opus-4-6", r.model);
     try std.testing.expectEqual(AgentMode.rush, r.mode);
@@ -212,7 +216,7 @@ test "resolve: falls back to codex when only codex available" {
     const tools = ToolAvailability{};
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expectEqual(Backend.codex, r.backend);
 }
@@ -226,7 +230,7 @@ test "resolve: system prompt includes tool preamble for zig_tools tier" {
     };
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, r.system_prompt, "zigrep") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.system_prompt, "code finder") != null);
@@ -239,7 +243,7 @@ test "resolve: system prompt falls back to standard tools" {
     const tools = ToolAvailability{ .has_rg = true };
 
     const r = resolve(alloc, req, backends, tools);
-    defer alloc.free(r.system_prompt);
+    defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, r.system_prompt, "rg") != null);
 }
