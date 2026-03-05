@@ -1963,13 +1963,15 @@ fn writeErr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: []const u8) 
 // `-c mcp_servers={}` prevents the inner Codex from starting unnecessary MCP
 // servers (including gitagent-mcp itself), keeping the subprocess fast.
 
-fn runCodexAgent(
+fn runAgentWithRole(
     alloc:  std.mem.Allocator,
+    role:   []const u8,
+    mode:   ?[]const u8,
+    writable_flag: ?bool,
     prompt: []const u8,
     out:    *std.ArrayList(u8),
 ) void {
-    const cas = @import("codex_appserver.zig");
-    cas.runTurn(alloc, prompt, out);
+    runChainStep(alloc, role, mode, writable_flag, null, prompt, out);
 }
 
 fn handleRunReviewer(
@@ -1983,7 +1985,7 @@ fn handleRunReviewer(
         "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
         "PPR push rule correctness, and missing test coverage. " ++
         "Lead with concrete findings, include file:line references.";
-    runCodexAgent(alloc, prompt, out);
+    runAgentWithRole(alloc, "reviewer", null, false, prompt, out);
 }
 
 fn handleRunExplorer(
@@ -1995,7 +1997,7 @@ fn handleRunExplorer(
         writeErr(alloc, out, "run_explorer requires a prompt argument");
         return;
     };
-    runCodexAgent(alloc, prompt, out);
+    runAgentWithRole(alloc, "explorer", null, false, prompt, out);
 }
 
 fn handleRunZigInfra(
@@ -2008,7 +2010,7 @@ fn handleRunZigInfra(
         "every module with tests is wired into test_step, no circular deps exist in " ++
         "types->graph->ppr / types->edge_weights / graph+types->ingest->registry. " ++
         "Flag any @import(\"../path\") that crosses module boundaries.";
-    runCodexAgent(alloc, prompt, out);
+    runAgentWithRole(alloc, "fixer", "smart", true, prompt, out);
 }
 
 fn handleSetRepo(
@@ -2045,7 +2047,6 @@ fn handleSetRepo(
 
 fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
     const swarm = @import("swarm.zig");
-    const cas   = @import("codex_appserver.zig");
     const prompt = mj.getStr(args, "prompt") orelse {
         writeErr(alloc, out, "missing required argument: prompt");
         return;
@@ -2056,13 +2057,13 @@ fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         }
         break :blk 5;
     };
-    const policy: cas.SandboxPolicy = blk: {
+    const writable: bool = blk: {
         if (args.get("writable")) |v| {
-            if (v == .bool and v.bool) break :blk .writable;
+            if (v == .bool) break :blk v.bool;
         }
-        break :blk .read_only;
+        break :blk false;
     };
-    swarm.runSwarm(alloc, prompt, max_agents, out, policy);
+    swarm.runSwarm(alloc, prompt, max_agents, out, writable);
 }
 
 fn handleReviewFixLoop(
@@ -2070,9 +2071,6 @@ fn handleReviewFixLoop(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
-    const cas = @import("codex_appserver.zig");
-    const swarm = @import("swarm.zig");
-
     const default_review_prompt =
         "Review the current branch for correctness and memory safety. " ++
         "Check: errdefer on every allocation, RwLock ordering, " ++
@@ -2092,8 +2090,6 @@ fn handleReviewFixLoop(
 
     var out_json: std.ArrayList(u8) = .empty;
     defer {
-        // Always flush whatever we have to `out`, even on early exit.
-        // This guarantees the caller gets partial JSON rather than nothing.
         if (out_json.items.len > 0)
             out.appendSlice(alloc, out_json.items) catch {};
         out_json.deinit(alloc);
@@ -2102,7 +2098,6 @@ fn handleReviewFixLoop(
     var converged = false;
     var completed: u32 = 0;
 
-    // Start JSON output
     out_json.appendSlice(alloc, "{\"iterations\":[") catch return;
 
     var i: u32 = 0;
@@ -2115,11 +2110,11 @@ fn handleReviewFixLoop(
         iter_json.appendSlice(alloc, "{\"iteration\":") catch return;
         iter_json.writer(alloc).print("{d}", .{i + 1}) catch return;
 
-        // ── Phase 1: Review (read-only) ───────────────────────────────────
+        // ── Phase 1: Review (read-only) via runtime pipeline ─────────────
         iter_json.appendSlice(alloc, ",\"review\":\"") catch return;
         var review_out: std.ArrayList(u8) = .empty;
         defer review_out.deinit(alloc);
-        cas.runTurnPolicy(alloc, review_prompt, &review_out, .read_only);
+        runChainStep(alloc, "reviewer", null, false, null, review_prompt, &review_out);
 
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
@@ -2136,18 +2131,14 @@ fn handleReviewFixLoop(
             break;
         }
 
-        // ── Phase 2: Fix (writable) ───────────────────────────────────────
-        const preamble = swarm.buildPreamble(alloc);
-        defer if (preamble.len > 0) alloc.free(preamble);
-
+        // ── Phase 2: Fix (writable) via runtime pipeline ─────────────────
         const fix_prompt = std.fmt.allocPrint(alloc,
-            "{s}" ++
             "You are a code fixer. The following review findings were reported. " ++
             "Fix ALL issues listed below. Use zigread to read files, zigpatch to edit, " ++
             "and zigdiff to verify each fix. Do not introduce new functionality — " ++
             "only fix the reported issues.\n\n" ++
             "REVIEW FINDINGS:\n{s}",
-            .{ preamble, review_text },
+            .{ review_text },
         ) catch {
             iter_json.appendSlice(alloc, ",\"fix\":\"OOM: fix prompt\"}") catch return;
             out_json.appendSlice(alloc, iter_json.items) catch return;
@@ -2158,7 +2149,7 @@ fn handleReviewFixLoop(
 
         var fix_out: std.ArrayList(u8) = .empty;
         defer fix_out.deinit(alloc);
-        cas.runTurnPolicy(alloc, fix_prompt, &fix_out, .writable);
+        runChainStep(alloc, "fixer", null, true, null, fix_prompt, &fix_out);
 
         iter_json.appendSlice(alloc, ",\"fix\":\"") catch return;
         mj.writeEscaped(alloc, &iter_json, fix_out.items);
@@ -2168,7 +2159,7 @@ fn handleReviewFixLoop(
         completed = i + 1;
     }
 
-    // Close JSON — completed tracks actual iterations regardless of exit path
+    // Close JSON
     out_json.appendSlice(alloc, "],\"total_iterations\":") catch return;
     out_json.writer(alloc).print("{d}", .{completed}) catch return;
 
