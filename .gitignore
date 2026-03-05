@@ -4,6 +4,21 @@
 zig-out/
 .mcp-e2e-test
 
+# IDE / agent config folders (never track)
+.agent/
+.agents/
+.claude/
+.codex/
+.continue/
+.cursor/
+.gemini/
+.opencode/
+.windsurf/
+
+# Tool cache files
+.muonry_*.txt
+.zigrep_archive
+
 # Ignore markdown files and python folder
 *.md
 !README.md

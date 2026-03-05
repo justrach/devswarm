@@ -28,12 +28,22 @@ var g_repo_mu:  std.Thread.Mutex = .{};
 var g_repo_buf: [512]u8          = undefined;
 var g_repo_len: usize            = 0;
 
-/// Returns the current GitHub repo slug (owner/repo).
-/// Falls back to "justrach/codedb" until detectAndUpdateRepo() is called.
+/// Returns the current GitHub repo slug (owner/repo), or "" if not detected.
 pub fn currentRepo() []const u8 {
     g_repo_mu.lock();
     defer g_repo_mu.unlock();
-    return if (g_repo_len == 0) "justrach/codedb" else g_repo_buf[0..g_repo_len];
+    return if (g_repo_len == 0) "" else g_repo_buf[0..g_repo_len];
+}
+
+/// Returns the current repo slug, or writes an error and returns null.
+/// Use this in tool handlers instead of currentRepo() directly.
+fn repoOrErr(alloc: std.mem.Allocator, out: *std.ArrayList(u8)) ?[]const u8 {
+    const repo = currentRepo();
+    if (repo.len == 0) {
+        writeErr(alloc, out, "no repository detected — call set_repo with the repo path, or set REPO_PATH env var");
+        return null;
+    }
+    return repo;
 }
 
 fn setCurrentRepo(slug: []const u8) void {
@@ -44,18 +54,75 @@ fn setCurrentRepo(slug: []const u8) void {
     g_repo_len = slug.len;
 }
 
-/// Detect the GitHub repo slug from the CWD git remote and update the global.
+/// Detect the GitHub repo slug from the CWD and update the global.
+/// Tries `gh repo view` first, then falls back to parsing `git remote get-url origin`.
 /// Call after any chdir to keep --repo in sync with the active repository.
 pub fn detectAndUpdateRepo(alloc: std.mem.Allocator) void {
-    const result = gh.run(alloc, &.{ "gh", "repo", "view", "--json", "nameWithOwner" }) catch return;
+    // Try gh CLI first (most reliable — handles forks, renames, etc.)
+    const result = gh.run(alloc, &.{ "gh", "repo", "view", "--json", "nameWithOwner" }) catch {
+        detectViaGitRemote(alloc);
+        return;
+    };
     defer result.deinit(alloc);
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, result.stdout, .{}) catch return;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, result.stdout, .{}) catch {
+        detectViaGitRemote(alloc);
+        return;
+    };
     defer parsed.deinit();
     if (parsed.value == .object) {
         if (parsed.value.object.get("nameWithOwner")) |v| {
-            if (v == .string) setCurrentRepo(v.string);
+            if (v == .string) {
+                setCurrentRepo(v.string);
+                return;
+            }
         }
     }
+    // gh succeeded but returned unexpected JSON — fall back to git remote
+    detectViaGitRemote(alloc);
+}
+
+/// Fallback detection: parse owner/repo from `git remote get-url origin`.
+fn detectViaGitRemote(alloc: std.mem.Allocator) void {
+    var child = std.process.Child.init(
+        &.{ "git", "remote", "get-url", "origin" },
+        alloc,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Close;
+    child.stdin_behavior = .Close;
+
+    if (child.spawn()) |_| {
+        const stdout = child.stdout orelse return;
+        var buf: [4096]u8 = undefined;
+        const n = stdout.read(&buf) catch return;
+        _ = child.wait() catch {};
+        const url = std.mem.trim(u8, buf[0..n], " \t\r\n");
+        if (parseGitHubSlug(url)) |slug| {
+            setCurrentRepo(slug);
+        }
+    } else |_| {}
+}
+
+/// Extract "owner/repo" from a GitHub remote URL.
+/// Handles https://github.com/owner/repo.git, git@github.com:owner/repo.git,
+/// and ssh://git@github.com/owner/repo.git.
+fn parseGitHubSlug(url: []const u8) ?[]const u8 {
+    const markers = [_][]const u8{ "github.com/", "github.com:" };
+    for (markers) |marker| {
+        if (std.mem.indexOf(u8, url, marker)) |idx| {
+            var slug = url[idx + marker.len ..];
+            if (std.mem.endsWith(u8, slug, ".git")) {
+                slug = slug[0 .. slug.len - 4];
+            }
+            // Must contain exactly one slash (owner/repo)
+            if (std.mem.indexOf(u8, slug, "/") != null and
+                std.mem.lastIndexOf(u8, slug, "/") == std.mem.indexOf(u8, slug, "/"))
+            {
+                return slug;
+            }
+        }
+    }
+    return null;
 }
 
 // ── Step 1: Tool enum ─────────────────────────────────────────────────────────
@@ -236,13 +303,14 @@ fn handleDecomposeFeature(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const desc = mj.getStr(args, "feature_description") orelse {
         writeErr(alloc, out, "missing feature_description");
         return;
     };
     const labels_r = gh.run(alloc, &.{
         "gh", "label", "list",
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--json", "name,description,color",
         "--limit", "100",
     }) catch null;
@@ -267,9 +335,10 @@ fn handleGetProjectState(
     out: *std.ArrayList(u8),
 ) void {
     _ = args;
+    const repo = repoOrErr(alloc, out) orelse return;
     const issues_r = gh.run(alloc, &.{
         "gh", "issue", "list",
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--json", "number,title,labels,state,url",
         "--limit", "200",
     }) catch |err| {
@@ -280,7 +349,7 @@ fn handleGetProjectState(
 
     const prs_r = gh.run(alloc, &.{
         "gh", "pr", "list",
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--json", "number,title,state,headRefName,url",
         "--limit", "50",
     }) catch |err| {
@@ -305,10 +374,11 @@ fn handleGetNextTask(
     out: *std.ArrayList(u8),
 ) void {
     _ = args;
+    const repo = repoOrErr(alloc, out) orelse return;
     // Lightweight fetch — just number + labels needed for priority + block filtering
     const parsed = gh.runJson(alloc, &.{
         "gh", "issue", "list",
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--label", "status:backlog",
         "--json", "number,labels",
         "--limit", "100",
@@ -358,7 +428,7 @@ fn handleGetNextTask(
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num}) catch return;
     const detail_r = gh.run(alloc, &.{
         "gh", "issue", "view", num_str,
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--json", "number,title,body,labels,url,state",
     }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err));
@@ -373,6 +443,7 @@ fn handlePrioritizeIssues(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const nums_val = args.get("issue_numbers") orelse {
         writeErr(alloc, out, "missing issue_numbers"); return;
     };
@@ -391,14 +462,14 @@ fn handlePrioritizeIssues(
         // Strip old priority labels (ignore error — label may not exist)
         const rm = gh.run(alloc, &.{
             "gh", "issue", "edit", num_str,
-            "--repo", currentRepo(),
+            "--repo", repo,
             "--remove-label", "priority:p0,priority:p1,priority:p2,priority:p3",
         }) catch null;
         if (rm) |r| r.deinit(alloc);
 
         const r = gh.run(alloc, &.{
             "gh", "issue", "edit", num_str, "--add-label", prio,
-            "--repo", currentRepo(),
+            "--repo", repo,
         }) catch |err| {
             if (!first) out.appendSlice(alloc, ",") catch {};
             first = false;
@@ -429,6 +500,7 @@ fn handleCreateIssue(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const title = mj.getStr(args, "title") orelse {
         writeErr(alloc, out, "missing title"); return;
     };
@@ -450,7 +522,7 @@ fn handleCreateIssue(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
     // Note: gh issue create does NOT support --json; stdout is the new issue URL
-    argv.appendSlice(alloc, &.{ "gh", "issue", "create", "--repo", currentRepo(), "--title", title, "--body", body }) catch return;
+    argv.appendSlice(alloc, &.{ "gh", "issue", "create", "--repo", repo, "--title", title, "--body", body }) catch return;
 
     var has_status = false;
     // Track skipped labels for warnings
@@ -546,6 +618,7 @@ fn handleUpdateIssue(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
         writeErr(alloc, out, "missing issue_number"); return;
     };
@@ -555,7 +628,7 @@ fn handleUpdateIssue(
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
-    argv.appendSlice(alloc, &.{ "gh", "issue", "edit", num_str, "--repo", currentRepo() }) catch return;
+    argv.appendSlice(alloc, &.{ "gh", "issue", "edit", num_str, "--repo", repo }) catch return;
 
     if (mj.getStr(args, "title")) |t| argv.appendSlice(alloc, &.{ "--title", t }) catch return;
     if (mj.getStr(args, "body"))  |b| argv.appendSlice(alloc, &.{ "--body",  b }) catch return;
@@ -628,6 +701,7 @@ fn handleCloseIssue(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
         writeErr(alloc, out, "missing issue_number"); return;
     };
@@ -640,12 +714,12 @@ fn handleCloseIssue(
         if (pr_val == .integer) {
             var comment_buf: [64]u8 = undefined;
             const comment = std.fmt.bufPrint(&comment_buf, "Resolved by PR #{d}.", .{pr_val.integer}) catch "";
-            const cr = gh.run(alloc, &.{ "gh", "issue", "comment", num_str, "--repo", currentRepo(), "--body", comment }) catch null;
+            const cr = gh.run(alloc, &.{ "gh", "issue", "comment", num_str, "--repo", repo, "--body", comment }) catch null;
             if (cr) |r| r.deinit(alloc);
         }
     }
 
-    const close_r = gh.run(alloc, &.{ "gh", "issue", "close", num_str, "--repo", currentRepo() }) catch |err| {
+    const close_r = gh.run(alloc, &.{ "gh", "issue", "close", num_str, "--repo", repo }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err)); return;
     };
     close_r.deinit(alloc);
@@ -653,7 +727,7 @@ fn handleCloseIssue(
     // Transition label: remove all status labels, apply status:done
     const edit_r = gh.run(alloc, &.{
         "gh", "issue", "edit", num_str,
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--remove-label", "status:backlog,status:in-progress,status:in-review,status:blocked",
         "--add-label",    "status:done",
     }) catch null;
@@ -669,6 +743,7 @@ fn handleLinkIssues(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const blocker_val = args.get("issue_number") orelse {
         writeErr(alloc, out, "missing issue_number"); return;
     };
@@ -706,7 +781,7 @@ fn handleLinkIssues(
     var blocker_buf: [16]u8 = undefined;
     const blocker_str = std.fmt.bufPrint(&blocker_buf, "{d}", .{blocker}) catch "?";
     const bc = gh.run(alloc, &.{
-        "gh", "issue", "comment", blocker_str, "--repo", currentRepo(), "--body", comment.items,
+        "gh", "issue", "comment", blocker_str, "--repo", repo, "--body", comment.items,
     }) catch null;
     if (bc) |r| r.deinit(alloc);
 
@@ -717,13 +792,13 @@ fn handleLinkIssues(
     for (0..count) |i| {
         const ns = num_strs[i];
         const edit_r = gh.run(alloc, &.{
-            "gh", "issue", "edit", ns, "--repo", currentRepo(), "--add-label", "status:blocked",
+            "gh", "issue", "edit", ns, "--repo", repo, "--add-label", "status:blocked",
         }) catch null;
         if (edit_r) |r| r.deinit(alloc);
 
         var cb_buf: [64]u8 = undefined;
         const cb = std.fmt.bufPrint(&cb_buf, "Blocked by: #{s}.", .{blocker_str}) catch "";
-        const cr = gh.run(alloc, &.{ "gh", "issue", "comment", ns, "--repo", currentRepo(), "--body", cb }) catch null;
+        const cr = gh.run(alloc, &.{ "gh", "issue", "comment", ns, "--repo", repo, "--body", cb }) catch null;
         if (cr) |r| r.deinit(alloc);
 
         if (!first) out.appendSlice(alloc, ",") catch {};
@@ -738,6 +813,7 @@ fn handleGetIssue(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
         writeErr(alloc, out, "missing issue_number"); return;
     };
@@ -749,7 +825,7 @@ fn handleGetIssue(
 
     const r = gh.run(alloc, &.{
         "gh", "issue", "view", num_str,
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--json", "number,title,body,state,labels,url,comments",
     }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err)); return;
@@ -767,6 +843,7 @@ fn handleCreateBranch(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
         writeErr(alloc, out, "missing issue_number"); return;
     };
@@ -778,7 +855,7 @@ fn handleCreateBranch(
     // Fetch issue title
     const issue_r = gh.run(alloc, &.{
         "gh", "issue", "view", num_str, "--json", "title",
-        "--repo", currentRepo(),
+        "--repo", repo,
     }) catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
     defer issue_r.deinit(alloc);
 
@@ -813,7 +890,7 @@ fn handleCreateBranch(
     // Transition issue to in-progress
     const edit_r = gh.run(alloc, &.{
         "gh", "issue", "edit", num_str,
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--remove-label", "status:backlog,status:blocked",
         "--add-label",    "status:in-progress",
     }) catch null;
@@ -956,6 +1033,7 @@ fn handleCreatePr(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     // Determine current branch + linked issue
     const br_r = gh.run(alloc, &.{ "git", "branch", "--show-current" }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err)); return;
@@ -975,7 +1053,7 @@ fn handleCreatePr(
         if (issue_num) |n| {
             var nb: [16]u8 = undefined;
             const ns = std.fmt.bufPrint(&nb, "{d}", .{n}) catch break :blk branch;
-            const ir = gh.run(alloc, &.{ "gh", "issue", "view", ns, "--repo", currentRepo(), "--json", "title,body" }) catch break :blk branch;
+            const ir = gh.run(alloc, &.{ "gh", "issue", "view", ns, "--repo", repo, "--json", "title,body" }) catch break :blk branch;
             defer ir.deinit(alloc);
             const ip = std.json.parseFromSlice(std.json.Value, alloc, ir.stdout, .{}) catch break :blk branch;
             defer ip.deinit();
@@ -1018,7 +1096,7 @@ fn handleCreatePr(
 
     const pr_r = gh.run(alloc, &.{
         "gh", "pr", "create",
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--base",  "main",
         "--head",  branch,
         "--title", title,
@@ -1038,7 +1116,7 @@ fn handleCreatePr(
         const ns = std.fmt.bufPrint(&nb, "{d}", .{n}) catch "";
         const er = gh.run(alloc, &.{
             "gh", "issue", "edit", ns,
-            "--repo", currentRepo(),
+            "--repo", repo,
             "--remove-label", "status:in-progress",
             "--add-label",    "status:in-review",
         }) catch null;
@@ -1061,6 +1139,7 @@ fn handleGetPrStatus(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const fields = "number,title,state,mergeable,statusCheckRollup,reviews,headRefName,url";
     const r = blk: {
         if (args.get("pr_number")) |pv| {
@@ -1069,11 +1148,11 @@ fn handleGetPrStatus(
                 const ns = std.fmt.bufPrint(&nb, "{d}", .{pv.integer}) catch {
                     writeErr(alloc, out, "bad pr_number"); return;
                 };
-                break :blk gh.run(alloc, &.{ "gh", "pr", "view", ns, "--repo", currentRepo(), "--json", fields });
+                break :blk gh.run(alloc, &.{ "gh", "pr", "view", ns, "--repo", repo, "--json", fields });
             }
         }
         // Default: PR for current branch
-        break :blk gh.run(alloc, &.{ "gh", "pr", "view", "--repo", currentRepo(), "--json", fields });
+        break :blk gh.run(alloc, &.{ "gh", "pr", "view", "--repo", repo, "--json", fields });
     } catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
     defer r.deinit(alloc);
     out.appendSlice(alloc, std.mem.trim(u8, r.stdout, " \t\n\r")) catch {};
@@ -1085,9 +1164,10 @@ fn handleListOpenPrs(
     out: *std.ArrayList(u8),
 ) void {
     _ = args;
+    const repo = repoOrErr(alloc, out) orelse return;
     const r = gh.run(alloc, &.{
         "gh", "pr", "list",
-        "--repo", currentRepo(),
+        "--repo", repo,
         "--json", "number,title,state,headRefName,url,statusCheckRollup",
         "--limit", "50",
     }) catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
@@ -1100,6 +1180,7 @@ fn handleMergePr(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
     argv.appendSlice(alloc, &.{ "gh", "pr", "merge" }) catch return;
@@ -1115,7 +1196,7 @@ fn handleMergePr(
         }
     }
 
-    argv.appendSlice(alloc, &.{ "--repo", currentRepo() }) catch return;
+    argv.appendSlice(alloc, &.{ "--repo", repo }) catch return;
 
     // Strategy: squash (default), merge, or rebase
     const strategy = mj.getStr(args, "strategy") orelse "squash";
@@ -1149,6 +1230,7 @@ fn handleGetPrDiff(
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
+    const repo = repoOrErr(alloc, out) orelse return;
     const r = blk: {
         if (args.get("pr_number")) |pv| {
             if (pv == .integer) {
@@ -1156,10 +1238,10 @@ fn handleGetPrDiff(
                 const ns = std.fmt.bufPrint(&nb, "{d}", .{pv.integer}) catch {
                     writeErr(alloc, out, "bad pr_number"); return;
                 };
-                break :blk gh.run(alloc, &.{ "gh", "pr", "diff", ns, "--repo", currentRepo() });
+                break :blk gh.run(alloc, &.{ "gh", "pr", "diff", ns, "--repo", repo });
             }
         }
-        break :blk gh.run(alloc, &.{ "gh", "pr", "diff", "--repo", currentRepo() });
+        break :blk gh.run(alloc, &.{ "gh", "pr", "diff", "--repo", repo });
     } catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
     defer r.deinit(alloc);
     out.appendSlice(alloc, "{\"diff\":\"") catch return;
@@ -1943,9 +2025,16 @@ fn handleSetRepo(
     cache.invalidate();
     cache.prefetch(alloc);
     detectAndUpdateRepo(alloc);
-    // Return success
-    out.appendSlice(alloc, "{\"ok\":true,\"repo\":\"") catch return;
+    // Return success with both path and detected GitHub slug
+    const slug = currentRepo();
+    out.appendSlice(alloc, "{\"ok\":true,\"path\":\"") catch return;
     mj.writeEscaped(alloc, out, path);
+    out.appendSlice(alloc, "\",\"repo\":\"") catch return;
+    if (slug.len > 0) {
+        mj.writeEscaped(alloc, out, slug);
+    } else {
+        out.appendSlice(alloc, "(not detected)") catch {};
+    }
     out.appendSlice(alloc, "\"}") catch return;
 }
 
