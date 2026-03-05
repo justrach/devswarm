@@ -61,15 +61,16 @@ pub fn runAgent(
 /// unavailable so the caller can fall back to codex_appserver.
 /// Attempts to run the turn via `claude -p`. Returns false when claude is
 /// unavailable so the caller can fall back to codex_appserver.
-fn tryClaudeAgent(
+pub fn tryClaudeAgent(
     alloc: std.mem.Allocator,
     prompt: []const u8,
     opts: AgentOptions,
     out: *std.ArrayList(u8),
 ) bool {
     // Honour AGENT_SDK_BACKEND=codex to force the legacy codex path.
-    const backend = std.process.getEnvVarOwned(alloc, "AGENT_SDK_BACKEND") catch "";
-    defer if (backend.len > 0) alloc.free(backend);
+    const backend_owned = std.process.getEnvVarOwned(alloc, "AGENT_SDK_BACKEND") catch null;
+    defer if (backend_owned) |v| alloc.free(v);
+    const backend = backend_owned orelse "";
     if (std.mem.eql(u8, backend, "codex")) return false;
 
     const perm_mode: []const u8 =
@@ -120,9 +121,9 @@ fn tryClaudeAgent(
     // Direct spawn failed — claude not on the trimmed PATH seen by this process.
     // Re-try via the login shell so ~/.zshrc / ~/.zprofile are sourced and the
     // full user PATH (e.g. ~/.local/bin) is available.
-    const shell = std.process.getEnvVarOwned(alloc, "SHELL") catch
-        alloc.dupe(u8, "/bin/zsh") catch return false;
-    defer alloc.free(shell);
+    const shell_owned = std.process.getEnvVarOwned(alloc, "SHELL") catch null;
+    defer if (shell_owned) |sh| alloc.free(sh);
+    const shell = shell_owned orelse "/bin/zsh";
 
     // Pass the prompt via an env var so it doesn't need shell-quoting.
     // _AGENT_PROMPT avoids any risk of word-splitting or glob expansion.

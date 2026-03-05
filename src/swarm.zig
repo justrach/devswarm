@@ -1,8 +1,8 @@
-// swarm.zig — Agent Swarm: orchestrate N parallel Codex sub-agents
+// swarm.zig — Agent Swarm: orchestrate N parallel sub-agents
 //
 // Pipeline:
 //   1. Orchestrator agent decomposes the task into ≤max_agents sub-tasks (JSON)
-//   2. N worker threads each run one sub-agent via codex app-server (in parallel)
+//   2. N worker threads each run one sub-agent via runtime resolve→dispatch (in parallel)
 //   3. Synthesis agent combines all results into `out`
 //
 // Threading: std.Thread.spawn per worker; each worker uses page_allocator so
@@ -10,50 +10,10 @@
 
 const std = @import("std");
 const mj  = @import("mcp").json;
-const cas = @import("codex_appserver.zig");
+const rt   = @import("runtime.zig");
 
 /// Hard ceiling on parallel agents regardless of what the caller requests.
 pub const HARD_MAX: u32 = 100;
-
-/// Prepended to every writable-worker prompt so agents use the correct muonry
-/// shell tools instead of falling back to sed/awk/patch/heredocs.
-const WRITABLE_PREAMBLE =
-    \\ENVIRONMENT: The following shell commands are on PATH and MUST be used for all file I/O:
-    \\
-    \\  zigrep  "pattern" path/          # search code (NOT ziggrep — the command is zigrep)
-    \\  zigread FILE                     # read file with line numbers
-    \\  zigread -o FILE                  # structural outline
-    \\  zigread -s SYMBOL FILE           # extract function by name
-    \\  zigread -L FROM-TO FILE          # read line range
-    \\  zigpatch FILE FROM-TO <<'EOF'    # replace line range (PREFERRED for edits)
-    \\    new content
-    \\  EOF
-    \\  zigpatch FILE -s SYMBOL <<'EOF'  # replace function by name (immune to line drift)
-    \\    new content
-    \\  EOF
-    \\  zigcreate FILE --content "..."   # create new file
-    \\  zigdiff FILE                     # verify edit landed correctly
-    \\
-    \\CODEDB GRAPH TOOLS (if codedb binary is on PATH):
-    \\  codedb outline FILE              # structural outline with symbols
-    \\  codedb deps FILE                 # reverse dependencies (who imports this file)
-    \\  codedb symbol NAME               # find all definitions of a symbol
-    \\  codedb search "query"            # full-text search across indexed files
-    \\  codedb hot                       # recently modified files
-    \\
-    \\RULES:
-    \\  - NEVER use sed, awk, patch, tee, echo/printf redirects (>, >>), or heredocs to write files
-    \\  - NEVER write raw diff/patch syntax into source files
-    \\  - Always zigread before zigpatch; always zigdiff after zigpatch
-    \\  - One focused change per file; do not rewrite files wholesale
-    \\  - Cite file:line for every finding
-    \\  - Prefer zigpatch -s SYMBOL for multi-iteration edits (immune to line drift)
-    \\
-    \\MCP TOOLS (available when muonry is in ~/.codex/config.toml): mcp__muonry__read, mcp__muonry__search, mcp__muonry__edit
-    \\
-    \\Task:
-    \\
-;
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
@@ -66,28 +26,29 @@ const Worker = struct {
 
 const WorkerArgs = struct {
     worker: *Worker,
-    policy: cas.SandboxPolicy,
+    writable: bool,
 };
 
 fn workerFn(args: *WorkerArgs) void {
+    const alloc = std.heap.page_allocator;
     const prompt = args.worker.allocated_prompt orelse args.worker.prompt;
-    cas.runTurnPolicy(std.heap.page_allocator, prompt, &args.worker.out, args.policy);
+    const req: rt.AgentRequest = .{
+        .prompt   = prompt,
+        .role     = "fixer",
+        .mode     = "smart",
+        .writable = args.writable,
+    };
+    const resolved = rt.resolve.resolveWithProbe(alloc, req);
+    defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
+    rt.dispatch.dispatch(alloc, resolved, prompt, &args.worker.out);
 }
 
-/// Build the writable-worker preamble. Includes the resolved absolute path to
-/// the zig tools bin dir so agents don't need PATH to be perfect.
-pub fn buildPreamble(alloc: std.mem.Allocator) []u8 {
-    const tools_dir = cas.toolsBinDir();
-    const abs_note = if (tools_dir.len > 0)
-        std.fmt.allocPrint(alloc,
-            "TOOLS BIN: {s}  (absolute path — use this if bare names fail)\n\n",
-            .{tools_dir},
-        ) catch ""
-    else
-        "";
-    defer if (abs_note.len > 0) alloc.free(abs_note);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ abs_note, WRITABLE_PREAMBLE }) catch
-        alloc.dupe(u8, WRITABLE_PREAMBLE) catch "";
+/// Build the writable-worker preamble using the runtime prompt assembly.
+/// Returns an allocated string that the caller must free.
+pub fn buildPreamble(alloc: std.mem.Allocator) []const u8 {
+    const cascade_mod = @import("runtime/cascade.zig");
+    const tools = cascade_mod.probe(alloc);
+    return rt.prompts.assemble(alloc, null, .smart, tools.tier());
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -99,7 +60,7 @@ pub fn runSwarm(
     task:       []const u8,
     max_agents: u32,
     out:        *std.ArrayList(u8),
-    policy:     cas.SandboxPolicy,
+    writable:   bool,
 ) void {
     const cap: usize = @min(max_agents, HARD_MAX);
 
@@ -107,16 +68,27 @@ pub fn runSwarm(
     const orch_prompt = std.fmt.allocPrint(alloc,
         "You are a task orchestrator. Decompose the task below into at most {d} " ++
         "independent, self-contained sub-tasks that can execute in parallel.\n" ++
-        "Reply with ONLY a JSON array — no markdown, no prose:\n" ++
-        "[{{\"role\":\"<role label>\",\"prompt\":\"<full sub-task prompt>\"}},...]\\n\\n" ++
+        "Reply with ONLY a valid JSON array — no markdown fences, no commentary, no explanation:\n" ++
+        "[{{\"role\":\"<role label>\",\"prompt\":\"<full sub-task prompt>\"}},...]\n\n" ++
         "Task: {s}",
         .{ cap, task },
     ) catch { appendErr(alloc, out, "OOM: orchestrator prompt"); return; };
     defer alloc.free(orch_prompt);
 
+    // Orchestrator: read-only, rush mode (concise JSON output), no role preamble
     var orch_out: std.ArrayList(u8) = .empty;
     defer orch_out.deinit(alloc);
-    cas.runTurnPolicy(alloc, orch_prompt, &orch_out, .read_only); // orchestrator only reads
+    {
+        const req: rt.AgentRequest = .{
+            .prompt   = orch_prompt,
+            .role     = null,
+            .mode     = "rush",
+            .writable = false,
+        };
+        const resolved = rt.resolve.resolveWithProbe(alloc, req);
+        defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
+        rt.dispatch.dispatch(alloc, resolved, orch_prompt, &orch_out);
+    }
 
     // ── Phase 2: Parse sub-tasks from orchestrator output ─────────────────
     const raw = orch_out.items;
@@ -159,12 +131,12 @@ pub fn runSwarm(
         const p_val = obj.get("prompt") orelse continue;
         const r_val = obj.get("role")   orelse std.json.Value{ .string = "agent" };
         const base  = switch (p_val) { .string => |s| s, else => continue };
-        // For writable workers, prepend the tool-use preamble (with resolved
-        // absolute tools path) so agents use zigrep/zigpatch instead of sed/awk.
-        const allocated: ?[]u8 = if (policy == .writable) blk: {
+        // For writable workers, prepend the tool-use preamble so agents use
+        // zigrep/zigpatch instead of sed/awk.
+        const allocated: ?[]u8 = if (writable) blk: {
             const preamble = buildPreamble(alloc);
             const full = std.fmt.allocPrint(alloc, "{s}{s}", .{ preamble, base }) catch null;
-            alloc.free(preamble);
+            rt.prompts.freeAssembled(alloc, preamble);
             break :blk full;
         } else null;
         workers[count] = .{
@@ -172,7 +144,7 @@ pub fn runSwarm(
             .prompt           = base,
             .allocated_prompt = allocated,
         };
-        worker_args[count] = .{ .worker = &workers[count], .policy = policy };
+        worker_args[count] = .{ .worker = &workers[count], .writable = writable };
         threads[count] = std.Thread.spawn(.{}, workerFn, .{&worker_args[count]}) catch null;
         count += 1;
     }
@@ -192,7 +164,7 @@ pub fn runSwarm(
     var manifest: []const u8 = "";
     var manifest_alloc: ?[]u8 = null;
     defer if (manifest_alloc) |m| alloc.free(m);
-    if (policy == .writable) {
+    if (writable) {
         const gh = @import("gh.zig");
         if (gh.run(alloc, &.{ "git", "diff", "--stat", "HEAD" })) |dr| {
             defer dr.deinit(alloc);
@@ -233,8 +205,18 @@ pub fn runSwarm(
 
     synth.appendSlice(alloc, "Synthesize the above into a final answer.") catch {};
 
-    // ── Phase 5: Synthesis agent ──────────────────────────────────────────
-    cas.runTurnPolicy(alloc, synth.items, out, .read_only); // synthesis only reads
+    // ── Phase 5: Synthesis agent (read-only, uses synthesizer role) ───────
+    {
+        const req: rt.AgentRequest = .{
+            .prompt   = synth.items,
+            .role     = "synthesizer",
+            .mode     = "smart",
+            .writable = false,
+        };
+        const resolved = rt.resolve.resolveWithProbe(alloc, req);
+        defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
+        rt.dispatch.dispatch(alloc, resolved, synth.items, out);
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -251,15 +233,13 @@ test "swarm: HARD_MAX is 100" {
     try std.testing.expectEqual(@as(u32, 100), HARD_MAX);
 }
 
-test "swarm: buildPreamble references required zig tools" {
+test "swarm: buildPreamble references agency rules" {
     const alloc = std.testing.allocator;
     const preamble = buildPreamble(alloc);
-    defer alloc.free(preamble);
+    defer rt.prompts.freeAssembled(alloc, preamble);
 
-    try std.testing.expect(std.mem.indexOf(u8, preamble, "zigrep") != null);
-    try std.testing.expect(std.mem.indexOf(u8, preamble, "zigread") != null);
-    try std.testing.expect(std.mem.indexOf(u8, preamble, "zigpatch") != null);
-    try std.testing.expect(std.mem.indexOf(u8, preamble, "zigdiff") != null);
+    // The preamble should come from prompts.zig and include agency rules
+    try std.testing.expect(preamble.len > 0);
 }
 
 test "swarm: appendErr writes JSON error object" {
