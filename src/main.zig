@@ -8,7 +8,8 @@
 //   devswarm --mcp           — explicit MCP mode (default when no subcommand)
 //   devswarm                 — MCP mode (default)
 
-const std = @import("std");
+const std    = @import("std");
+const notify = @import("notify.zig");
 const build_options = @import("build_options");
 const mj = @import("mcp").json; // readLine, getStr/Int/Bool, eql, writeEscaped
 const tools = @import("tools.zig");
@@ -159,6 +160,7 @@ fn run(alloc: std.mem.Allocator, active_repo: *?[]const u8) void {
             break;
         } orelse break;
         g_use_headers = g_use_headers or message_uses_headers;
+        notify.init(g_use_headers);
         defer alloc.free(line);
 
         const input = std.mem.trim(u8, line, " \t\r\n");
