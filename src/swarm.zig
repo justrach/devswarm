@@ -8,7 +8,8 @@
 // Threading: std.Thread.spawn per worker; each worker uses page_allocator so
 // there is no allocator contention across threads.
 
-const std = @import("std");
+const std    = @import("std");
+const notify = @import("notify.zig");
 const mj  = @import("mcp").json;
 const rt   = @import("runtime.zig");
 
@@ -58,11 +59,23 @@ pub fn buildPreamble(alloc: std.mem.Allocator) []const u8 {
 pub fn runSwarm(
     alloc:      std.mem.Allocator,
     task:       []const u8,
+    title:      ?[]const u8,
     max_agents: u32,
     out:        *std.ArrayList(u8),
     writable:   bool,
 ) void {
     const cap: usize = @min(max_agents, HARD_MAX);
+
+    // ── Phase 0: Announce swarm start ────────────────────────────────────────
+    {
+        var msg_buf: [256]u8 = undefined;
+        const label = title orelse "swarm";
+        const msg = std.fmt.bufPrint(&msg_buf,
+            "swarm: '{s}' — decomposing task (up to {d} agents)...",
+            .{ label, cap },
+        ) catch "🔀 run_swarm: decomposing task...";
+        notify.send(alloc, msg);
+    }
 
     // ── Phase 1: Orchestrator decomposes task ─────────────────────────────
     const orch_prompt = std.fmt.allocPrint(alloc,
@@ -151,6 +164,16 @@ pub fn runSwarm(
 
     if (count == 0) { appendErr(alloc, out, "swarm: no valid sub-tasks extracted"); return; }
 
+    // ── Announce workers ──────────────────────────────────────────────────────
+    {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf,
+            "⚡ {d} agent{s} running in parallel...",
+            .{ count, if (count == 1) "" else "s" },
+        ) catch "⚡ agents running...";
+        notify.send(alloc, msg);
+    }
+
     // ── Phase 3: Join all worker threads ──────────────────────────────────
     for (threads[0..count]) |maybe_t| {
         if (maybe_t) |t| t.join();
@@ -204,6 +227,9 @@ pub fn runSwarm(
     }
 
     synth.appendSlice(alloc, "Synthesize the above into a final answer.") catch {};
+
+    // ── Announce synthesis ───────────────────────────────────────────────────
+    notify.send(alloc, "🧬 Synthesizing agent results...");
 
     // ── Phase 5: Synthesis agent (read-only, uses synthesizer role) ───────
     {
