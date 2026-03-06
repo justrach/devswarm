@@ -1,6 +1,12 @@
-// gitagent-mcp — MCP server (JSON-RPC 2.0 over stdio)
+// devswarm — MCP server (JSON-RPC 2.0 over stdio) + CLI
 // Protocol: JSON-RPC transport via NDJSON by default, with optional MCP stdio headers.
 // Lifecycle: initialize → notifications/initialized → tools/list + tools/call loop.
+//
+// CLI subcommands:
+//   devswarm init [--force]  — generate .devswarm/config.toml
+//   devswarm --version / -v  — print version
+//   devswarm --mcp           — explicit MCP mode (default when no subcommand)
+//   devswarm                 — MCP mode (default)
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -8,6 +14,7 @@ const mj = @import("mcp").json; // readLine, getStr/Int/Bool, eql, writeEscaped
 const tools = @import("tools.zig");
 const cache = @import("cache.zig");
 const runtime = @import("runtime.zig");
+const init_cmd = @import("init.zig");
 
 const MaxThreadIdLen = 96;
 const MaxThreads = 32;
@@ -28,20 +35,71 @@ var g_thread_contexts: [MaxThreads]ThreadContext = [_]ThreadContext{.{}} ** MaxT
 var g_thread_count: usize = 0;
 var g_use_headers: bool = false;
 
-
 pub fn main() void {
-    // --version / -v
     var args = std.process.args();
     _ = args.next(); // skip argv[0]
-    if (args.next()) |arg| {
+
+    // Parse first argument as subcommand / flag
+    const first_arg = args.next();
+    if (first_arg) |arg| {
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             const stdout = std.fs.File.stdout();
-            stdout.writeAll("gitagent-mcp ") catch {};
+            stdout.writeAll("devswarm ") catch {};
             stdout.writeAll(build_options.version) catch {};
             stdout.writeAll("\n") catch {};
             return;
         }
+
+        if (std.mem.eql(u8, arg, "init")) {
+            // devswarm init [--force]
+            var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var force = false;
+            while (args.next()) |a| {
+                if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-f")) {
+                    force = true;
+                }
+            }
+            std.process.exit(init_cmd.run(alloc, force));
+            return;
+        }
+
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printHelp();
+            return;
+        }
+
+        // --mcp or unknown → fall through to MCP server mode
     }
+
+    // If stdin is a TTY (human ran it directly), show help instead of hanging
+    if (std.posix.isatty(std.posix.STDIN_FILENO)) {
+        printHelp();
+        return;
+    }
+
+    runMcpServer();
+}
+
+fn printHelp() void {
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(
+        \\DevSwarm — AI coding swarm for Codex, Amp, and Claude Code
+        \\
+        \\Usage:
+        \\  devswarm init [--force]   Generate .devswarm/config.toml
+        \\  devswarm --mcp            Run as MCP server (default)
+        \\  devswarm --version        Print version
+        \\  devswarm --help           This message
+        \\
+        \\MCP tools: run_agent, run_swarm, run_task, run_reviewer, run_explorer,
+        \\           run_zig_infra, review_fix_loop, and 30+ code intelligence tools.
+        \\
+    ) catch {};
+}
+
+fn runMcpServer() void {
 
     const act = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
