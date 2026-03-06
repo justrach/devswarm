@@ -8,24 +8,16 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
     name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - target: x86_64-linux
-            os: ubuntu-latest
             asset: devswarm-x86_64-linux
           - target: aarch64-linux
-            os: ubuntu-latest
             asset: devswarm-aarch64-linux
-          - target: x86_64-macos
-            os: ubuntu-latest
-            asset: devswarm-x86_64-macos
-          - target: aarch64-macos
-            os: macos-latest
-            asset: devswarm-aarch64-macos
     steps:
       - uses: actions/checkout@v4
 
@@ -43,8 +35,76 @@ jobs:
         run: |
           mkdir -p dist
           cp zig-out/bin/devswarm dist/${{ matrix.asset }}
-          cd dist
-          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          cd dist && sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/
+
+  build-macos:
+    name: Build ${{ matrix.target }} (signed)
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-macos
+            asset: devswarm-x86_64-macos
+          - target: aarch64-macos
+            asset: devswarm-aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Build
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dversion="$VERSION"
+
+      - name: Import signing certificate
+        env:
+          CERT_B64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT }}
+          CERT_PASS: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          echo "$CERT_B64" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import /tmp/cert.p12 -k build.keychain -P "$CERT_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+          rm /tmp/cert.p12
+
+      - name: Sign binary
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          codesign --sign "Developer ID Application: Rachit Pradhan ($TEAM_ID)" \
+            --options runtime --timestamp \
+            zig-out/bin/devswarm
+          codesign --verify --verbose zig-out/bin/devswarm
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          zip -j /tmp/devswarm-notarize.zip zig-out/bin/devswarm
+          xcrun notarytool submit /tmp/devswarm-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/devswarm dist/${{ matrix.asset }}
+          cd dist && shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
 
       - uses: actions/upload-artifact@v4
         with:
@@ -53,7 +113,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
