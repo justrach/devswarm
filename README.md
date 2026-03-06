@@ -10,6 +10,8 @@
   <img src="https://img.shields.io/badge/MCP-compatible-6c63ff?style=flat-square" alt="MCP Compatible" />
 </p>
 
+<h1 align="center">DevSwarm</h1>
+
 <h3 align="center">Your AI coding assistant, now with a team.</h3>
 
 <p align="center">
