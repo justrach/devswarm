@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="DevSwarm" width="160" />
+</p>
+
 # DevSwarm
 
 > Your AI coding assistant just got a team.
