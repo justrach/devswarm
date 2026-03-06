@@ -78,7 +78,7 @@ jobs:
         run: |
           IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | awk -F '"' '{print $2}' | head -1)
           echo "Signing with: $IDENTITY"
-          codesign --sign "$IDENTITY" --options runtime --timestamp zig-out/bin/devswarm
+          codesign --sign "$IDENTITY" --options runtime --timestamp --force zig-out/bin/devswarm
           codesign --verify --verbose zig-out/bin/devswarm
       - name: Notarize
         env:
