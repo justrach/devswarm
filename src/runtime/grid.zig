@@ -19,28 +19,34 @@ const AgentMode = types.AgentMode;
 /// Model tier — abstract categories that map to concrete model IDs.
 /// Model tier — abstract categories that map to concrete model IDs.
 pub const ModelTier = enum {
-    haiku,   // fast, cheap: Haiku
-    sonnet,  // balanced: Sonnet
-    opus,    // powerful: Opus
-    spark,   // fast, cheap Codex: gpt-5.3-codex-spark
-    bolt,    // OpenAI flagship: gpt-5.4
+    haiku,        // fast, cheap: Claude Haiku
+    sonnet,       // balanced: Claude Sonnet
+    opus,         // powerful: Claude Opus
+    spark,        // fast, cheap Codex: gpt-5.3-codex-spark
+    bolt,         // OpenAI flagship: gpt-5.4
+    gemini_flash, // fast Gemini: gemini-3-flash-preview
+    gemini_pro,   // powerful Gemini: gemini-3.1-pro-preview
 
     pub fn toModelId(self: ModelTier) []const u8 {
         return switch (self) {
-            .haiku  => "claude-haiku-4-5-20251001",
-            .sonnet => "claude-sonnet-4-6",
-            .opus   => "claude-opus-4-6",
-            .spark  => "gpt-5.3-codex-spark",
-            .bolt   => "gpt-5.4",
+            .haiku        => "claude-haiku-4-5-20251001",
+            .sonnet       => "claude-sonnet-4-6",
+            .opus         => "claude-opus-4-6",
+            .spark        => "gpt-5.3-codex-spark",
+            .bolt         => "gpt-5.4",
+            .gemini_flash => "gemini-3-flash-preview",
+            .gemini_pro   => "gemini-3.1-pro-preview",
         };
     }
 
     pub fn fromString(s: []const u8) ?ModelTier {
-        if (std.mem.eql(u8, s, "haiku"))  return .haiku;
-        if (std.mem.eql(u8, s, "sonnet")) return .sonnet;
-        if (std.mem.eql(u8, s, "opus"))   return .opus;
-        if (std.mem.eql(u8, s, "spark"))  return .spark;
-        if (std.mem.eql(u8, s, "bolt"))   return .bolt;
+        if (std.mem.eql(u8, s, "haiku"))        return .haiku;
+        if (std.mem.eql(u8, s, "sonnet"))       return .sonnet;
+        if (std.mem.eql(u8, s, "opus"))         return .opus;
+        if (std.mem.eql(u8, s, "spark"))        return .spark;
+        if (std.mem.eql(u8, s, "bolt"))         return .bolt;
+        if (std.mem.eql(u8, s, "gemini_flash")) return .gemini_flash;
+        if (std.mem.eql(u8, s, "gemini_pro"))   return .gemini_pro;
         return null;
     }
 };

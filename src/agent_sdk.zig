@@ -36,6 +36,93 @@ pub const AgentOptions = struct {
     reasoning_effort: ?[]const u8 = null,
 };
 
+// ── Agent progress emission ────────────────────────────────────────────────
+// Writes colored tool-use events to stderr as they happen so the terminal
+// shows what the agent is doing during long runs.
+
+const P_RESET   = "\x1b[0m";
+const P_BOLD    = "\x1b[1m";
+const P_DIM     = "\x1b[2m";
+const P_RED     = "\x1b[31m";
+const P_GREEN   = "\x1b[32m";
+const P_YELLOW  = "\x1b[33m";
+const P_BLUE    = "\x1b[34m";
+const P_MAGENTA = "\x1b[35m";
+const P_CYAN    = "\x1b[36m";
+
+const P_ZAP   = "\xe2\x9a\xa1";  // ⚡
+const P_CHECK = "\xe2\x9c\x93";  // ✓
+const P_CROSS = "\xe2\x9c\x97";  // ✗
+
+fn agentToolColor(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "Read")  or std.mem.eql(u8, name, "Glob"))    return P_BLUE;
+    if (std.mem.eql(u8, name, "Edit")  or std.mem.eql(u8, name, "Write"))   return P_YELLOW;
+    if (std.mem.eql(u8, name, "Bash"))                                         return P_GREEN;
+    if (std.mem.eql(u8, name, "Grep")  or std.mem.eql(u8, name, "Search"))  return P_MAGENTA;
+    if (std.mem.eql(u8, name, "WebSearch") or std.mem.eql(u8, name, "WebFetch")) return P_CYAN;
+    if (std.mem.eql(u8, name, "Task"))                                         return P_RED;
+    return P_DIM;
+}
+
+fn emitToolUseProgress(alloc: std.mem.Allocator, obj: std.json.ObjectMap) void {
+    const msg_val = obj.get("message") orelse return;
+    if (msg_val != .object) return;
+    const content_val = msg_val.object.get("content") orelse return;
+    if (content_val != .array) return;
+
+    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    for (content_val.array.items) |item| {
+        if (item != .object) continue;
+        const c = item.object;
+        const ctype = c.get("type") orelse continue;
+        if (ctype != .string or !std.mem.eql(u8, ctype.string, "tool_use")) continue;
+        const name_v = c.get("name") orelse continue;
+        if (name_v != .string) continue;
+        const tname = name_v.string;
+
+        var detail: []const u8 = "";
+        if (c.get("input")) |inp| {
+            if (inp == .object) {
+                const io = inp.object;
+                if (io.get("file_path")) |v|    { if (v == .string) detail = v.string; }
+                else if (io.get("command")) |v| { if (v == .string) { detail = v.string; if (detail.len > 50) detail = detail[0..50]; } }
+                else if (io.get("pattern")) |v| { if (v == .string) detail = v.string; }
+                else if (io.get("query")) |v|   { if (v == .string) detail = v.string; }
+                else if (io.get("path")) |v|    { if (v == .string) detail = v.string; }
+            }
+        }
+
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(alloc);
+        line.appendSlice(alloc, "  " ++ P_DIM ++ P_ZAP ++ "  " ++ P_RESET) catch continue;
+        line.appendSlice(alloc, agentToolColor(tname)) catch continue;
+        line.appendSlice(alloc, P_BOLD) catch continue;
+        line.appendSlice(alloc, tname) catch continue;
+        line.appendSlice(alloc, P_RESET) catch continue;
+        if (detail.len > 0) {
+            line.appendSlice(alloc, "  " ++ P_DIM) catch continue;
+            line.appendSlice(alloc, detail) catch continue;
+            line.appendSlice(alloc, P_RESET) catch continue;
+        }
+        line.appendSlice(alloc, "\n") catch continue;
+        stderr.writeAll(line.items) catch {};
+    }
+}
+
+fn emitAgentDone(alloc: std.mem.Allocator, obj: std.json.ObjectMap) void {
+    _ = alloc;
+    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    const is_err = if (obj.get("subtype")) |sv|
+        (sv == .string and std.mem.eql(u8, sv.string, "error"))
+    else
+        false;
+    if (is_err) {
+        stderr.writeAll("  " ++ P_RED ++ P_CROSS ++ " agent error" ++ P_RESET ++ "\n") catch {};
+    } else {
+        stderr.writeAll("  " ++ P_GREEN ++ P_CHECK ++ " agent done" ++ P_RESET ++ "\n") catch {};
+    }
+}
+
 /// Run one agent turn. Writes the agent's final text reply to `out`.
 ///
 /// Prefers `claude -p` (Claude Code CLI) when available.
@@ -80,8 +167,28 @@ pub fn tryClaudeAgent(
         opts.permission_mode orelse if (opts.writable) "bypassPermissions" else "default";
     const model = opts.model orelse "claude-sonnet-4-6";
 
-    // Build argv in a fixed-size stack buffer (22 slots is sufficient).
-    var argv_buf: [22][]const u8 = undefined;
+    // Write a temp MCP config so sub-agents have muonry (read/edit/search/…) available.
+    var mcp_tmp: [128]u8 = undefined;
+    var mcp_tmp_len: usize = 0;
+    {
+        const mcp_json =
+            \\{"mcpServers":{"muonry":{"command":"muonry","args":[]}}}
+        ;
+        const ts: u64 = @intCast(@max(0, std.time.milliTimestamp()));
+        if (std.fmt.bufPrint(&mcp_tmp, "/tmp/.devswarm_{d}.json", .{ts})) |p| {
+            mcp_tmp_len = p.len;
+            if (std.fs.cwd().createFile(p, .{})) |f| {
+                f.writeAll(mcp_json) catch {};
+                f.close();
+            } else |_| {
+                mcp_tmp_len = 0;
+            }
+        } else |_| {}
+    }
+    defer if (mcp_tmp_len > 0) std.fs.cwd().deleteFile(mcp_tmp[0..mcp_tmp_len]) catch {};
+
+    // Build argv in a fixed-size stack buffer (26 slots).
+    var argv_buf: [26][]const u8 = undefined;
     var argc: usize = 0;
     argv_buf[argc] = "claude";            argc += 1;
     argv_buf[argc] = "-p";               argc += 1;
@@ -102,6 +209,11 @@ pub fn tryClaudeAgent(
     if (opts.allowed_tools) |at| {
         argv_buf[argc] = "--allowedTools"; argc += 1;
         argv_buf[argc] = at;               argc += 1;
+    }
+
+    if (mcp_tmp_len > 0) {
+        argv_buf[argc] = "--mcp-config"; argc += 1;
+        argv_buf[argc] = mcp_tmp[0..mcp_tmp_len]; argc += 1;
     }
 
     // Inherit environment but strip CLAUDECODE (nested-session guard).
@@ -243,7 +355,10 @@ fn parseClaudeLine(
                 found_result.* = true;
             }
         }
+        emitAgentDone(alloc, obj);
     } else if (std.mem.eql(u8, type_str, "assistant")) {
+        // Emit tool_use events to stderr for live progress
+        emitToolUseProgress(alloc, obj);
         // Accumulate assistant text as fallback when result event is absent.
         extractAssistantText(alloc, obj, accumulated);
     }

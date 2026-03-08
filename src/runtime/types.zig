@@ -8,11 +8,13 @@ const std = @import("std");
 pub const Backend = enum {
     claude,  // `claude -p` (Claude Code CLI)
     codex,   // `codex app-server` (Codex app-server protocol)
+    gemini,  // `gemini` (Google Gemini CLI)
 
     pub fn label(self: Backend) []const u8 {
         return switch (self) {
             .claude => "claude",
             .codex  => "codex",
+            .gemini => "gemini",
         };
     }
 };

@@ -13,17 +13,19 @@ const Backend = types.Backend;
 pub const Backends = struct {
     claude: bool = false,
     codex: bool = false,
+    gemini: bool = false,
 
     pub fn any(self: Backends) bool {
-        return self.claude or self.codex;
+        return self.claude or self.codex or self.gemini;
     }
 
-    /// Return the preferred backend (claude first, then codex).
+    /// Return the preferred backend (claude first, then codex, then gemini).
     /// This is NOT a hardcoded preference — resolve() can override based on
     /// role/mode/config. This is just the "if nothing else says otherwise" default.
     pub fn preferred(self: Backends) ?Backend {
         if (self.claude) return .claude;
         if (self.codex)  return .codex;
+        if (self.gemini) return .gemini;
         return null;
     }
 };
@@ -80,6 +82,22 @@ pub fn probe(alloc: std.mem.Allocator) Backends {
             if (gh.run(alloc, &.{ shell, "-lc", "codex --version" })) |r| {
                 r.deinit(alloc);
                 g_backends.codex = true;
+            } else |_| {}
+        }
+    }
+
+    // Probe gemini CLI
+    if (gh.run(alloc, &.{ "gemini", "--version" })) |r| {
+        r.deinit(alloc);
+        g_backends.gemini = true;
+    } else |_| {
+        const shell_owned = std.process.getEnvVarOwned(alloc, "SHELL") catch null;
+        defer if (shell_owned) |sh| alloc.free(sh);
+        const shell = shell_owned orelse "/bin/zsh";
+        if (shell.len > 0) {
+            if (gh.run(alloc, &.{ shell, "-lc", "gemini --version" })) |r| {
+                r.deinit(alloc);
+                g_backends.gemini = true;
             } else |_| {}
         }
     }

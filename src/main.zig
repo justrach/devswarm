@@ -335,6 +335,173 @@ fn setThreadRepoPath(alloc: std.mem.Allocator, ctx: *ThreadContext, repo_path: [
     ctx.repo_path = owned;
 }
 
+// ─── MCP response UX ──────────────────────────────────────────────────────
+const C_RESET        = "\x1b[0m";
+const C_BOLD         = "\x1b[1m";
+const C_DIM          = "\x1b[2m";
+const C_RED          = "\x1b[31m";
+const C_GREEN        = "\x1b[32m";
+const C_YELLOW       = "\x1b[33m";
+const C_BLUE         = "\x1b[34m";
+const C_MAGENTA      = "\x1b[35m";
+const C_CYAN         = "\x1b[36m";
+const C_BRIGHT_GREEN = "\x1b[92m";
+
+const U_CHECK = "\xe2\x9c\x93";   // ✓
+const U_CROSS = "\xe2\x9c\x97";   // ✗
+const U_DASH  = " \xe2\x80\x94 "; //  —
+const U_ARROW = "\xe2\x86\x92 ";  // →
+const U_DOT   = "\xe2\x80\xa2 ";  // •
+const U_ZAP   = "\xe2\x9a\xa1";   // ⚡
+
+fn formatDuration(buf: []u8, ns: i128) []const u8 {
+    if (ns < 0) return "";
+    const uns: u64 = @intCast(@min(ns, std.math.maxInt(u64)));
+    if (uns < 1_000) {
+        return std.fmt.bufPrint(buf, "  " ++ C_CYAN ++ U_ZAP ++ " {d}ns" ++ C_RESET, .{uns}) catch "";
+    } else if (uns < 1_000_000) {
+        const us   = uns / 1_000;
+        const frac = (uns % 1_000) / 100;
+        return std.fmt.bufPrint(buf, "  " ++ C_CYAN ++ U_ZAP ++ " {d}.{d}\xc2\xb5s" ++ C_RESET, .{ us, frac }) catch "";
+    } else if (uns < 1_000_000_000) {
+        const ms   = uns / 1_000_000;
+        const frac = (uns % 1_000_000) / 100_000;
+        if (ms < 10) {
+            return std.fmt.bufPrint(buf, "  " ++ C_BRIGHT_GREEN ++ U_ZAP ++ " {d}.{d}ms" ++ C_RESET, .{ ms, frac }) catch "";
+        } else if (ms < 100) {
+            return std.fmt.bufPrint(buf, "  " ++ C_GREEN ++ "{d}.{d}ms" ++ C_RESET, .{ ms, frac }) catch "";
+        } else {
+            return std.fmt.bufPrint(buf, "  " ++ C_BLUE ++ "{d}.{d}ms" ++ C_RESET, .{ ms, frac }) catch "";
+        }
+    } else {
+        const s    = uns / 1_000_000_000;
+        const frac = (uns % 1_000_000_000) / 100_000_000;
+        return std.fmt.bufPrint(buf, "  " ++ C_YELLOW ++ "{d}.{d}s" ++ C_RESET, .{ s, frac }) catch "";
+    }
+}
+
+fn toolColor(name: []const u8) []const u8 {
+    const eq = std.mem.eql;
+    // Issues
+    if (eq(u8, name, "create_issue")      or eq(u8, name, "create_issues_batch") or
+        eq(u8, name, "update_issue")       or eq(u8, name, "close_issue")         or
+        eq(u8, name, "close_issues_batch") or eq(u8, name, "link_issues")         or
+        eq(u8, name, "get_issue"))         return C_YELLOW;
+    // PRs
+    if (eq(u8, name, "create_pr")    or eq(u8, name, "get_pr_status") or
+        eq(u8, name, "list_open_prs") or eq(u8, name, "merge_pr")     or
+        eq(u8, name, "get_pr_diff"))  return C_MAGENTA;
+    // Branches / commits
+    if (eq(u8, name, "create_branch")      or eq(u8, name, "get_current_branch") or
+        eq(u8, name, "commit_with_context") or eq(u8, name, "push_branch"))       return C_CYAN;
+    // Analysis
+    if (eq(u8, name, "review_pr_impact") or eq(u8, name, "blast_radius")   or
+        eq(u8, name, "relevant_context") or eq(u8, name, "git_history_for") or
+        eq(u8, name, "recently_changed")) return C_BLUE;
+    // Graph
+    if (eq(u8, name, "symbol_at")     or eq(u8, name, "find_callers")   or
+        eq(u8, name, "find_callees")   or eq(u8, name, "find_dependents")) return C_GREEN;
+    // Planning
+    if (eq(u8, name, "decompose_feature") or eq(u8, name, "get_project_state") or
+        eq(u8, name, "get_next_task")     or eq(u8, name, "prioritize_issues")) return C_BRIGHT_GREEN;
+    // Agents / swarm
+    if (eq(u8, name, "run_reviewer")    or eq(u8, name, "run_explorer")   or
+        eq(u8, name, "run_zig_infra")   or eq(u8, name, "run_swarm")      or
+        eq(u8, name, "review_fix_loop") or eq(u8, name, "run_agent")      or
+        eq(u8, name, "run_task"))        return C_RED;
+    return C_DIM;
+}
+
+fn generateSummary(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    args: *const std.json.ObjectMap,
+    output: []const u8,
+    is_error: bool,
+    elapsed: i128,
+    buf: *std.ArrayList(u8),
+) void {
+    if (is_error) {
+        var err_msg: []const u8 = "failed";
+        if (std.mem.indexOf(u8, output, "\"error\":\"")) |idx| {
+            const after = output[idx + 9 ..];
+            if (std.mem.indexOfScalar(u8, after, '"')) |end| err_msg = after[0..end];
+        }
+        buf.appendSlice(alloc, C_RED ++ U_CROSS ++ " " ++ C_BOLD) catch return;
+        buf.appendSlice(alloc, name) catch return;
+        buf.appendSlice(alloc, C_RESET ++ C_RED ++ " failed" ++ C_RESET ++ U_DASH) catch return;
+        buf.appendSlice(alloc, err_msg) catch return;
+        return;
+    }
+    buf.appendSlice(alloc, C_GREEN ++ U_CHECK ++ " " ++ C_RESET) catch return;
+    buf.appendSlice(alloc, toolColor(name)) catch return;
+    buf.appendSlice(alloc, U_DOT) catch return;
+    buf.appendSlice(alloc, C_RESET ++ C_BOLD) catch return;
+    buf.appendSlice(alloc, name) catch return;
+    buf.appendSlice(alloc, C_RESET) catch return;
+    if (mj.getStr(args, "title")) |title| {
+        buf.appendSlice(alloc, U_DASH ++ C_DIM) catch return;
+        buf.appendSlice(alloc, if (title.len > 60) title[0..60] else title) catch return;
+        buf.appendSlice(alloc, C_RESET) catch return;
+    } else if (args.get("number")) |v| {
+        if (v == .integer) {
+            var tmp: [16]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{v.integer}) catch "";
+            buf.appendSlice(alloc, U_DASH ++ C_CYAN ++ "#") catch return;
+            buf.appendSlice(alloc, s) catch return;
+            buf.appendSlice(alloc, C_RESET) catch return;
+        }
+    } else if (mj.getStr(args, "branch")) |branch| {
+        buf.appendSlice(alloc, U_DASH ++ C_CYAN) catch return;
+        buf.appendSlice(alloc, branch) catch return;
+        buf.appendSlice(alloc, C_RESET) catch return;
+    } else if (mj.getStr(args, "repo")) |repo| {
+        buf.appendSlice(alloc, U_DASH ++ C_DIM) catch return;
+        buf.appendSlice(alloc, repo) catch return;
+        buf.appendSlice(alloc, C_RESET) catch return;
+    } else if (mj.getStr(args, "prompt")) |prompt| {
+        const p = if (prompt.len > 60) prompt[0..60] else prompt;
+        buf.appendSlice(alloc, U_DASH ++ C_DIM ++ "\"") catch return;
+        buf.appendSlice(alloc, p) catch return;
+        if (prompt.len > 60) {
+            buf.appendSlice(alloc, "\xe2\x80\xa6\"" ++ C_RESET) catch return;
+        } else {
+            buf.appendSlice(alloc, "\"" ++ C_RESET) catch return;
+        }
+    }
+    var dur_buf: [96]u8 = undefined;
+    buf.appendSlice(alloc, formatDuration(&dur_buf, elapsed)) catch {};
+}
+
+fn generateGuidance(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    args: *const std.json.ObjectMap,
+    buf: *std.ArrayList(u8),
+) void {
+    _ = args;
+    const eq = std.mem.eql;
+    if (eq(u8, name, "create_branch")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: commit_with_context \xe2\x86\x92 push_branch \xe2\x86\x92 create_pr" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "commit_with_context")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: push_branch then create_pr" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "push_branch")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: create_pr to open a pull request" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "create_issue")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: create_branch to start work, or get_next_task for queue" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "blast_radius") or eq(u8, name, "relevant_context")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: review_pr_impact or create_branch to start changes" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "decompose_feature")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: get_next_task to pick up the first task" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "get_next_task")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: create_branch then implement the task" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "run_swarm")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: review results then push_branch + create_pr" ++ C_RESET) catch {};
+    } else if (eq(u8, name, "run_agent") or eq(u8, name, "run_task")) {
+        buf.appendSlice(alloc, C_DIM ++ U_ARROW ++ "next: run diff to review changes then push_branch" ++ C_RESET) catch {};
+    }
+}
+
 fn handleCall(
     alloc: std.mem.Allocator,
     root: *const std.json.ObjectMap,
@@ -395,15 +562,87 @@ fn handleCall(
         return;
     };
 
+    // Extract MCP progress token from _meta (sent by Claude Code when it wants live updates)
+    const progress_token: []const u8 = blk: {
+        if (params.get("_meta")) |meta_val| {
+            if (meta_val == .object) {
+                if (meta_val.object.get("progressToken")) |pt| {
+                    if (pt == .string) break :blk pt.string;
+                }
+            }
+        }
+        break :blk "";
+    };
+    const progress_ctx: ?tools.ProgressCtx = if (progress_token.len > 0)
+        .{ .stdout = stdout, .token = progress_token }
+    else
+        null;
+
+    // Emit start signal to stderr for long-running agent tools
+    const eq = std.mem.eql;
+    if (eq(u8, name, "run_agent")      or eq(u8, name, "run_swarm")     or
+        eq(u8, name, "run_task")        or eq(u8, name, "run_reviewer")  or
+        eq(u8, name, "run_explorer")    or eq(u8, name, "run_zig_infra") or
+        eq(u8, name, "review_fix_loop"))
+    {
+        const se = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+        var hdr_buf: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hdr_buf,
+            "\x1b[31m\xe2\x9a\xa1\x1b[0m \x1b[1m{s}\x1b[0m\x1b[2m  running\xe2\x80\xa6\x1b[0m\n",
+            .{name},
+        ) catch "";
+        se.writeAll(hdr) catch {};
+    }
+
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    tools.dispatch(alloc, tool, args, &out);
+    const t0 = std.time.nanoTimestamp();
+    tools.dispatch(alloc, tool, args, &out, progress_ctx);
+    const elapsed = std.time.nanoTimestamp() - t0;
+
+    var handler_output = out.items;
+    if (handler_output.len > 0 and handler_output[handler_output.len - 1] == '\n') {
+        handler_output = handler_output[0 .. handler_output.len - 1];
+    }
+
+    const is_error = std.mem.startsWith(u8, handler_output, "{\"error\":");
+
+    var summary: std.ArrayList(u8) = .empty;
+    defer summary.deinit(alloc);
+    generateSummary(alloc, name, args, handler_output, is_error, elapsed, &summary);
+
+    var guidance: std.ArrayList(u8) = .empty;
+    defer guidance.deinit(alloc);
+    if (!is_error) generateGuidance(alloc, name, args, &guidance);
 
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(alloc);
-    result.appendSlice(alloc, "{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
-    mj.writeEscaped(alloc, &result, out.items);
-    result.appendSlice(alloc, "\"}],\"isError\":false}") catch return;
+    result.appendSlice(alloc, "{\"content\":[") catch return;
+
+    // Block 1: human-readable summary (ANSI colors here, zero token cost to model)
+    if (summary.items.len > 0) {
+        result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
+        mj.writeEscaped(alloc, &result, summary.items);
+        result.appendSlice(alloc, "\"},") catch return;
+    }
+
+    // Block 2: structured JSON data (never colored)
+    result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
+    mj.writeEscaped(alloc, &result, handler_output);
+    result.appendSlice(alloc, "\"}") catch return;
+
+    // Block 3: guidance hints
+    if (guidance.items.len > 0) {
+        result.appendSlice(alloc, ",{\"type\":\"text\",\"text\":\"") catch return;
+        mj.writeEscaped(alloc, &result, guidance.items);
+        result.appendSlice(alloc, "\"}") catch return;
+    }
+
+    if (is_error) {
+        result.appendSlice(alloc, "],\"isError\":true}") catch return;
+    } else {
+        result.appendSlice(alloc, "],\"isError\":false}") catch return;
+    }
 
     writeResult(alloc, stdout, id, result.items);
 }

@@ -61,6 +61,7 @@ pub fn runSwarm(
     max_agents: u32,
     out:        *std.ArrayList(u8),
     writable:   bool,
+    progress:   ?@import("progress.zig").ProgressCtx,
 ) void {
     const cap: usize = @min(max_agents, HARD_MAX);
 
@@ -69,11 +70,16 @@ pub fn runSwarm(
         "You are a task orchestrator. Decompose the task below into at most {d} " ++
         "independent, self-contained sub-tasks that can execute in parallel.\n" ++
         "Reply with ONLY a valid JSON array — no markdown fences, no commentary, no explanation:\n" ++
-        "[{{\"role\":\"<role label>\",\"prompt\":\"<full sub-task prompt>\"}},...]\n\n" ++
-        "Task: {s}",
+        "[{{\"role\":\"<role label>\",\"prompt\":\"<full sub-task prompt>\"}},...]" ++
+        "\n\nTask: {s}",
         .{ cap, task },
     ) catch { appendErr(alloc, out, "OOM: orchestrator prompt"); return; };
     defer alloc.free(orch_prompt);
+
+    (std.fs.File{ .handle = std.posix.STDERR_FILENO }).writeAll(
+        "\x1b[31m\xe2\x9a\xa1\x1b[0m \x1b[2mswarm\x1b[0m  decomposing task\xe2\x80\xa6\n",
+    ) catch {};
+    if (progress) |p| p.emit(alloc, 0.05, "decomposing task\xe2\x80\xa6");
 
     // Orchestrator: read-only, rush mode (concise JSON output), no role preamble
     var orch_out: std.ArrayList(u8) = .empty;
@@ -131,8 +137,6 @@ pub fn runSwarm(
         const p_val = obj.get("prompt") orelse continue;
         const r_val = obj.get("role")   orelse std.json.Value{ .string = "agent" };
         const base  = switch (p_val) { .string => |s| s, else => continue };
-        // For writable workers, prepend the tool-use preamble so agents use
-        // zigrep/zigpatch instead of sed/awk.
         const allocated: ?[]u8 = if (writable) blk: {
             const preamble = buildPreamble(alloc);
             const full = std.fmt.allocPrint(alloc, "{s}{s}", .{ preamble, base }) catch null;
@@ -150,6 +154,20 @@ pub fn runSwarm(
     }
 
     if (count == 0) { appendErr(alloc, out, "swarm: no valid sub-tasks extracted"); return; }
+
+    {
+        var _swb: [64]u8 = undefined;
+        const _sws = std.fmt.bufPrint(&_swb,
+            "\x1b[31m\xe2\x9a\xa1\x1b[0m \x1b[2mswarm\x1b[0m  \x1b[1m{d}\x1b[0m\x1b[2m agents running in parallel\x1b[0m\n",
+            .{count},
+        ) catch "";
+        (std.fs.File{ .handle = std.posix.STDERR_FILENO }).writeAll(_sws) catch {};
+    }
+    if (progress) |p| {
+        var msg_buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{d} agents running in parallel", .{count}) catch "agents running";
+        p.emit(alloc, 0.30, msg);
+    }
 
     // ── Phase 3: Join all worker threads ──────────────────────────────────
     for (threads[0..count]) |maybe_t| {
@@ -196,7 +214,6 @@ pub fn runSwarm(
         w.out.deinit(std.heap.page_allocator);
     }
 
-    // Include file manifest in synthesis if available
     if (manifest.len > 0) {
         synth.appendSlice(alloc, "## Files Changed\n```\n") catch {};
         synth.appendSlice(alloc, manifest) catch {};
@@ -204,6 +221,11 @@ pub fn runSwarm(
     }
 
     synth.appendSlice(alloc, "Synthesize the above into a final answer.") catch {};
+
+    (std.fs.File{ .handle = std.posix.STDERR_FILENO }).writeAll(
+        "\x1b[31m\xe2\x9a\xa1\x1b[0m \x1b[2mswarm\x1b[0m  synthesizing\xe2\x80\xa6\n",
+    ) catch {};
+    if (progress) |p| p.emit(alloc, 0.85, "synthesizing\xe2\x80\xa6");
 
     // ── Phase 5: Synthesis agent (read-only, uses synthesizer role) ───────
     {

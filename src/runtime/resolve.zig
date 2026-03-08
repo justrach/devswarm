@@ -49,11 +49,17 @@ pub fn resolve(
             if (std.mem.eql(u8, m, "bolt-medium")) { alias_effort = "medium"; break :blk "gpt-5.4"; }
             if (std.mem.eql(u8, m, "bolt-pro"))    { alias_effort = "high";   break :blk "gpt-5.4"; }
             // single-word aliases
-            if (std.mem.eql(u8, m, "bolt"))   break :blk "gpt-5.4";
-            if (std.mem.eql(u8, m, "spark"))  break :blk "gpt-5.3-codex-spark";
-            if (std.mem.eql(u8, m, "opus"))   break :blk "claude-opus-4-6";
-            if (std.mem.eql(u8, m, "sonnet")) break :blk "claude-sonnet-4-6";
-            if (std.mem.eql(u8, m, "haiku"))  break :blk "claude-haiku-4-5-20251001";
+            if (std.mem.eql(u8, m, "bolt"))         break :blk "gpt-5.4";
+            if (std.mem.eql(u8, m, "spark"))        break :blk "gpt-5.3-codex-spark";
+            if (std.mem.eql(u8, m, "opus"))         break :blk "claude-opus-4-6";
+            if (std.mem.eql(u8, m, "sonnet"))       break :blk "claude-sonnet-4-6";
+            if (std.mem.eql(u8, m, "haiku"))        break :blk "claude-haiku-4-5-20251001";
+            // gemini aliases
+            if (std.mem.eql(u8, m, "flash"))         break :blk "gemini-3-flash-preview";
+            if (std.mem.eql(u8, m, "gemini-flash"))  break :blk "gemini-3-flash-preview";
+            if (std.mem.eql(u8, m, "gemini-pro"))    break :blk "gemini-3.1-pro-preview";
+            if (std.mem.eql(u8, m, "gemini3"))       break :blk "gemini-3-flash-preview";
+            if (std.mem.eql(u8, m, "gemini3-pro"))   break :blk "gemini-3.1-pro-preview";
             break :blk m; // pass through full model IDs
         }
         if (role_spec) |rs| {
@@ -67,10 +73,13 @@ pub fn resolve(
 
     // 4. Resolve backend
     //    gpt-* and codex-* models → codex backend when available
+    //    gemini-* models → gemini backend when available
     const backend: Backend = blk: {
         const is_openai = std.mem.startsWith(u8, model, "gpt-") or
                           std.mem.indexOf(u8, model, "codex") != null;
-        if (is_openai and backends.codex) break :blk .codex;
+        const is_gemini = std.mem.startsWith(u8, model, "gemini-");
+        if (is_openai and backends.codex)  break :blk .codex;
+        if (is_gemini and backends.gemini) break :blk .gemini;
         break :blk backends.preferred() orelse .claude;
     };
 

@@ -24,6 +24,7 @@ pub fn dispatch(
     switch (resolved.backend) {
         .claude => spawnClaude(alloc, resolved, prompt, out),
         .codex  => spawnCodex(alloc, resolved, prompt, out),
+        .gemini => spawnGemini(alloc, resolved, prompt, out),
     }
 }
 
@@ -84,6 +85,46 @@ fn spawnCodex(
     cas.runTurnPolicy(alloc, full_prompt, out, policy);
 }
 
+// ── Gemini backend ────────────────────────────────────────────────────────
+
+fn spawnGemini(
+    alloc: std.mem.Allocator,
+    resolved: ResolvedAgent,
+    prompt: []const u8,
+    out: *std.ArrayList(u8),
+) void {
+    const gh = @import("../gh.zig");
+
+    // Build the full prompt (system + user)
+    const full_prompt = if (resolved.system_prompt.len > 0)
+        std.fmt.allocPrint(alloc, "{s}{s}", .{ resolved.system_prompt, prompt }) catch prompt
+    else
+        prompt;
+    defer if (full_prompt.ptr != prompt.ptr) alloc.free(full_prompt);
+
+    // gemini -m <model> -p "<prompt>"
+    const model = if (resolved.model.len > 0) resolved.model else "gemini-3-flash-preview";
+
+    if (gh.run(alloc, &.{ "gemini", "-m", model, "-p", full_prompt })) |result| {
+        defer result.deinit(alloc);
+        out.appendSlice(alloc, result.stdout) catch {};
+    } else |_| {
+        // Try login shell fallback
+        const shell_owned = std.process.getEnvVarOwned(alloc, "SHELL") catch null;
+        defer if (shell_owned) |sh| alloc.free(sh);
+        const shell = shell_owned orelse "/bin/zsh";
+        const cmd = std.fmt.allocPrint(alloc, "gemini -m {s} -p {s}", .{ model, full_prompt }) catch return;
+        defer alloc.free(cmd);
+        if (gh.run(alloc, &.{ shell, "-lc", cmd })) |r| {
+            defer r.deinit(alloc);
+            out.appendSlice(alloc, r.stdout) catch {};
+        } else |_| {
+            out.appendSlice(alloc, "{\"error\":\"gemini backend unavailable\"}") catch {};
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 // dispatch() can only be integration-tested (needs actual claude/codex on PATH).

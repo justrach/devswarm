@@ -20,6 +20,7 @@ const search = @import("search.zig");
 const graph_query = @import("graph/query.zig");
 const graph_mod   = @import("graph/graph.zig");
 const graph_store = @import("graph/storage.zig");
+pub const ProgressCtx = @import("progress.zig").ProgressCtx;
 
 // ── Dynamic repo slug ─────────────────────────────────────────────────────────
 // Updated from CWD on startup (notifications/initialized) and on every set_repo.
@@ -239,6 +240,7 @@ pub fn dispatch(
     tool: Tool,
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
+    progress: ?ProgressCtx,
 ) void {
     switch (tool) {
         // Planning
@@ -283,7 +285,7 @@ pub fn dispatch(
         .run_explorer          => handleRunExplorer(alloc, args, out),
         .run_zig_infra         => handleRunZigInfra(alloc, args, out),
         // Swarm
-        .run_swarm             => handleRunSwarm(alloc, args, out),
+        .run_swarm             => handleRunSwarm(alloc, args, out, progress),
         // Iterative review-fix loop
         .review_fix_loop       => handleReviewFixLoop(alloc, args, out),
         // Claude Agent SDK
@@ -2045,7 +2047,7 @@ fn handleSetRepo(
     out.appendSlice(alloc, "\"}") catch return;
 }
 
-fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), progress: ?ProgressCtx) void {
     const swarm = @import("swarm.zig");
     const prompt = mj.getStr(args, "prompt") orelse {
         writeErr(alloc, out, "missing required argument: prompt");
@@ -2063,7 +2065,7 @@ fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         }
         break :blk false;
     };
-    swarm.runSwarm(alloc, prompt, max_agents, out, writable);
+    swarm.runSwarm(alloc, prompt, max_agents, out, writable, progress);
 }
 
 fn handleReviewFixLoop(
