@@ -9,8 +9,9 @@
 // there is no allocator contention across threads.
 
 const std = @import("std");
-const mj  = @import("mcp").json;
-const rt   = @import("runtime.zig");
+const mj = @import("mcp").json;
+const rt = @import("runtime.zig");
+const telemetry = @import("telemetry.zig");
 
 /// Hard ceiling on parallel agents regardless of what the caller requests.
 pub const HARD_MAX: u32 = 100;
@@ -18,10 +19,14 @@ pub const HARD_MAX: u32 = 100;
 // ── Worker ────────────────────────────────────────────────────────────────────
 
 const Worker = struct {
-    role:             []const u8,        // borrowed from parsed JSON (valid until parsed.deinit)
-    prompt:           []const u8,        // borrowed from parsed JSON
-    allocated_prompt: ?[]u8 = null,      // non-null for writable workers; freed after thread join
-    out:              std.ArrayList(u8) = .empty,  // written by worker thread, freed by collector
+    id: u32,
+    role: []const u8,
+    prompt: []const u8,
+    allocated_prompt: ?[]u8 = null,
+    out: std.ArrayList(u8) = .empty,
+    start_ms: i64 = 0,
+    end_ms: i64 = 0,
+    model: []const u8 = "claude-sonnet-4-6",
 };
 
 const WorkerArgs = struct {
@@ -32,15 +37,18 @@ const WorkerArgs = struct {
 fn workerFn(args: *WorkerArgs) void {
     const alloc = std.heap.page_allocator;
     const prompt = args.worker.allocated_prompt orelse args.worker.prompt;
+    args.worker.start_ms = std.time.milliTimestamp();
     const req: rt.AgentRequest = .{
-        .prompt   = prompt,
-        .role     = "fixer",
-        .mode     = "smart",
+        .prompt = prompt,
+        .role = "fixer",
+        .mode = "smart",
         .writable = args.writable,
     };
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
     defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
+    args.worker.model = resolved.model;
     rt.dispatch.dispatch(alloc, resolved, prompt, &args.worker.out);
+    args.worker.end_ms = std.time.milliTimestamp();
 }
 
 /// Build the writable-worker preamble using the runtime prompt assembly.
@@ -56,23 +64,33 @@ pub fn buildPreamble(alloc: std.mem.Allocator) []const u8 {
 /// Run an agent swarm for `task`. Blocks until all sub-agents finish and
 /// the synthesis agent has written its result to `out`.
 pub fn runSwarm(
-    alloc:      std.mem.Allocator,
-    task:       []const u8,
+    alloc: std.mem.Allocator,
+    task: []const u8,
     max_agents: u32,
-    out:        *std.ArrayList(u8),
-    writable:   bool,
+    out: *std.ArrayList(u8),
+    writable: bool,
+    telemetry_out_path: ?[]const u8,
 ) void {
     const cap: usize = @min(max_agents, HARD_MAX);
 
+    const tools_mod = @import("tools.zig");
+    const repo = tools_mod.currentRepo();
+    var tel = telemetry.SwarmTelemetry.init(alloc, repo, task);
+    defer tel.deinit();
+
     // ── Phase 1: Orchestrator decomposes task ─────────────────────────────
-    const orch_prompt = std.fmt.allocPrint(alloc,
+    const orch_prompt = std.fmt.allocPrint(
+        alloc,
         "You are a task orchestrator. Decompose the task below into at most {d} " ++
-        "independent, self-contained sub-tasks that can execute in parallel.\n" ++
-        "Reply with ONLY a valid JSON array — no markdown fences, no commentary, no explanation:\n" ++
-        "[{{\"role\":\"<role label>\",\"prompt\":\"<full sub-task prompt>\"}},...]\n\n" ++
-        "Task: {s}",
+            "independent, self-contained sub-tasks that can execute in parallel.\n" ++
+            "Reply with ONLY a valid JSON array — no markdown fences, no commentary, no explanation:\n" ++
+            "[{{\"role\":\"<role label>\",\"prompt\":\"<full sub-task prompt>\"}},...]\n\n" ++
+            "Task: {s}",
         .{ cap, task },
-    ) catch { appendErr(alloc, out, "OOM: orchestrator prompt"); return; };
+    ) catch {
+        appendErr(alloc, out, "OOM: orchestrator prompt");
+        return;
+    };
     defer alloc.free(orch_prompt);
 
     // Orchestrator: read-only, rush mode (concise JSON output), no role preamble
@@ -80,9 +98,9 @@ pub fn runSwarm(
     defer orch_out.deinit(alloc);
     {
         const req: rt.AgentRequest = .{
-            .prompt   = orch_prompt,
-            .role     = null,
-            .mode     = "rush",
+            .prompt = orch_prompt,
+            .role = null,
+            .mode = "rush",
             .writable = false,
         };
         const resolved = rt.resolve.resolveWithProbe(alloc, req);
@@ -93,44 +111,64 @@ pub fn runSwarm(
     // ── Phase 2: Parse sub-tasks from orchestrator output ─────────────────
     const raw = orch_out.items;
     const json_start = std.mem.indexOfScalar(u8, raw, '[') orelse {
-        appendErr(alloc, out, "swarm: orchestrator returned no JSON array"); return;
+        appendErr(alloc, out, "swarm: orchestrator returned no JSON array");
+        return;
     };
     const json_end = std.mem.lastIndexOfScalar(u8, raw, ']') orelse {
-        appendErr(alloc, out, "swarm: orchestrator JSON array not closed"); return;
+        appendErr(alloc, out, "swarm: orchestrator JSON array not closed");
+        return;
     };
     const js = raw[json_start .. json_end + 1];
 
     const parsed = std.json.parseFromSlice(
-        std.json.Value, alloc, js, .{ .ignore_unknown_fields = true },
-    ) catch { appendErr(alloc, out, "swarm: orchestrator returned invalid JSON"); return; };
+        std.json.Value,
+        alloc,
+        js,
+        .{ .ignore_unknown_fields = true },
+    ) catch {
+        appendErr(alloc, out, "swarm: orchestrator returned invalid JSON");
+        return;
+    };
     defer parsed.deinit();
 
     const arr = switch (parsed.value) {
         .array => |a| a,
-        else   => { appendErr(alloc, out, "swarm: orchestrator value is not an array"); return; },
+        else => {
+            appendErr(alloc, out, "swarm: orchestrator value is not an array");
+            return;
+        },
     };
 
     var workers = alloc.alloc(Worker, @min(arr.items.len, cap)) catch {
-        appendErr(alloc, out, "OOM: workers"); return;
+        appendErr(alloc, out, "OOM: workers");
+        return;
     };
     defer alloc.free(workers);
 
     var worker_args = alloc.alloc(WorkerArgs, workers.len) catch {
-        appendErr(alloc, out, "OOM: worker_args"); return;
+        appendErr(alloc, out, "OOM: worker_args");
+        return;
     };
     defer alloc.free(worker_args);
 
     var threads = alloc.alloc(?std.Thread, workers.len) catch {
-        appendErr(alloc, out, "OOM: threads"); return;
+        appendErr(alloc, out, "OOM: threads");
+        return;
     };
     defer alloc.free(threads);
 
     var count: usize = 0;
     for (arr.items[0..@min(arr.items.len, cap)]) |item| {
-        const obj   = switch (item) { .object => |o| o, else => continue };
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
         const p_val = obj.get("prompt") orelse continue;
-        const r_val = obj.get("role")   orelse std.json.Value{ .string = "agent" };
-        const base  = switch (p_val) { .string => |s| s, else => continue };
+        const r_val = obj.get("role") orelse std.json.Value{ .string = "agent" };
+        const base = switch (p_val) {
+            .string => |s| s,
+            else => continue,
+        };
         // For writable workers, prepend the tool-use preamble so agents use
         // zigrep/zigpatch instead of sed/awk.
         const allocated: ?[]u8 = if (writable) blk: {
@@ -140,8 +178,12 @@ pub fn runSwarm(
             break :blk full;
         } else null;
         workers[count] = .{
-            .role             = switch (r_val) { .string => |s| s, else => "agent" },
-            .prompt           = base,
+            .id = @intCast(count),
+            .role = switch (r_val) {
+                .string => |s| s,
+                else => "agent",
+            },
+            .prompt = base,
             .allocated_prompt = allocated,
         };
         worker_args[count] = .{ .worker = &workers[count], .writable = writable };
@@ -149,7 +191,10 @@ pub fn runSwarm(
         count += 1;
     }
 
-    if (count == 0) { appendErr(alloc, out, "swarm: no valid sub-tasks extracted"); return; }
+    if (count == 0) {
+        appendErr(alloc, out, "swarm: no valid sub-tasks extracted");
+        return;
+    }
 
     // ── Phase 3: Join all worker threads ──────────────────────────────────
     for (threads[0..count]) |maybe_t| {
@@ -159,6 +204,23 @@ pub fn runSwarm(
     for (workers[0..count]) |w| {
         if (w.allocated_prompt) |p| alloc.free(p);
     }
+
+    // ── Phase 3a: Collect worker telemetry ───────────────────────────────
+    var grid: telemetry.GridMetrics = .{ .name = "workers" };
+    defer grid.deinit(alloc);
+    for (workers[0..count]) |w| {
+        var wm: telemetry.WorkerMetrics = .{
+            .worker_id = w.id,
+            .role = alloc.dupe(u8, w.role) catch "",
+            .model = alloc.dupe(u8, w.model) catch "",
+            .wall_ms = @intCast(@max(w.end_ms - w.start_ms, 0)),
+        };
+        if (w.out.items.len > 0) {
+            wm.tokens_out = estimateTokens(w.out.items);
+        }
+        grid.addWorker(alloc, wm);
+    }
+    tel.addGrid(grid);
 
     // ── Phase 3b: Capture file manifest for writable swarms ──────────────
     var manifest: []const u8 = "";
@@ -180,14 +242,17 @@ pub fn runSwarm(
     var synth: std.ArrayList(u8) = .empty;
     defer synth.deinit(alloc);
 
-    synth.appendSlice(alloc,
+    synth.appendSlice(
+        alloc,
         "You are a synthesis agent. Combine these parallel sub-agent results " ++
-        "into one coherent, well-structured response:\n\n",
+            "into one coherent, well-structured response:\n\n",
     ) catch {};
 
     for (workers[0..count], 0..) |*w, i| {
         const header = std.fmt.allocPrint(
-            alloc, "## Agent {d} — {s}\n", .{ i + 1, w.role },
+            alloc,
+            "## Agent {d} — {s}\n",
+            .{ i + 1, w.role },
         ) catch "";
         defer alloc.free(header);
         synth.appendSlice(alloc, header) catch {};
@@ -208,15 +273,18 @@ pub fn runSwarm(
     // ── Phase 5: Synthesis agent (read-only, uses synthesizer role) ───────
     {
         const req: rt.AgentRequest = .{
-            .prompt   = synth.items,
-            .role     = "synthesizer",
-            .mode     = "smart",
+            .prompt = synth.items,
+            .role = "synthesizer",
+            .mode = "smart",
             .writable = false,
         };
         const resolved = rt.resolve.resolveWithProbe(alloc, req);
         defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
         rt.dispatch.dispatch(alloc, resolved, synth.items, out);
     }
+
+    // ── Phase 6: Emit telemetry ───────────────────────────────────────────
+    writeTelemetry(alloc, &tel, telemetry_out_path, out);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -225,6 +293,33 @@ fn appendErr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: []const u8)
     out.appendSlice(alloc, "{\"error\":\"") catch return;
     mj.writeEscaped(alloc, out, msg);
     out.appendSlice(alloc, "\"}") catch {};
+}
+
+fn estimateTokens(text: []const u8) u64 {
+    return @intCast((text.len / 4) + 1);
+}
+
+fn writeTelemetry(alloc: std.mem.Allocator, tel: *telemetry.SwarmTelemetry, path: ?[]const u8, out: *std.ArrayList(u8)) void {
+    tel.finalize();
+    const json = tel.toJson(alloc);
+    defer alloc.free(json);
+
+    if (path) |p| {
+        const file = std.fs.cwd().createFile(p, .{}) catch {
+            out.appendSlice(alloc, "\n\n--- Telemetry (write failed) ---\n") catch {};
+            out.appendSlice(alloc, json) catch {};
+            return;
+        };
+        defer file.close();
+        file.writeAll(json) catch {};
+        out.appendSlice(alloc, "\n\n--- Telemetry written to ") catch {};
+        out.appendSlice(alloc, p) catch {};
+        out.appendSlice(alloc, " ---\n") catch {};
+    } else {
+        out.appendSlice(alloc, "\n\n--- Telemetry ---\n") catch {};
+        out.appendSlice(alloc, json) catch {};
+        out.appendSlice(alloc, "\n") catch {};
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
