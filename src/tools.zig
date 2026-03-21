@@ -11,22 +11,22 @@
 // Whatever ends up in `out` becomes the tool response text shown to the model.
 // On error: write a JSON error object to `out` — never crash the server.
 
-const std   = @import("std");
-const mj    = @import("mcp").json;
-const gh    = @import("gh.zig");
+const std = @import("std");
+const mj = @import("mcp").json;
+const gh = @import("gh.zig");
 const cache = @import("cache.zig");
-const state  = @import("state.zig");
+const state = @import("state.zig");
 const search = @import("search.zig");
 const graph_query = @import("graph/query.zig");
-const graph_mod   = @import("graph/graph.zig");
+const graph_mod = @import("graph/graph.zig");
 const graph_store = @import("graph/storage.zig");
 
 // ── Dynamic repo slug ─────────────────────────────────────────────────────────
 // Updated from CWD on startup (notifications/initialized) and on every set_repo.
 // MCP dispatch is single-threaded; mutex is belt-and-suspenders for drainer threads.
-var g_repo_mu:  std.Thread.Mutex = .{};
-var g_repo_buf: [512]u8          = undefined;
-var g_repo_len: usize            = 0;
+var g_repo_mu: std.Thread.Mutex = .{};
+var g_repo_buf: [512]u8 = undefined;
+var g_repo_len: usize = 0;
 
 /// Returns the current GitHub repo slug (owner/repo), or "" if not detected.
 pub fn currentRepo() []const u8 {
@@ -219,7 +219,7 @@ pub const tools_list =
     \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"}},"required":[]}},
     \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
-    \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"}},"required":["prompt"]}},
+    \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"},"telemetry_out":{"type":"string","description":"Optional file path to write telemetry JSON (cost, tokens, wall time, parallelism)"}},"required":["prompt"]}},
     \\{"name":"review_fix_loop","description":"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review criteria"},"max_iterations":{"type":"integer","description":"Maximum review-fix cycles (default 3, max 5)"}},"required":[]}},
     \\{"name":"run_agent","description":"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The task or question for the agent"},"model":{"type":"string","description":"Model alias or full ID (default: claude-sonnet-4-6). Use \"opus\" for hardest tasks, \"haiku\" for fast/cheap."},"role":{"type":"string","description":"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor"},"mode":{"type":"string","enum":["smart","rush","deep","free"],"description":"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)"},"allowed_tools":{"type":"string","description":"Comma-separated tool allowlist, e.g. \"Bash,Read,Edit\". Omit to allow all tools."},"permission_mode":{"type":"string","enum":["default","acceptEdits","bypassPermissions"],"description":"Permission mode for file and shell operations"},"writable":{"type":"boolean","description":"Allow file writes (maps to bypassPermissions when permission_mode is unset)"},"cwd":{"type":"string","description":"Working directory override (default: current repo path)"}},"required":["prompt"]}},
     \\{"name":"run_task","description":"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Task description — what needs to be done"},"preset":{"type":"string","enum":["finder_fixer","reviewer_fixer","explore_report","architect_build","custom"],"description":"Chain preset (default: auto-select based on task)"},"mode":{"type":"string","enum":["smart","rush","deep","free"],"description":"Agent mode for all agents in the chain"},"max_agents":{"type":"integer","description":"Max agents to spawn (default: preset-determined)"},"writable":{"type":"boolean","description":"Override write access (default: role-determined)"},"permission_mode":{"type":"string","enum":["default","acceptEdits","bypassPermissions"],"description":"Permission mode for file and shell operations"}},"required":["task"]}}
@@ -242,58 +242,56 @@ pub fn dispatch(
 ) void {
     switch (tool) {
         // Planning
-        .decompose_feature     => handleDecomposeFeature(alloc, args, out),
-        .get_project_state     => handleGetProjectState(alloc, args, out),
-        .get_next_task         => handleGetNextTask(alloc, args, out),
-        .prioritize_issues     => handlePrioritizeIssues(alloc, args, out),
+        .decompose_feature => handleDecomposeFeature(alloc, args, out),
+        .get_project_state => handleGetProjectState(alloc, args, out),
+        .get_next_task => handleGetNextTask(alloc, args, out),
+        .prioritize_issues => handlePrioritizeIssues(alloc, args, out),
         // Issues
-        .create_issue          => handleCreateIssue(alloc, args, out),
-        .create_issues_batch   => handleCreateIssuesBatch(alloc, args, out),
-        .update_issue          => handleUpdateIssue(alloc, args, out),
-        .close_issues_batch    => handleCloseIssuesBatch(alloc, args, out),
-        .close_issue           => handleCloseIssue(alloc, args, out),
-        .link_issues           => handleLinkIssues(alloc, args, out),
-        .get_issue             => handleGetIssue(alloc, args, out),
+        .create_issue => handleCreateIssue(alloc, args, out),
+        .create_issues_batch => handleCreateIssuesBatch(alloc, args, out),
+        .update_issue => handleUpdateIssue(alloc, args, out),
+        .close_issues_batch => handleCloseIssuesBatch(alloc, args, out),
+        .close_issue => handleCloseIssue(alloc, args, out),
+        .link_issues => handleLinkIssues(alloc, args, out),
+        .get_issue => handleGetIssue(alloc, args, out),
         // Branches & commits
-        .create_branch         => handleCreateBranch(alloc, args, out),
-        .get_current_branch    => handleGetCurrentBranch(alloc, args, out),
-        .commit_with_context   => handleCommitWithContext(alloc, args, out),
-        .push_branch           => handlePushBranch(alloc, args, out),
+        .create_branch => handleCreateBranch(alloc, args, out),
+        .get_current_branch => handleGetCurrentBranch(alloc, args, out),
+        .commit_with_context => handleCommitWithContext(alloc, args, out),
+        .push_branch => handlePushBranch(alloc, args, out),
         // Pull requests
-        .create_pr             => handleCreatePr(alloc, args, out),
-        .get_pr_status         => handleGetPrStatus(alloc, args, out),
-        .list_open_prs         => handleListOpenPrs(alloc, args, out),
-        .merge_pr              => handleMergePr(alloc, args, out),
-        .get_pr_diff           => handleGetPrDiff(alloc, args, out),
+        .create_pr => handleCreatePr(alloc, args, out),
+        .get_pr_status => handleGetPrStatus(alloc, args, out),
+        .list_open_prs => handleListOpenPrs(alloc, args, out),
+        .merge_pr => handleMergePr(alloc, args, out),
+        .get_pr_diff => handleGetPrDiff(alloc, args, out),
         // Analysis
-        .review_pr_impact      => handleReviewPrImpact(alloc, args, out),
-        .blast_radius          => handleBlastRadius(alloc, args, out),
-        .relevant_context      => handleRelevantContext(alloc, args, out),
-        .git_history_for       => handleGitHistoryFor(alloc, args, out),
-        .recently_changed      => handleRecentlyChanged(alloc, args, out),
+        .review_pr_impact => handleReviewPrImpact(alloc, args, out),
+        .blast_radius => handleBlastRadius(alloc, args, out),
+        .relevant_context => handleRelevantContext(alloc, args, out),
+        .git_history_for => handleGitHistoryFor(alloc, args, out),
+        .recently_changed => handleRecentlyChanged(alloc, args, out),
         // Graph queries
-        .symbol_at             => handleSymbolAt(alloc, args, out),
-        .find_callers          => handleFindCallers(alloc, args, out),
-        .find_callees          => handleFindCallees(alloc, args, out),
-        .find_dependents       => handleFindDependents(alloc, args, out),
+        .symbol_at => handleSymbolAt(alloc, args, out),
+        .find_callers => handleFindCallers(alloc, args, out),
+        .find_callees => handleFindCallees(alloc, args, out),
+        .find_dependents => handleFindDependents(alloc, args, out),
         // Repository management
-        .set_repo              => handleSetRepo(alloc, args, out),
+        .set_repo => handleSetRepo(alloc, args, out),
         // Agents
-        .run_reviewer          => handleRunReviewer(alloc, args, out),
-        .run_explorer          => handleRunExplorer(alloc, args, out),
-        .run_zig_infra         => handleRunZigInfra(alloc, args, out),
+        .run_reviewer => handleRunReviewer(alloc, args, out),
+        .run_explorer => handleRunExplorer(alloc, args, out),
+        .run_zig_infra => handleRunZigInfra(alloc, args, out),
         // Swarm
-        .run_swarm             => handleRunSwarm(alloc, args, out),
+        .run_swarm => handleRunSwarm(alloc, args, out),
         // Iterative review-fix loop
-        .review_fix_loop       => handleReviewFixLoop(alloc, args, out),
+        .review_fix_loop => handleReviewFixLoop(alloc, args, out),
         // Claude Agent SDK
-        .run_agent             => handleRunAgent(alloc, args, out),
+        .run_agent => handleRunAgent(alloc, args, out),
         // Smart executor
-        .run_task              => handleRunTask(alloc, args, out),
+        .run_task => handleRunTask(alloc, args, out),
     }
 }
-
-
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 //
@@ -314,10 +312,9 @@ fn handleDecomposeFeature(
         return;
     };
     const labels_r = gh.run(alloc, &.{
-        "gh", "label", "list",
-        "--repo", repo,
-        "--json", "name,description,color",
-        "--limit", "100",
+        "gh",                     "label",   "list",
+        "--repo",                 repo,      "--json",
+        "name,description,color", "--limit", "100",
     }) catch null;
     defer if (labels_r) |r| r.deinit(alloc);
 
@@ -342,10 +339,9 @@ fn handleGetProjectState(
     _ = args;
     const repo = repoOrErr(alloc, out) orelse return;
     const issues_r = gh.run(alloc, &.{
-        "gh", "issue", "list",
-        "--repo", repo,
-        "--json", "number,title,labels,state,url",
-        "--limit", "200",
+        "gh",                            "issue",   "list",
+        "--repo",                        repo,      "--json",
+        "number,title,labels,state,url", "--limit", "200",
     }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err));
         return;
@@ -353,10 +349,9 @@ fn handleGetProjectState(
     defer issues_r.deinit(alloc);
 
     const prs_r = gh.run(alloc, &.{
-        "gh", "pr", "list",
-        "--repo", repo,
-        "--json", "number,title,state,headRefName,url",
-        "--limit", "50",
+        "gh",                                 "pr",      "list",
+        "--repo",                             repo,      "--json",
+        "number,title,state,headRefName,url", "--limit", "50",
     }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err));
         return;
@@ -364,13 +359,13 @@ fn handleGetProjectState(
     defer prs_r.deinit(alloc);
 
     const issues_json = std.mem.trim(u8, issues_r.stdout, " \t\n\r");
-    const prs_json    = std.mem.trim(u8, prs_r.stdout,   " \t\n\r");
+    const prs_json = std.mem.trim(u8, prs_r.stdout, " \t\n\r");
 
     out.appendSlice(alloc, "{\"issues\":") catch return;
-    out.appendSlice(alloc, issues_json)     catch return;
+    out.appendSlice(alloc, issues_json) catch return;
     out.appendSlice(alloc, ",\"open_prs\":") catch return;
-    out.appendSlice(alloc, prs_json)        catch return;
-    out.appendSlice(alloc, "}")             catch return;
+    out.appendSlice(alloc, prs_json) catch return;
+    out.appendSlice(alloc, "}") catch return;
 }
 
 fn handleGetNextTask(
@@ -382,11 +377,10 @@ fn handleGetNextTask(
     const repo = repoOrErr(alloc, out) orelse return;
     // Lightweight fetch — just number + labels needed for priority + block filtering
     const parsed = gh.runJson(alloc, &.{
-        "gh", "issue", "list",
-        "--repo", repo,
-        "--label", "status:backlog",
-        "--json", "number,labels",
-        "--limit", "100",
+        "gh",             "issue",  "list",
+        "--repo",         repo,     "--label",
+        "status:backlog", "--json", "number,labels",
+        "--limit",        "100",
     }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err));
         return;
@@ -408,7 +402,7 @@ fn handleGetNextTask(
 
     // Find highest-priority issue that is not blocked
     var best_num: ?i64 = null;
-    var best_prio: u8  = 255;
+    var best_prio: u8 = 255;
 
     for (items) |item| {
         if (item != .object) continue;
@@ -416,9 +410,12 @@ fn handleGetNextTask(
         if (hasLabel(labels_val, "status:blocked")) continue;
         const prio = getPriority(labels_val);
         const num_val = item.object.get("number") orelse continue;
-        const num = switch (num_val) { .integer => |n| n, else => continue };
+        const num = switch (num_val) {
+            .integer => |n| n,
+            else => continue,
+        };
         if (best_num == null or prio < best_prio) {
-            best_num  = num;
+            best_num = num;
             best_prio = prio;
         }
     }
@@ -432,9 +429,8 @@ fn handleGetNextTask(
     var num_buf: [16]u8 = undefined;
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num}) catch return;
     const detail_r = gh.run(alloc, &.{
-        "gh", "issue", "view", num_str,
-        "--repo", repo,
-        "--json", "number,title,body,labels,url,state",
+        "gh",     "issue", "view",   num_str,
+        "--repo", repo,    "--json", "number,title,body,labels,url,state",
     }) catch |err| {
         writeErr(alloc, out, gh.errorMessage(err));
         return;
@@ -450,9 +446,13 @@ fn handlePrioritizeIssues(
 ) void {
     const repo = repoOrErr(alloc, out) orelse return;
     const nums_val = args.get("issue_numbers") orelse {
-        writeErr(alloc, out, "missing issue_numbers"); return;
+        writeErr(alloc, out, "missing issue_numbers");
+        return;
     };
-    if (nums_val != .array) { writeErr(alloc, out, "issue_numbers must be array"); return; }
+    if (nums_val != .array) {
+        writeErr(alloc, out, "issue_numbers must be array");
+        return;
+    }
     const nums = nums_val.array.items;
 
     out.appendSlice(alloc, "{\"prioritized\":[") catch return;
@@ -466,14 +466,13 @@ fn handlePrioritizeIssues(
 
         // Strip old priority labels (ignore error — label may not exist)
         const rm = gh.run(alloc, &.{
-            "gh", "issue", "edit", num_str,
-            "--repo", repo,
-            "--remove-label", "priority:p0,priority:p1,priority:p2,priority:p3",
+            "gh",     "issue", "edit",           num_str,
+            "--repo", repo,    "--remove-label", "priority:p0,priority:p1,priority:p2,priority:p3",
         }) catch null;
         if (rm) |r| r.deinit(alloc);
 
         const r = gh.run(alloc, &.{
-            "gh", "issue", "edit", num_str, "--add-label", prio,
+            "gh",     "issue", "edit", num_str, "--add-label", prio,
             "--repo", repo,
         }) catch |err| {
             if (!first) out.appendSlice(alloc, ",") catch {};
@@ -507,7 +506,8 @@ fn handleCreateIssue(
 ) void {
     const repo = repoOrErr(alloc, out) orelse return;
     const title = mj.getStr(args, "title") orelse {
-        writeErr(alloc, out, "missing title"); return;
+        writeErr(alloc, out, "missing title");
+        return;
     };
 
     // Build body — optionally append parent issue reference
@@ -556,7 +556,8 @@ fn handleCreateIssue(
     if (mj.getStr(args, "milestone")) |ms| argv.appendSlice(alloc, &.{ "--milestone", ms }) catch return;
 
     const r = gh.run(alloc, argv.items) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer r.deinit(alloc);
 
@@ -597,9 +598,13 @@ fn handleCreateIssuesBatch(
     out: *std.ArrayList(u8),
 ) void {
     const issues_val = args.get("issues") orelse {
-        writeErr(alloc, out, "missing issues array"); return;
+        writeErr(alloc, out, "missing issues array");
+        return;
     };
-    if (issues_val != .array) { writeErr(alloc, out, "issues must be array"); return; }
+    if (issues_val != .array) {
+        writeErr(alloc, out, "issues must be array");
+        return;
+    }
 
     out.appendSlice(alloc, "[") catch return;
     var first = true;
@@ -625,9 +630,13 @@ fn handleUpdateIssue(
 ) void {
     const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
-        writeErr(alloc, out, "missing issue_number"); return;
+        writeErr(alloc, out, "missing issue_number");
+        return;
     };
-    if (num_val != .integer) { writeErr(alloc, out, "issue_number must be integer"); return; }
+    if (num_val != .integer) {
+        writeErr(alloc, out, "issue_number must be integer");
+        return;
+    }
     var num_buf: [16]u8 = undefined;
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num_val.integer}) catch return;
 
@@ -636,7 +645,7 @@ fn handleUpdateIssue(
     argv.appendSlice(alloc, &.{ "gh", "issue", "edit", num_str, "--repo", repo }) catch return;
 
     if (mj.getStr(args, "title")) |t| argv.appendSlice(alloc, &.{ "--title", t }) catch return;
-    if (mj.getStr(args, "body"))  |b| argv.appendSlice(alloc, &.{ "--body",  b }) catch return;
+    if (mj.getStr(args, "body")) |b| argv.appendSlice(alloc, &.{ "--body", b }) catch return;
 
     if (args.get("add_labels")) |lv| {
         if (lv == .array) {
@@ -654,11 +663,13 @@ fn handleUpdateIssue(
     }
 
     if (argv.items.len == 6) { // only "gh issue edit N --repo owner/repo" — nothing to do
-        writeErr(alloc, out, "no fields to update"); return;
+        writeErr(alloc, out, "no fields to update");
+        return;
     }
 
     const r = gh.run(alloc, argv.items) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer r.deinit(alloc);
 
@@ -667,16 +678,19 @@ fn handleUpdateIssue(
     out.appendSlice(alloc, s) catch {};
 }
 
-
 fn handleCloseIssuesBatch(
     alloc: std.mem.Allocator,
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
     const numbers_val = args.get("issue_numbers") orelse {
-        writeErr(alloc, out, "missing issue_numbers array"); return;
+        writeErr(alloc, out, "missing issue_numbers array");
+        return;
     };
-    if (numbers_val != .array) { writeErr(alloc, out, "issue_numbers must be array"); return; }
+    if (numbers_val != .array) {
+        writeErr(alloc, out, "issue_numbers must be array");
+        return;
+    }
 
     out.appendSlice(alloc, "[") catch return;
     var first = true;
@@ -708,9 +722,13 @@ fn handleCloseIssue(
 ) void {
     const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
-        writeErr(alloc, out, "missing issue_number"); return;
+        writeErr(alloc, out, "missing issue_number");
+        return;
     };
-    if (num_val != .integer) { writeErr(alloc, out, "issue_number must be integer"); return; }
+    if (num_val != .integer) {
+        writeErr(alloc, out, "issue_number must be integer");
+        return;
+    }
     var num_buf: [16]u8 = undefined;
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num_val.integer}) catch return;
 
@@ -725,16 +743,16 @@ fn handleCloseIssue(
     }
 
     const close_r = gh.run(alloc, &.{ "gh", "issue", "close", num_str, "--repo", repo }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     close_r.deinit(alloc);
 
     // Transition label: remove all status labels, apply status:done
     const edit_r = gh.run(alloc, &.{
-        "gh", "issue", "edit", num_str,
-        "--repo", repo,
-        "--remove-label", "status:backlog,status:in-progress,status:in-review,status:blocked",
-        "--add-label",    "status:done",
+        "gh",          "issue",       "edit",           num_str,
+        "--repo",      repo,          "--remove-label", "status:backlog,status:in-progress,status:in-review,status:blocked",
+        "--add-label", "status:done",
     }) catch null;
     if (edit_r) |r| r.deinit(alloc);
 
@@ -750,17 +768,28 @@ fn handleLinkIssues(
 ) void {
     const repo = repoOrErr(alloc, out) orelse return;
     const blocker_val = args.get("issue_number") orelse {
-        writeErr(alloc, out, "missing issue_number"); return;
+        writeErr(alloc, out, "missing issue_number");
+        return;
     };
-    if (blocker_val != .integer) { writeErr(alloc, out, "issue_number must be integer"); return; }
+    if (blocker_val != .integer) {
+        writeErr(alloc, out, "issue_number must be integer");
+        return;
+    }
     const blocker = blocker_val.integer;
 
     const blocks_val = args.get("blocks") orelse {
-        writeErr(alloc, out, "missing blocks array"); return;
+        writeErr(alloc, out, "missing blocks array");
+        return;
     };
-    if (blocks_val != .array) { writeErr(alloc, out, "blocks must be array"); return; }
+    if (blocks_val != .array) {
+        writeErr(alloc, out, "blocks must be array");
+        return;
+    }
     const blocked_items = blocks_val.array.items;
-    if (blocked_items.len == 0) { out.appendSlice(alloc, "{\"linked\":[]}") catch {}; return; }
+    if (blocked_items.len == 0) {
+        out.appendSlice(alloc, "{\"linked\":[]}") catch {};
+        return;
+    }
 
     // Build comma list "Blocks #X, #Y, #Z" for blocker comment
     var comment: std.ArrayList(u8) = .empty;
@@ -820,26 +849,30 @@ fn handleGetIssue(
 ) void {
     const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
-        writeErr(alloc, out, "missing issue_number"); return;
+        writeErr(alloc, out, "missing issue_number");
+        return;
     };
-    if (num_val != .integer) { writeErr(alloc, out, "issue_number must be integer"); return; }
+    if (num_val != .integer) {
+        writeErr(alloc, out, "issue_number must be integer");
+        return;
+    }
     var num_buf: [16]u8 = undefined;
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num_val.integer}) catch {
-        writeErr(alloc, out, "issue_number out of range"); return;
+        writeErr(alloc, out, "issue_number out of range");
+        return;
     };
 
     const r = gh.run(alloc, &.{
-        "gh", "issue", "view", num_str,
-        "--repo", repo,
-        "--json", "number,title,body,state,labels,url,comments",
+        "gh",     "issue", "view",   num_str,
+        "--repo", repo,    "--json", "number,title,body,state,labels,url,comments",
     }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer r.deinit(alloc);
 
     out.appendSlice(alloc, std.mem.trim(u8, r.stdout, " \t\n\r")) catch {};
 }
-
 
 // ── Branches & commits ────────────────────────────────────────────────────────
 
@@ -850,22 +883,30 @@ fn handleCreateBranch(
 ) void {
     const repo = repoOrErr(alloc, out) orelse return;
     const num_val = args.get("issue_number") orelse {
-        writeErr(alloc, out, "missing issue_number"); return;
+        writeErr(alloc, out, "missing issue_number");
+        return;
     };
-    if (num_val != .integer) { writeErr(alloc, out, "issue_number must be integer"); return; }
+    if (num_val != .integer) {
+        writeErr(alloc, out, "issue_number must be integer");
+        return;
+    }
     const num: u32 = @intCast(num_val.integer);
     var num_buf: [16]u8 = undefined;
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num}) catch return;
 
     // Fetch issue title
     const issue_r = gh.run(alloc, &.{
-        "gh", "issue", "view", num_str, "--json", "title",
+        "gh",     "issue", "view", num_str, "--json", "title",
         "--repo", repo,
-    }) catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
+    }) catch |err| {
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
+    };
     defer issue_r.deinit(alloc);
 
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, issue_r.stdout, .{}) catch {
-        writeErr(alloc, out, "could not parse issue JSON"); return;
+        writeErr(alloc, out, "could not parse issue JSON");
+        return;
     };
     defer parsed.deinit();
 
@@ -882,22 +923,23 @@ fn handleCreateBranch(
     const branch_type: state.BranchType = if (std.mem.eql(u8, branch_type_str, "fix")) .fix else .feature;
 
     const branch_name = state.buildBranchName(alloc, branch_type, num, title) catch {
-        writeErr(alloc, out, "could not build branch name"); return;
+        writeErr(alloc, out, "could not build branch name");
+        return;
     };
     defer alloc.free(branch_name);
 
     // Create local branch
     const checkout_r = gh.run(alloc, &.{ "git", "checkout", "-b", branch_name }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     checkout_r.deinit(alloc);
 
     // Transition issue to in-progress
     const edit_r = gh.run(alloc, &.{
-        "gh", "issue", "edit", num_str,
-        "--repo", repo,
-        "--remove-label", "status:backlog,status:blocked",
-        "--add-label",    "status:in-progress",
+        "gh",          "issue",              "edit",           num_str,
+        "--repo",      repo,                 "--remove-label", "status:backlog,status:blocked",
+        "--add-label", "status:in-progress",
     }) catch null;
     if (edit_r) |r| r.deinit(alloc);
 
@@ -942,7 +984,8 @@ fn handleCommitWithContext(
     out: *std.ArrayList(u8),
 ) void {
     const message = mj.getStr(args, "message") orelse {
-        writeErr(alloc, out, "missing message"); return;
+        writeErr(alloc, out, "missing message");
+        return;
     };
 
     // Resolve issue number: explicit arg > parsed from branch name
@@ -977,24 +1020,28 @@ fn handleCommitWithContext(
                 }
             }
             const add_r = gh.run(alloc, add_argv.items) catch |err| {
-                writeErr(alloc, out, gh.errorMessage(err)); return;
+                writeErr(alloc, out, gh.errorMessage(err));
+                return;
             };
             add_r.deinit(alloc);
         } else {
             const add_r = gh.run(alloc, &.{ "git", "add", "-A" }) catch |err| {
-                writeErr(alloc, out, gh.errorMessage(err)); return;
+                writeErr(alloc, out, gh.errorMessage(err));
+                return;
             };
             add_r.deinit(alloc);
         }
     } else {
         const add_r = gh.run(alloc, &.{ "git", "add", "-A" }) catch |err| {
-            writeErr(alloc, out, gh.errorMessage(err)); return;
+            writeErr(alloc, out, gh.errorMessage(err));
+            return;
         };
         add_r.deinit(alloc);
     }
 
     const commit_r = gh.run(alloc, &.{ "git", "commit", "-m", full_msg }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer commit_r.deinit(alloc);
 
@@ -1041,7 +1088,8 @@ fn handleCreatePr(
     const repo = repoOrErr(alloc, out) orelse return;
     // Determine current branch + linked issue
     const br_r = gh.run(alloc, &.{ "git", "branch", "--show-current" }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer br_r.deinit(alloc);
     const branch = std.mem.trim(u8, br_r.stdout, " \t\n\r");
@@ -1049,9 +1097,9 @@ fn handleCreatePr(
 
     // Resolve title + body — provided args win, else pull from linked issue
     var title_buf: ?[]u8 = null;
-    var body_buf:  ?[]u8 = null;
+    var body_buf: ?[]u8 = null;
     defer if (title_buf) |b| alloc.free(b);
-    defer if (body_buf)  |b| alloc.free(b);
+    defer if (body_buf) |b| alloc.free(b);
 
     const title: []const u8 = blk: {
         if (mj.getStr(args, "title")) |t| break :blk t;
@@ -1073,8 +1121,7 @@ fn handleCreatePr(
                                     if (bv == .string) {
                                         var bb: [16]u8 = undefined;
                                         const ns2 = std.fmt.bufPrint(&bb, "{d}", .{n}) catch "";
-                                        body_buf = std.fmt.allocPrint(alloc,
-                                            "{s}\n\nCloses #{s}", .{ bv.string, ns2 }) catch null;
+                                        body_buf = std.fmt.allocPrint(alloc, "{s}\n\nCloses #{s}", .{ bv.string, ns2 }) catch null;
                                     }
                                 }
                             }
@@ -1100,13 +1147,15 @@ fn handleCreatePr(
     };
 
     const pr_r = gh.run(alloc, &.{
-        "gh", "pr", "create",
-        "--repo", repo,
-        "--base",  "main",
-        "--head",  branch,
-        "--title", title,
-        "--body",  body,
-    }) catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
+        "gh",      "pr",     "create",
+        "--repo",  repo,     "--base",
+        "main",    "--head", branch,
+        "--title", title,    "--body",
+        body,
+    }) catch |err| {
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
+    };
     defer pr_r.deinit(alloc);
 
     // Parse PR number from URL: https://github.com/.../pull/42
@@ -1120,10 +1169,9 @@ fn handleCreatePr(
         var nb: [16]u8 = undefined;
         const ns = std.fmt.bufPrint(&nb, "{d}", .{n}) catch "";
         const er = gh.run(alloc, &.{
-            "gh", "issue", "edit", ns,
-            "--repo", repo,
-            "--remove-label", "status:in-progress",
-            "--add-label",    "status:in-review",
+            "gh",          "issue",            "edit",           ns,
+            "--repo",      repo,               "--remove-label", "status:in-progress",
+            "--add-label", "status:in-review",
         }) catch null;
         if (er) |r| r.deinit(alloc);
     }
@@ -1151,14 +1199,18 @@ fn handleGetPrStatus(
             if (pv == .integer) {
                 var nb: [16]u8 = undefined;
                 const ns = std.fmt.bufPrint(&nb, "{d}", .{pv.integer}) catch {
-                    writeErr(alloc, out, "bad pr_number"); return;
+                    writeErr(alloc, out, "bad pr_number");
+                    return;
                 };
                 break :blk gh.run(alloc, &.{ "gh", "pr", "view", ns, "--repo", repo, "--json", fields });
             }
         }
         // Default: PR for current branch
         break :blk gh.run(alloc, &.{ "gh", "pr", "view", "--repo", repo, "--json", fields });
-    } catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
+    } catch |err| {
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
+    };
     defer r.deinit(alloc);
     out.appendSlice(alloc, std.mem.trim(u8, r.stdout, " \t\n\r")) catch {};
 }
@@ -1171,11 +1223,13 @@ fn handleListOpenPrs(
     _ = args;
     const repo = repoOrErr(alloc, out) orelse return;
     const r = gh.run(alloc, &.{
-        "gh", "pr", "list",
-        "--repo", repo,
-        "--json", "number,title,state,headRefName,url,statusCheckRollup",
-        "--limit", "50",
-    }) catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
+        "gh",                                                   "pr",      "list",
+        "--repo",                                               repo,      "--json",
+        "number,title,state,headRefName,url,statusCheckRollup", "--limit", "50",
+    }) catch |err| {
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
+    };
     defer r.deinit(alloc);
     out.appendSlice(alloc, std.mem.trim(u8, r.stdout, " \t\n\r")) catch {};
 }
@@ -1195,7 +1249,8 @@ fn handleMergePr(
         if (pv == .integer) {
             var nb: [16]u8 = undefined;
             const ns = std.fmt.bufPrint(&nb, "{d}", .{pv.integer}) catch {
-                writeErr(alloc, out, "bad pr_number"); return;
+                writeErr(alloc, out, "bad pr_number");
+                return;
             };
             argv.appendSlice(alloc, &.{ns}) catch return;
         }
@@ -1221,7 +1276,8 @@ fn handleMergePr(
     }
 
     const r = gh.run(alloc, argv.items) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer r.deinit(alloc);
 
@@ -1241,13 +1297,17 @@ fn handleGetPrDiff(
             if (pv == .integer) {
                 var nb: [16]u8 = undefined;
                 const ns = std.fmt.bufPrint(&nb, "{d}", .{pv.integer}) catch {
-                    writeErr(alloc, out, "bad pr_number"); return;
+                    writeErr(alloc, out, "bad pr_number");
+                    return;
                 };
                 break :blk gh.run(alloc, &.{ "gh", "pr", "diff", ns, "--repo", repo });
             }
         }
         break :blk gh.run(alloc, &.{ "gh", "pr", "diff", "--repo", repo });
-    } catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
+    } catch |err| {
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
+    };
     defer r.deinit(alloc);
     out.appendSlice(alloc, "{\"diff\":\"") catch return;
     mj.writeEscaped(alloc, out, std.mem.trim(u8, r.stdout, " \t\n\r"));
@@ -1267,13 +1327,17 @@ fn handleReviewPrImpact(
             if (pv == .integer) {
                 var nb: [16]u8 = undefined;
                 const ns = std.fmt.bufPrint(&nb, "{d}", .{pv.integer}) catch {
-                    writeErr(alloc, out, "bad pr_number"); return;
+                    writeErr(alloc, out, "bad pr_number");
+                    return;
                 };
                 break :blk gh.run(alloc, &.{ "gh", "pr", "diff", ns });
             }
         }
         break :blk gh.run(alloc, &.{ "gh", "pr", "diff" });
-    } catch |err| { writeErr(alloc, out, gh.errorMessage(err)); return; };
+    } catch |err| {
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
+    };
     defer diff_r.deinit(alloc);
 
     const diff = std.mem.trim(u8, diff_r.stdout, " \t\n\r");
@@ -1299,7 +1363,10 @@ fn handleReviewPrImpact(
             if (search.extractFilePath(line)) |path| {
                 if (!seen_files.contains(path)) {
                     const owned = alloc.dupe(u8, path) catch continue;
-                    files.append(alloc, owned) catch { alloc.free(owned); continue; };
+                    files.append(alloc, owned) catch {
+                        alloc.free(owned);
+                        continue;
+                    };
                     seen_files.put(owned, {}) catch {};
                     current_file = owned;
                 } else {
@@ -1317,7 +1384,8 @@ fn handleReviewPrImpact(
                 if (!seen_syms.contains(sym)) {
                     const owned_sym = alloc.dupe(u8, sym) catch continue;
                     symbols.append(alloc, .{ .name = owned_sym, .file = current_file }) catch {
-                        alloc.free(owned_sym); continue;
+                        alloc.free(owned_sym);
+                        continue;
                     };
                     seen_syms.put(owned_sym, {}) catch {};
                     sym_count += 1;
@@ -1332,7 +1400,8 @@ fn handleReviewPrImpact(
                 if (!seen_syms.contains(sym)) {
                     const owned_sym = alloc.dupe(u8, sym) catch continue;
                     symbols.append(alloc, .{ .name = owned_sym, .file = current_file }) catch {
-                        alloc.free(owned_sym); continue;
+                        alloc.free(owned_sym);
+                        continue;
                     };
                     seen_syms.put(owned_sym, {}) catch {};
                     sym_count += 1;
@@ -1416,13 +1485,21 @@ fn handleBlastRadius(
     }
 
     if (sym_arg) |s| {
-        const owned = alloc.dupe(u8, s) catch { writeErr(alloc, out, "alloc failed"); return; };
-        syms.append(alloc, owned) catch { alloc.free(owned); writeErr(alloc, out, "alloc failed"); return; };
+        const owned = alloc.dupe(u8, s) catch {
+            writeErr(alloc, out, "alloc failed");
+            return;
+        };
+        syms.append(alloc, owned) catch {
+            alloc.free(owned);
+            writeErr(alloc, out, "alloc failed");
+            return;
+        };
     }
 
     if (file_arg) |f| {
         const r = gh.run(alloc, &.{ "cat", f }) catch |err| {
-            writeErr(alloc, out, gh.errorMessage(err)); return;
+            writeErr(alloc, out, gh.errorMessage(err));
+            return;
         };
         defer r.deinit(alloc);
 
@@ -1431,7 +1508,10 @@ fn handleBlastRadius(
         for (extracted.items) |s| {
             // Dupe: extracted slices point into r.stdout which is freed by defer above
             const owned = alloc.dupe(u8, s) catch continue;
-            syms.append(alloc, owned) catch { alloc.free(owned); continue; };
+            syms.append(alloc, owned) catch {
+                alloc.free(owned);
+                continue;
+            };
         }
     }
 
@@ -1482,11 +1562,13 @@ fn handleRelevantContext(
     out: *std.ArrayList(u8),
 ) void {
     const file_arg = mj.getStr(args, "file") orelse {
-        writeErr(alloc, out, "missing file"); return;
+        writeErr(alloc, out, "missing file");
+        return;
     };
 
     const r = gh.run(alloc, &.{ "cat", file_arg }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer r.deinit(alloc);
 
@@ -1521,7 +1603,10 @@ fn handleRelevantContext(
                 if (scores.getPtr(ref)) |vp| vp.* += 1;
             } else {
                 const owned = alloc.dupe(u8, ref) catch continue;
-                scores.put(owned, 1) catch { alloc.free(owned); continue; };
+                scores.put(owned, 1) catch {
+                    alloc.free(owned);
+                    continue;
+                };
             }
         }
     }
@@ -1541,7 +1626,10 @@ fn handleRelevantContext(
                         if (scores.getPtr(full)) |vp| vp.* += 10;
                     } else {
                         const owned = alloc.dupe(u8, full) catch continue;
-                        scores.put(owned, 10) catch { alloc.free(owned); continue; };
+                        scores.put(owned, 10) catch {
+                            alloc.free(owned);
+                            continue;
+                        };
                     }
                 }
             }
@@ -1594,7 +1682,8 @@ fn handleGitHistoryFor(
     out: *std.ArrayList(u8),
 ) void {
     const file_arg = mj.getStr(args, "file") orelse {
-        writeErr(alloc, out, "missing file"); return;
+        writeErr(alloc, out, "missing file");
+        return;
     };
 
     var count_buf: [8]u8 = undefined;
@@ -1608,10 +1697,11 @@ fn handleGitHistoryFor(
     };
 
     const r = gh.run(alloc, &.{
-        "git", "log", "--follow", "--format=%h%x00%an%x00%ai%x00%s",
-        "-n", count_str, "--", file_arg,
+        "git", "log",     "--follow", "--format=%h%x00%an%x00%ai%x00%s",
+        "-n",  count_str, "--",       file_arg,
     }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer r.deinit(alloc);
 
@@ -1670,7 +1760,8 @@ fn handleRecentlyChanged(
     const r = gh.run(alloc, &.{
         "git", "log", "--name-only", "--pretty=format:", "-n", count_str,
     }) catch |err| {
-        writeErr(alloc, out, gh.errorMessage(err)); return;
+        writeErr(alloc, out, gh.errorMessage(err));
+        return;
     };
     defer r.deinit(alloc);
 
@@ -1956,7 +2047,6 @@ fn writeErr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: []const u8) 
 
 // ── Repository management ─────────────────────────────────────────────────────
 
-
 // ── Agent runners ─────────────────────────────────────────────────────────────
 //
 // Each handler shells out to `codex exec` with the appropriate prompt.
@@ -1964,12 +2054,12 @@ fn writeErr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: []const u8) 
 // servers (including gitagent-mcp itself), keeping the subprocess fast.
 
 fn runAgentWithRole(
-    alloc:  std.mem.Allocator,
-    role:   []const u8,
-    mode:   ?[]const u8,
+    alloc: std.mem.Allocator,
+    role: []const u8,
+    mode: ?[]const u8,
     writable_flag: ?bool,
     prompt: []const u8,
-    out:    *std.ArrayList(u8),
+    out: *std.ArrayList(u8),
 ) void {
     runChainStep(alloc, role, mode, writable_flag, null, prompt, out);
 }
@@ -1981,10 +2071,10 @@ fn handleRunReviewer(
 ) void {
     const prompt = mj.getStr(args, "prompt") orelse
         "Review the current branch for correctness and memory safety. " ++
-        "Check: errdefer on every allocation, RwLock ordering, " ++
-        "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
-        "PPR push rule correctness, and missing test coverage. " ++
-        "Lead with concrete findings, include file:line references.";
+            "Check: errdefer on every allocation, RwLock ordering, " ++
+            "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
+            "PPR push rule correctness, and missing test coverage. " ++
+            "Lead with concrete findings, include file:line references.";
     runAgentWithRole(alloc, "reviewer", null, false, prompt, out);
 }
 
@@ -2007,9 +2097,9 @@ fn handleRunZigInfra(
 ) void {
     const prompt = mj.getStr(args, "prompt") orelse
         "Review build.zig: check every module uses @import(\"name\") not relative paths, " ++
-        "every module with tests is wired into test_step, no circular deps exist in " ++
-        "types->graph->ppr / types->edge_weights / graph+types->ingest->registry. " ++
-        "Flag any @import(\"../path\") that crosses module boundaries.";
+            "every module with tests is wired into test_step, no circular deps exist in " ++
+            "types->graph->ppr / types->edge_weights / graph+types->ingest->registry. " ++
+            "Flag any @import(\"../path\") that crosses module boundaries.";
     runAgentWithRole(alloc, "fixer", "smart", true, prompt, out);
 }
 
@@ -2063,7 +2153,8 @@ fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         }
         break :blk false;
     };
-    swarm.runSwarm(alloc, prompt, max_agents, out, writable);
+    const telemetry_out: ?[]const u8 = mj.getStr(args, "telemetry_out");
+    swarm.runSwarm(alloc, prompt, max_agents, out, writable, telemetry_out);
 }
 
 fn handleReviewFixLoop(
@@ -2132,13 +2223,14 @@ fn handleReviewFixLoop(
         }
 
         // ── Phase 2: Fix (writable) via runtime pipeline ─────────────────
-        const fix_prompt = std.fmt.allocPrint(alloc,
+        const fix_prompt = std.fmt.allocPrint(
+            alloc,
             "You are a code fixer. The following review findings were reported. " ++
-            "Fix ALL issues listed below. Use zigread to read files, zigpatch to edit, " ++
-            "and zigdiff to verify each fix. Do not introduce new functionality — " ++
-            "only fix the reported issues.\n\n" ++
-            "REVIEW FINDINGS:\n{s}",
-            .{ review_text },
+                "Fix ALL issues listed below. Use zigread to read files, zigpatch to edit, " ++
+                "and zigdiff to verify each fix. Do not introduce new functionality — " ++
+                "only fix the reported issues.\n\n" ++
+                "REVIEW FINDINGS:\n{s}",
+            .{review_text},
         ) catch {
             iter_json.appendSlice(alloc, ",\"fix\":\"OOM: fix prompt\"}") catch return;
             out_json.appendSlice(alloc, iter_json.items) catch return;
@@ -2228,14 +2320,14 @@ fn handleRunAgent(
 
     // Build AgentRequest from MCP params
     const req: rt.AgentRequest = .{
-        .prompt          = final_prompt,
-        .role            = mj.getStr(args, "role"),
-        .mode            = mj.getStr(args, "mode"),
-        .model           = mj.getStr(args, "model"),
-        .allowed_tools   = mj.getStr(args, "allowed_tools"),
+        .prompt = final_prompt,
+        .role = mj.getStr(args, "role"),
+        .mode = mj.getStr(args, "mode"),
+        .model = mj.getStr(args, "model"),
+        .allowed_tools = mj.getStr(args, "allowed_tools"),
         .permission_mode = mj.getStr(args, "permission_mode"),
-        .cwd             = mj.getStr(args, "cwd"),
-        .writable        = blk: {
+        .cwd = mj.getStr(args, "cwd"),
+        .writable = blk: {
             if (args.get("writable")) |v|
                 if (v == .bool) break :blk v.bool;
             break :blk null;
@@ -2259,11 +2351,11 @@ const ChainPreset = enum {
     custom,
 
     fn fromString(s: []const u8) ?ChainPreset {
-        if (std.mem.eql(u8, s, "finder_fixer"))    return .finder_fixer;
-        if (std.mem.eql(u8, s, "reviewer_fixer"))   return .reviewer_fixer;
-        if (std.mem.eql(u8, s, "explore_report"))   return .explore_report;
-        if (std.mem.eql(u8, s, "architect_build"))  return .architect_build;
-        if (std.mem.eql(u8, s, "custom"))           return .custom;
+        if (std.mem.eql(u8, s, "finder_fixer")) return .finder_fixer;
+        if (std.mem.eql(u8, s, "reviewer_fixer")) return .reviewer_fixer;
+        if (std.mem.eql(u8, s, "explore_report")) return .explore_report;
+        if (std.mem.eql(u8, s, "architect_build")) return .architect_build;
+        if (std.mem.eql(u8, s, "custom")) return .custom;
         return null;
     }
 };
@@ -2280,10 +2372,10 @@ fn runChainStep(
 ) void {
     const rt = @import("runtime.zig");
     const req: rt.AgentRequest = .{
-        .prompt          = prompt,
-        .role            = role,
-        .mode            = mode,
-        .writable        = writable_override,
+        .prompt = prompt,
+        .role = role,
+        .mode = mode,
+        .writable = writable_override,
         .permission_mode = permission_mode,
     };
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
@@ -2321,11 +2413,11 @@ fn handleRunTask(
     // Start JSON output
     out.appendSlice(alloc, "{\"preset\":\"") catch return;
     const preset_name: []const u8 = switch (preset) {
-        .finder_fixer    => "finder_fixer",
-        .reviewer_fixer  => "reviewer_fixer",
-        .explore_report  => "explore_report",
+        .finder_fixer => "finder_fixer",
+        .reviewer_fixer => "reviewer_fixer",
+        .explore_report => "explore_report",
         .architect_build => "architect_build",
-        .custom          => "custom",
+        .custom => "custom",
     };
     out.appendSlice(alloc, preset_name) catch return;
     out.appendSlice(alloc, "\",\"steps\":[") catch return;
@@ -2336,9 +2428,11 @@ fn handleRunTask(
             var finder_out: std.ArrayList(u8) = .empty;
             defer finder_out.deinit(alloc);
 
-            const finder_prompt = std.fmt.allocPrint(alloc,
+            const finder_prompt = std.fmt.allocPrint(
+                alloc,
                 "Find all code relevant to the following task. " ++
-                "Report file paths and line numbers.\n\nTASK: {s}", .{task},
+                    "Report file paths and line numbers.\n\nTASK: {s}",
+                .{task},
             ) catch task;
             defer if (finder_prompt.ptr != task.ptr) alloc.free(finder_prompt);
 
@@ -2354,10 +2448,12 @@ fn handleRunTask(
                 // Step 2: fixer (writable) — apply changes based on findings
                 var fixer_out: std.ArrayList(u8) = .empty;
                 defer fixer_out.deinit(alloc);
-                const fixer_prompt = std.fmt.allocPrint(alloc,
+                const fixer_prompt = std.fmt.allocPrint(
+                    alloc,
                     "Fix the following task based on these findings. " ++
-                    "Read files before editing, verify each edit.\n\n" ++
-                    "TASK: {s}\n\nFINDINGS:\n{s}", .{ task, finder_out.items },
+                        "Read files before editing, verify each edit.\n\n" ++
+                        "TASK: {s}\n\nFINDINGS:\n{s}",
+                    .{ task, finder_out.items },
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
@@ -2387,8 +2483,10 @@ fn handleRunTask(
                 var fixer_out: std.ArrayList(u8) = .empty;
                 defer fixer_out.deinit(alloc);
 
-                const fixer_prompt = std.fmt.allocPrint(alloc,
-                    "Fix ALL issues listed below.\n\nREVIEW FINDINGS:\n{s}", .{review_out.items},
+                const fixer_prompt = std.fmt.allocPrint(
+                    alloc,
+                    "Fix ALL issues listed below.\n\nREVIEW FINDINGS:\n{s}",
+                    .{review_out.items},
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
@@ -2416,9 +2514,11 @@ fn handleRunTask(
                 // Step 2: synthesizer (read-only) — summarize findings
                 var synth_out: std.ArrayList(u8) = .empty;
                 defer synth_out.deinit(alloc);
-                const synth_prompt = std.fmt.allocPrint(alloc,
+                const synth_prompt = std.fmt.allocPrint(
+                    alloc,
                     "Synthesize these exploration findings into a clear report.\n\n" ++
-                    "TASK: {s}\n\nFINDINGS:\n{s}", .{ task, explore_out.items },
+                        "TASK: {s}\n\nFINDINGS:\n{s}",
+                    .{ task, explore_out.items },
                 ) catch task;
                 defer if (synth_prompt.ptr != task.ptr) alloc.free(synth_prompt);
 
@@ -2444,9 +2544,11 @@ fn handleRunTask(
             var fixer_out: std.ArrayList(u8) = .empty;
             defer fixer_out.deinit(alloc);
 
-            const fixer_prompt = std.fmt.allocPrint(alloc,
+            const fixer_prompt = std.fmt.allocPrint(
+                alloc,
                 "Implement the following architectural plan.\n\n" ++
-                "PLAN:\n{s}", .{arch_out.items},
+                    "PLAN:\n{s}",
+                .{arch_out.items},
             ) catch task;
             defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
