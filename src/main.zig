@@ -430,12 +430,13 @@ fn handleInitialize(
     stdout: std.fs.File,
     id: ?std.json.Value,
 ) void {
-    writeResult(
+    const response = std.fmt.allocPrint(
         alloc,
-        stdout,
-        id,
-        "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"gitagent-mcp\",\"version\":\"0.1.0\"}}",
-    );
+        "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"devswarm\",\"version\":\"{s}\"}}}}",
+        .{build_options.version},
+    ) catch return;
+    defer alloc.free(response);
+    writeResult(alloc, stdout, id, response);
 }
 
 fn resolveThreadId(
