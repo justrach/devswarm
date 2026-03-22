@@ -27,11 +27,15 @@ jobs:
         run: |
           sed -i 's/"version": "[^"]*"/"version": "${{ inputs.version }}"/' npm/package.json
 
+      - name: Update build.zig fallback version
+        run: |
+          sed -i 's/orelse "[0-9]*\.[0-9]*\.[0-9]*"/orelse "${{ inputs.version }}"/' build.zig
+
       - name: Commit and tag
         run: |
           git config user.name "github-actions"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add build.zig.zon npm/package.json
+          git add build.zig.zon npm/package.json build.zig
           git commit -m "chore: bump version to v${{ inputs.version }}"
           git tag "v${{ inputs.version }}"
           git push origin main --tags
