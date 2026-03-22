@@ -216,7 +216,7 @@ pub const tools_list =
     \\{"name":"find_callees","description":"Find all symbols that the given symbol calls/references. Returns callee name, location, edge kind, and weight. Requires a CodeGraph DB file at .codegraph/graph.bin.","inputSchema":{"type":"object","properties":{"symbol_id":{"type":"integer","description":"Symbol ID to find callees of"}},"required":["symbol_id"]}},
     \\{"name":"find_dependents","description":"Find all symbols that transitively depend on the given symbol, ranked by Personalized PageRank score. Use this to understand the full blast radius of changing a symbol. Requires a CodeGraph DB file at .codegraph/graph.bin.","inputSchema":{"type":"object","properties":{"symbol_id":{"type":"integer","description":"Symbol ID to find dependents of"},"max_results":{"type":"integer","description":"Maximum number of results to return (default 10)"}},"required":["symbol_id"]}},
     \\{"name":"set_repo","description":"Switch the active repository path. All subsequent tool calls will operate against this repo. Invalidates the session cache.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the git repository root"}},"required":["path"]}},
-    \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"}},"required":[]}},
+    \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":[]}},
     \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
     \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"},"telemetry_out":{"type":"string","description":"Optional file path to write telemetry JSON (cost, tokens, wall time, parallelism)"}},"required":["prompt"]}},
@@ -2059,9 +2059,10 @@ fn runAgentWithRole(
     mode: ?[]const u8,
     writable_flag: ?bool,
     prompt: []const u8,
+    timeout_seconds: ?u32,
     out: *std.ArrayList(u8),
 ) void {
-    runChainStep(alloc, role, mode, writable_flag, null, prompt, out);
+    runChainStep(alloc, role, mode, writable_flag, null, prompt, timeout_seconds, out);
 }
 
 fn handleRunReviewer(
@@ -2075,7 +2076,15 @@ fn handleRunReviewer(
             "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
             "PPR push rule correctness, and missing test coverage. " ++
             "Lead with concrete findings, include file:line references.";
-    runAgentWithRole(alloc, "reviewer", null, false, prompt, out);
+    const timeout_seconds: ?u32 = blk: {
+        if (args.get("timeout_seconds")) |v| {
+            if (v == .integer and v.integer > 0) {
+                break :blk @intCast(@min(v.integer, 600));
+            }
+        }
+        break :blk 300;
+    };
+    runAgentWithRole(alloc, "reviewer", null, false, prompt, timeout_seconds, out);
 }
 
 fn handleRunExplorer(
@@ -2087,7 +2096,7 @@ fn handleRunExplorer(
         writeErr(alloc, out, "run_explorer requires a prompt argument");
         return;
     };
-    runAgentWithRole(alloc, "explorer", null, false, prompt, out);
+    runAgentWithRole(alloc, "explorer", null, false, prompt, 300, out);
 }
 
 fn handleRunZigInfra(
@@ -2100,7 +2109,7 @@ fn handleRunZigInfra(
             "every module with tests is wired into test_step, no circular deps exist in " ++
             "types->graph->ppr / types->edge_weights / graph+types->ingest->registry. " ++
             "Flag any @import(\"../path\") that crosses module boundaries.";
-    runAgentWithRole(alloc, "fixer", "smart", true, prompt, out);
+    runAgentWithRole(alloc, "fixer", "smart", true, prompt, 300, out);
 }
 
 fn handleSetRepo(
@@ -2205,7 +2214,7 @@ fn handleReviewFixLoop(
         iter_json.appendSlice(alloc, ",\"review\":\"") catch return;
         var review_out: std.ArrayList(u8) = .empty;
         defer review_out.deinit(alloc);
-        runChainStep(alloc, "reviewer", null, false, null, review_prompt, &review_out);
+        runChainStep(alloc, "reviewer", null, false, null, review_prompt, 300, &review_out);
 
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
@@ -2241,7 +2250,7 @@ fn handleReviewFixLoop(
 
         var fix_out: std.ArrayList(u8) = .empty;
         defer fix_out.deinit(alloc);
-        runChainStep(alloc, "fixer", null, true, null, fix_prompt, &fix_out);
+        runChainStep(alloc, "fixer", null, true, null, fix_prompt, 300, &fix_out);
 
         iter_json.appendSlice(alloc, ",\"fix\":\"") catch return;
         mj.writeEscaped(alloc, &iter_json, fix_out.items);
@@ -2368,6 +2377,7 @@ fn runChainStep(
     writable_override: ?bool,
     permission_mode: ?[]const u8,
     prompt: []const u8,
+    timeout_seconds: ?u32,
     step_out: *std.ArrayList(u8),
 ) void {
     const rt = @import("runtime.zig");
@@ -2380,7 +2390,42 @@ fn runChainStep(
     };
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
     defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
-    rt.dispatch.dispatch(alloc, resolved, prompt, step_out);
+
+    const timeout_ns = @as(u64, timeout_seconds orelse 300) * std.time.ns_per_s;
+
+    const Ctx = struct {
+        alloc: std.mem.Allocator,
+        resolved: rt.ResolvedAgent,
+        prompt: []const u8,
+        out: *std.ArrayList(u8),
+        done: std.Thread.ResetEvent,
+        fn run(ctx: *@This()) void {
+            rt.dispatch.dispatch(ctx.alloc, ctx.resolved, ctx.prompt, ctx.out);
+            ctx.done.set();
+        }
+    };
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .resolved = resolved,
+        .prompt = prompt,
+        .out = step_out,
+        .done = .{},
+    };
+
+    const thread = std.Thread.spawn(.{}, Ctx.run, .{&ctx}) catch {
+        step_out.appendSlice(alloc, "{\"error\":\"failed to spawn agent thread\"}") catch {};
+        return;
+    };
+
+    if (ctx.done.timedWait(timeout_ns)) |_| {
+        thread.join();
+    } else |_| {
+        var ts_buf: [16]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{timeout_seconds orelse 300}) catch "300";
+        step_out.appendSlice(alloc, "{\"timed_out\":true,\"error\":\"agent execution exceeded timeout\",\"timeout_seconds\":") catch {};
+        step_out.appendSlice(alloc, ts) catch {};
+        step_out.appendSlice(alloc, "}") catch {};
+    }
 }
 
 fn handleRunTask(
@@ -2436,7 +2481,7 @@ fn handleRunTask(
             ) catch task;
             defer if (finder_prompt.ptr != task.ptr) alloc.free(finder_prompt);
 
-            runChainStep(alloc, "finder", mode, false, permission_mode, finder_prompt, &finder_out);
+            runChainStep(alloc, "finder", mode, false, permission_mode, finder_prompt, 300, &finder_out);
 
             out.appendSlice(alloc, "{\"role\":\"finder\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, finder_out.items);
@@ -2457,7 +2502,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, &fixer_out);
+                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
 
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2469,7 +2514,7 @@ fn handleRunTask(
             var review_out: std.ArrayList(u8) = .empty;
             defer review_out.deinit(alloc);
 
-            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, &review_out);
+            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, 300, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
@@ -2490,7 +2535,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, &fixer_out);
+                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
 
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2502,7 +2547,7 @@ fn handleRunTask(
             var explore_out: std.ArrayList(u8) = .empty;
             defer explore_out.deinit(alloc);
 
-            runChainStep(alloc, "explorer", mode, false, permission_mode, task, &explore_out);
+            runChainStep(alloc, "explorer", mode, false, permission_mode, task, 300, &explore_out);
 
             out.appendSlice(alloc, "{\"role\":\"explorer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, explore_out.items);
@@ -2522,7 +2567,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (synth_prompt.ptr != task.ptr) alloc.free(synth_prompt);
 
-                runChainStep(alloc, "synthesizer", mode, false, permission_mode, synth_prompt, &synth_out);
+                runChainStep(alloc, "synthesizer", mode, false, permission_mode, synth_prompt, 300, &synth_out);
 
                 out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, synth_out.items);
@@ -2534,7 +2579,7 @@ fn handleRunTask(
             var arch_out: std.ArrayList(u8) = .empty;
             defer arch_out.deinit(alloc);
 
-            runChainStep(alloc, "architect", "deep", false, permission_mode, task, &arch_out);
+            runChainStep(alloc, "architect", "deep", false, permission_mode, task, 300, &arch_out);
 
             out.appendSlice(alloc, "{\"role\":\"architect\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, arch_out.items);
@@ -2552,7 +2597,7 @@ fn handleRunTask(
             ) catch task;
             defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, &fixer_out);
+            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
 
             out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2562,7 +2607,7 @@ fn handleRunTask(
             var review_out: std.ArrayList(u8) = .empty;
             defer review_out.deinit(alloc);
 
-            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, &review_out);
+            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, 300, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
@@ -2573,7 +2618,7 @@ fn handleRunTask(
             var step_out: std.ArrayList(u8) = .empty;
             defer step_out.deinit(alloc);
 
-            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, task, &step_out);
+            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, task, 300, &step_out);
 
             out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, step_out.items);
