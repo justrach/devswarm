@@ -918,4 +918,16 @@ test "protocol: writeResult emits valid JSON-RPC 2.0 result structure" {
 comptime {
     _ = runtime;
     _ = @import("telemetry.zig");
+    _ = @import("auth.zig");
+    _ = @import("rate_limit.zig");
+    _ = @import("graph/edge_weights.zig");
+    _ = @import("graph/watcher.zig");
+    _ = @import("graph/hot_cache.zig");
+    _ = @import("graph/harness.zig");
+    _ = @import("graph/tenant.zig");
+    _ = @import("graph/ingest.zig");
+    _ = @import("graph/monorepo.zig");
+    _ = @import("graph/tier_manager.zig");
+    _ = @import("graph/wal.zig");
+    _ = @import("graph/ppr_incremental.zig");
 }
