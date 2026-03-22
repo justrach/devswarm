@@ -10,35 +10,18 @@ pub const WorkerMetrics = struct {
     tokens_out: u64 = 0,
     wall_ms: u64 = 0,
     errors: u32 = 0,
-    files_read: std.ArrayList([]const u8),
-    files_written: std.ArrayList([]const u8),
 
-    pub fn init(alloc: std.mem.Allocator, id: u32, role: []const u8, model: []const u8) WorkerMetrics {
-        _ = alloc;
+    pub fn init(id: u32, role: []const u8, model: []const u8) WorkerMetrics {
         return .{
             .worker_id = id,
             .role = role,
             .model = model,
-            .files_read = .empty,
-            .files_written = .empty,
         };
     }
 
     pub fn deinit(self: *WorkerMetrics, alloc: std.mem.Allocator) void {
-        for (self.files_read.items) |f| alloc.free(f);
-        for (self.files_written.items) |f| alloc.free(f);
-        self.files_read.deinit(alloc);
-        self.files_written.deinit(alloc);
-    }
-
-    pub fn addFileRead(self: *WorkerMetrics, alloc: std.mem.Allocator, path: []const u8) void {
-        const owned = alloc.dupe(u8, path) catch return;
-        self.files_read.append(alloc, owned) catch alloc.free(owned);
-    }
-
-    pub fn addFileWritten(self: *WorkerMetrics, alloc: std.mem.Allocator, path: []const u8) void {
-        const owned = alloc.dupe(u8, path) catch return;
-        self.files_written.append(alloc, owned) catch alloc.free(owned);
+        _ = self;
+        _ = alloc;
     }
 };
 
@@ -302,21 +285,7 @@ pub const SwarmTelemetry = struct {
         const err_str = std.fmt.bufPrint(&tmp, "{d}", .{w.errors}) catch "";
         buf.appendSlice(alloc, err_str) catch return;
 
-        buf.appendSlice(alloc, ",\"files_read\":[") catch return;
-        for (w.files_read.items, 0..) |f, i| {
-            if (i > 0) buf.appendSlice(alloc, ",") catch return;
-            buf.append(alloc, '"') catch return;
-            mj.writeEscaped(alloc, buf, f);
-            buf.append(alloc, '"') catch return;
-        }
-        buf.appendSlice(alloc, "],\"files_written\":[") catch return;
-        for (w.files_written.items, 0..) |f, i| {
-            if (i > 0) buf.appendSlice(alloc, ",") catch return;
-            buf.append(alloc, '"') catch return;
-            mj.writeEscaped(alloc, buf, f);
-            buf.append(alloc, '"') catch return;
-        }
-        buf.appendSlice(alloc, "]}") catch return;
+        buf.appendSlice(alloc, "}") catch return;
     }
 };
 
@@ -344,25 +313,12 @@ fn estimateCost(model: []const u8, tokens_in: u64, tokens_out: u64) f64 {
 
 test "telemetry: WorkerMetrics init and deinit" {
     const alloc = std.testing.allocator;
-    var w = WorkerMetrics.init(alloc, 0, "finder", "claude-sonnet-4-6");
+    var w = WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");
     defer w.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 0), w.worker_id);
     try std.testing.expectEqualStrings("finder", w.role);
     try std.testing.expectEqual(@as(u32, 0), w.tool_calls);
-}
-
-test "telemetry: WorkerMetrics addFileRead/Write" {
-    const alloc = std.testing.allocator;
-    var w = WorkerMetrics.init(alloc, 1, "fixer", "claude-opus-4-6");
-    defer w.deinit(alloc);
-
-    w.addFileRead(alloc, "src/main.zig");
-    w.addFileWritten(alloc, "src/fix.zig");
-
-    try std.testing.expectEqual(@as(usize, 1), w.files_read.items.len);
-    try std.testing.expectEqual(@as(usize, 1), w.files_written.items.len);
-    try std.testing.expectEqualStrings("src/main.zig", w.files_read.items[0]);
 }
 
 test "telemetry: SwarmTelemetry generates valid swarm_id" {
@@ -385,7 +341,7 @@ test "telemetry: SwarmTelemetry toJson produces valid JSON" {
     t.setRepo("owner/repo");
 
     var grid = GridMetrics.init(alloc, "review");
-    var w = WorkerMetrics.init(alloc, 0, "correctness", "claude-sonnet-4-6");
+    var w = WorkerMetrics.init(0, "correctness", "claude-sonnet-4-6");
     w.tokens_in = 4200;
     w.tokens_out = 1800;
     w.wall_ms = 3400;

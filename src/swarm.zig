@@ -80,7 +80,6 @@ fn parseMetricsFromOutput(_: std.mem.Allocator, output: []const u8, metrics: *te
                     const num_str = output[start..i];
                     if (std.fmt.parseInt(u64, num_str, 10)) |val| {
                         metrics.tokens_in = val;
-                        metrics.tokens_out = val / 3;
                     } else |_| {}
                 }
             }
@@ -255,7 +254,7 @@ pub fn runSwarm(
             .string => |s| s,
             else => "agent",
         };
-        worker_metrics[count] = telemetry.WorkerMetrics.init(alloc, @intCast(count), role_str, "claude-sonnet-4-6");
+        worker_metrics[count] = telemetry.WorkerMetrics.init(@intCast(count), role_str, "claude-sonnet-4-6");
         workers[count] = .{
             .id = @intCast(count),
             .role = role_str,
@@ -370,11 +369,18 @@ pub fn runSwarm(
         std.debug.print("\n[telemetry] {s}\n", .{telemetry_json});
 
         if (telemetry_out) |path| {
-            const file = std.fs.createFileAbsolute(path, .{}) catch |err| {
-                std.debug.print("[telemetry] failed to write to {s}: {}\n", .{ path, err });
-                alloc.free(telemetry_json);
-                return;
-            };
+            const file = if (std.fs.path.isAbsolute(path))
+                std.fs.createFileAbsolute(path, .{}) catch |err| {
+                    std.debug.print("[telemetry] failed to write to {s}: {}\n", .{ path, err });
+                    alloc.free(telemetry_json);
+                    return;
+                }
+            else
+                std.fs.cwd().createFile(path, .{}) catch |err| {
+                    std.debug.print("[telemetry] failed to write to {s}: {}\n", .{ path, err });
+                    alloc.free(telemetry_json);
+                    return;
+                };
             defer file.close();
             file.writeAll(telemetry_json) catch {};
             file.writeAll("\n") catch {};
