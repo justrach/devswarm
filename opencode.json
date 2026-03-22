@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "devswarm": {
+      "type": "local",
+      "command": ["/Users/limyuxi/devswarm/zig-out/bin/devswarm", "--mcp"],
+      "environment": {
+        "REPO_PATH": "/Users/limyuxi/devswarm"
+      },
+      "enabled": true
+    }
+  }
+}
