@@ -29,7 +29,22 @@ jobs:
 
       - name: Update build.zig fallback version
         run: |
-          sed -i 's/orelse "[0-9]*\.[0-9]*\.[0-9]*"/orelse "${{ inputs.version }}"/' build.zig
+          sed -i 's/orelse "[^"]*"/orelse "${{ inputs.version }}"/' build.zig
+
+      - name: Verify version updates
+        run: |
+          echo "Checking version consistency..."
+          ZON_VER=$(grep '\.version = "' build.zig.zon | sed 's/.*"\([^"]*\)".*/\1/')
+          NPM_VER=$(node -p "require('./npm/package.json').version")
+          BUILD_VER=$(grep 'orelse "' build.zig | sed 's/.*orelse "\([^"]*\)".*/\1/')
+          echo "build.zig.zon: $ZON_VER"
+          echo "npm/package.json: $NPM_VER"
+          echo "build.zig: $BUILD_VER"
+          if [ "$ZON_VER" != "${{ inputs.version }}" ] || [ "$NPM_VER" != "${{ inputs.version }}" ] || [ "$BUILD_VER" != "${{ inputs.version }}" ]; then
+            echo "::error::Version update failed - one or more files not updated correctly"
+            exit 1
+          fi
+          echo "All versions updated to ${{ inputs.version }}"
 
       - name: Commit and tag
         run: |
