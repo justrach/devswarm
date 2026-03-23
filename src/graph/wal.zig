@@ -278,7 +278,7 @@ fn parseRecord(data: []const u8, start: usize, op_byte: u8) !ParseResult {
             const id = try readU32(data, &pos);
             const path = try readBytesView(data, &pos);
             if (pos >= data.len) return error.Truncated;
-            const language: Language = @enumFromInt(data[pos]);
+            const language: Language = std.meta.intToEnum(Language, data[pos]) catch return error.InvalidOp;
             pos += 1;
             const last_modified = try readI64(data, &pos);
             if (pos + 32 > data.len) return error.Truncated;
@@ -316,7 +316,7 @@ fn parseRecord(data: []const u8, start: usize, op_byte: u8) !ParseResult {
             const src = try readU64(data, &pos);
             const dst = try readU64(data, &pos);
             if (pos >= data.len) return error.Truncated;
-            const kind: EdgeKind = @enumFromInt(data[pos]);
+            const kind: EdgeKind = std.meta.intToEnum(EdgeKind, data[pos]) catch return error.InvalidOp;
             pos += 1;
             if (pos + 4 > data.len) return error.Truncated;
             const weight: f32 = @bitCast(data[pos..][0..4].*);
@@ -793,6 +793,50 @@ test "WAL single byte of garbage produces zero records" {
     var g = CodeGraph.init(std.testing.allocator);
     defer g.deinit();
     var result = try replay(&garbage, &g, std.testing.allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.records_applied);
+}
+
+test "WAL invalid language byte stops replay without trapping" {
+    var w = WalWriter.init(std.testing.allocator);
+    defer w.deinit();
+
+    try w.logAddFile(.{
+        .id = 1,
+        .path = "a.zig",
+        .language = .zig,
+        .last_modified = 1,
+        .hash = [_]u8{0xAB} ** 32,
+    });
+
+    var corrupted = try std.testing.allocator.dupe(u8, w.data());
+    defer std.testing.allocator.free(corrupted);
+    const language_offset = 1 + 4 + 4 + "a.zig".len;
+    corrupted[language_offset] = 0xFF;
+
+    var g = CodeGraph.init(std.testing.allocator);
+    defer g.deinit();
+    var result = try replay(corrupted, &g, std.testing.allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.records_applied);
+}
+
+test "WAL invalid edge kind byte stops replay without trapping" {
+    var w = WalWriter.init(std.testing.allocator);
+    defer w.deinit();
+
+    try w.logAddEdge(.{ .src = 1, .dst = 2, .kind = .calls, .weight = 1.0 });
+
+    var corrupted = try std.testing.allocator.dupe(u8, w.data());
+    defer std.testing.allocator.free(corrupted);
+    const kind_offset = 1 + 8 + 8;
+    corrupted[kind_offset] = 0xFF;
+
+    var g = CodeGraph.init(std.testing.allocator);
+    defer g.deinit();
+    var result = try replay(corrupted, &g, std.testing.allocator);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.records_applied);
