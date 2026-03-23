@@ -84,6 +84,7 @@ pub const Server = struct {
     alloc: std.mem.Allocator,
     handler: Handler,
     running: bool,
+    socket_path: []const u8,
 
     /// Create a server listening on the given Unix socket path.
     pub fn listen(path: []const u8, handler: Handler, alloc: std.mem.Allocator) !Server {
@@ -97,12 +98,15 @@ pub const Server = struct {
 
         const addr = std.net.Address.initUnix(path) catch return error.InvalidSocketPath;
         const socket = try addr.listen(.{});
+        const owned_path = try alloc.dupe(u8, path);
+        errdefer alloc.free(owned_path);
 
         return .{
             .socket = socket,
             .alloc = alloc,
             .handler = handler,
             .running = true,
+            .socket_path = owned_path,
         };
     }
 
@@ -139,9 +143,14 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.socket.deinit();
         // Clean up socket file
-        std.fs.cwd().deleteFile(SOCKET_PATH) catch {};
+        std.fs.cwd().deleteFile(self.socket_path) catch {};
+        self.alloc.free(self.socket_path);
     }
 };
+
+fn testShutdownHandler(_: []const u8, _: std.mem.Allocator) ?[]u8 {
+    return null;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -343,4 +352,19 @@ test "multiple frames with varying sizes" {
     const f3 = try readFrame(stream.reader(), std.testing.allocator);
     defer std.testing.allocator.free(f3);
     try std.testing.expectEqualStrings("hello world, this is a longer frame payload for testing", f3);
+}
+
+test "server deinit removes actual bound socket path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const alloc = std.testing.allocator;
+    const socket_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/custom-daemon.sock", .{tmp.sub_path});
+    defer alloc.free(socket_path);
+
+    var server = try Server.listen(socket_path, testShutdownHandler, alloc);
+    try std.fs.cwd().access(socket_path, .{});
+
+    server.deinit();
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
 }
