@@ -177,8 +177,12 @@ pub fn assemble(
     mode: AgentMode,
     tier: ToolTier,
 ) []const u8 {
+    const skills = @import("../skills.zig");
     const role_prompt: []const u8 = blk: {
         if (role_name) |rn| {
+            // Check discovered skills first (higher priority)
+            if (skills.getSkillPrompt(rn)) |sp| break :blk sp;
+            // Fall back to built-in roles
             if (roles.getRole(rn)) |role| {
                 if (role.system_prompt) |sp| break :blk sp;
             }

@@ -933,4 +933,5 @@ comptime {
     _ = @import("graph/tier_manager.zig");
     _ = @import("graph/wal.zig");
     _ = @import("graph/ppr_incremental.zig");
+    _ = @import("skills.zig");
 }
