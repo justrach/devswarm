@@ -2177,12 +2177,27 @@ fn handleReviewFixLoop(
     out: *std.ArrayList(u8),
 ) void {
     const default_review_prompt =
-        "Review the current branch for correctness and memory safety. " ++
-        "Check: errdefer on every allocation, RwLock ordering, " ++
-        "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
-        "PPR push rule correctness, and missing test coverage. " ++
-        "Lead with concrete findings, include file:line references. " ++
-        "If you find NO issues, respond with exactly: NO_ISSUES_FOUND";
+        "Review the current codebase for correctness and safety issues. " ++
+        "Score each axis 1-10 and FAIL any axis below its threshold.\n\n" ++
+        "GRADING AXES:\n" ++
+        "  CORRECTNESS (threshold 8): logic errors, off-by-one, missing edge cases, compilation.\n" ++
+        "  SAFETY (threshold 9): errdefer on every alloc, no UAF, no double-free, allocator consistency.\n" ++
+        "  COMPLETENESS (threshold 7): does the code address all parts of the task? Any stubs or TODOs left?\n" ++
+        "  QUALITY (threshold 6): abstraction quality, pattern adherence, no unnecessary complexity.\n\n" ++
+        "OUTPUT FORMAT (you MUST follow this exactly):\n" ++
+        "SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+        "PASS or FAIL (FAIL if ANY axis is below threshold)\n" ++
+        "Then list concrete findings with file:line references.\n" ++
+        "If ALL axes pass and no findings, respond with exactly: NO_ISSUES_FOUND\n\n" ++
+        "EXAMPLE (failing review):\n" ++
+        "SCORES: correctness=7 safety=5 completeness=8 quality=7\n" ++
+        "FAIL (safety below threshold)\n" ++
+        "- [SAFETY] resolve.zig:183 — cfg.deinit frees model string while ResolvedAgent still references it. UAF when config uses full model ID.\n" ++
+        "- [CORRECTNESS] telemetry.zig:150 — addGrid catch {} silently drops OOM, leaves GridMetrics workers buffer leaked.\n\n" ++
+        "EXAMPLE (passing review):\n" ++
+        "SCORES: correctness=9 safety=9 completeness=8 quality=8\n" ++
+        "PASS\n" ++
+        "NO_ISSUES_FOUND";
     const review_prompt = mj.getStr(args, "prompt") orelse default_review_prompt;
 
     const max_iter: u32 = blk: {
@@ -2224,17 +2239,22 @@ fn handleReviewFixLoop(
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
 
-        // Check convergence: reviewer found no issues
+        // Check convergence: reviewer scored PASS or found no issues
         const review_text = review_out.items;
-        if (std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null or
-            review_text.len == 0)
-        {
-            iter_json.appendSlice(alloc, ",\"fix\":null}") catch return;
+        const is_pass = std.mem.indexOf(u8, review_text, "\nPASS") != null or
+            std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
+        const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
+
+        if (is_pass or no_issues or review_text.len == 0) {
+            iter_json.appendSlice(alloc, ",\"verdict\":\"PASS\",\"fix\":null}") catch return;
             out_json.appendSlice(alloc, iter_json.items) catch return;
             completed = i + 1;
             converged = true;
             break;
         }
+
+        // Record FAIL verdict
+        iter_json.appendSlice(alloc, ",\"verdict\":\"FAIL\"") catch return;
 
         // ── Phase 2: Fix (writable) via runtime pipeline ─────────────────
         const fix_prompt = std.fmt.allocPrint(
@@ -2456,7 +2476,6 @@ fn handleRunTask(
         if (mj.getStr(args, "preset")) |p| {
             if (ChainPreset.fromString(p)) |cp| break :blk cp;
         }
-        // Auto-select: default to finder_fixer (most common pattern)
         break :blk .finder_fixer;
     };
 
@@ -2495,15 +2514,35 @@ fn handleRunTask(
             if (std.mem.trim(u8, finder_out.items, " \t\n\r").len == 0) {
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: finder returned empty output\"}") catch return;
             } else {
-                // Step 2: fixer (writable) — apply changes based on findings
+                // Step 2: contract (read-only) — define acceptance criteria before fixing
+                var contract_out: std.ArrayList(u8) = .empty;
+                defer contract_out.deinit(alloc);
+
+                const contract_prompt = std.fmt.allocPrint(
+                    alloc,
+                    "You are defining a sprint contract. Based on the task and findings below, " ++
+                        "write a numbered list of TESTABLE acceptance criteria that the fix must satisfy. " ++
+                        "Each criterion must be verifiable by reading code or running tests. " ++
+                        "Be specific — include file paths, function names, and expected behaviors.\n\n" ++
+                        "TASK: {s}\n\nFINDINGS:\n{s}",
+                    .{ task, finder_out.items },
+                ) catch task;
+                defer if (contract_prompt.ptr != task.ptr) alloc.free(contract_prompt);
+
+                runChainStep(alloc, "reviewer", mode, false, permission_mode, contract_prompt, 120, &contract_out);
+
+                out.appendSlice(alloc, "{\"role\":\"contract\",\"output\":\"") catch return;
+                mj.writeEscaped(alloc, out, contract_out.items);
+                out.appendSlice(alloc, "\"},") catch return;
+
+                // Step 3: fixer (writable) — apply changes against the contract
                 var fixer_out: std.ArrayList(u8) = .empty;
                 defer fixer_out.deinit(alloc);
                 const fixer_prompt = std.fmt.allocPrint(
                     alloc,
-                    "Fix the following task based on these findings. " ++
-                        "Read files before editing, verify each edit.\n\n" ++
-                        "TASK: {s}\n\nFINDINGS:\n{s}",
-                    .{ task, finder_out.items },
+                    "Fix the following task. You MUST satisfy all acceptance criteria in the contract.\n\n" ++
+                        "TASK: {s}\n\nFINDINGS:\n{s}\n\nACCEPTANCE CRITERIA (you must pass ALL):\n{s}",
+                    .{ task, finder_out.items, contract_out.items },
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
@@ -2515,27 +2554,50 @@ fn handleRunTask(
             }
         },
         .reviewer_fixer => {
-            // Step 1: reviewer (read-only) — find issues
+            // Step 1: reviewer (read-only) — find issues with scoring
             var review_out: std.ArrayList(u8) = .empty;
             defer review_out.deinit(alloc);
 
-            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, 300, &review_out);
+            const scored_review_prompt = std.fmt.allocPrint(
+                alloc,
+                "Review the codebase for issues related to the following task. " ++
+                    "Score each axis 1-10.\n\n" ++
+                    "GRADING AXES:\n" ++
+                    "  CORRECTNESS (threshold 8): logic errors, missing edge cases.\n" ++
+                    "  SAFETY (threshold 9): memory safety, allocator consistency.\n" ++
+                    "  COMPLETENESS (threshold 7): does existing code fully address the task?\n" ++
+                    "  QUALITY (threshold 6): abstraction quality, pattern adherence.\n\n" ++
+                    "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+                    "PASS or FAIL, then concrete findings with file:line.\n" ++
+                    "If no issues: NO_ISSUES_FOUND\n\nTASK: {s}",
+                .{task},
+            ) catch task;
+            defer if (scored_review_prompt.ptr != task.ptr) alloc.free(scored_review_prompt);
+
+            runChainStep(alloc, "reviewer", mode, false, permission_mode, scored_review_prompt, 300, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
             // Check convergence
-            if (std.mem.indexOf(u8, review_out.items, "NO_ISSUES_FOUND") != null or std.mem.trim(u8, review_out.items, " \t\n\r").len == 0) {
-                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"No issues to fix\"}") catch return;
+            const review_text = review_out.items;
+            const is_pass = std.mem.indexOf(u8, review_text, "\nPASS") != null or
+                std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
+            const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
+
+            if (is_pass or no_issues or std.mem.trim(u8, review_text, " \t\n\r").len == 0) {
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"No issues to fix — all axes passed\"}") catch return;
             } else {
-                // Step 2: fixer (writable) — fix found issues
+                // Step 2: fixer (writable) — fix found issues, must address all FAIL axes
                 var fixer_out: std.ArrayList(u8) = .empty;
                 defer fixer_out.deinit(alloc);
 
                 const fixer_prompt = std.fmt.allocPrint(
                     alloc,
-                    "Fix ALL issues listed below.\n\nREVIEW FINDINGS:\n{s}",
+                    "Fix ALL issues listed below. The reviewer scored axes and FAILed — " ++
+                        "you must address every finding to bring all axes above threshold.\n\n" ++
+                        "REVIEW FINDINGS:\n{s}",
                     .{review_out.items},
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
