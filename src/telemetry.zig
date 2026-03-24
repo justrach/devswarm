@@ -373,9 +373,9 @@ pub fn upload(alloc: std.mem.Allocator, telemetry_json: []const u8) void {
 
     // Fire and forget — spawn curl, don't wait
     var child = std.process.Child.init(args_buf[0..argc], alloc);
-    child.stdin_behavior = .close;
-    child.stdout_behavior = .close;
-    child.stderr_behavior = .close;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
     child.spawn() catch return;
     // Don't wait — let it finish in the background
 }
