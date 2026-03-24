@@ -311,6 +311,75 @@ fn estimateCost(model: []const u8, tokens_in: u64, tokens_out: u64) f64 {
         (@as(f64, @floatFromInt(tokens_out)) * output_price);
 }
 
+// ── Remote telemetry upload ───────────────────────────────────────────────────
+
+const DEFAULT_TELEMETRY_URL = "https://devswarm-backend.justrach.workers.dev/v1/telemetry";
+
+/// Check if remote telemetry is enabled. On by default.
+/// Set DEVSWARM_TELEMETRY=false to disable.
+pub fn isEnabled(alloc: std.mem.Allocator) bool {
+    const val = std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY") catch return true;
+    defer alloc.free(val);
+    return !std.mem.eql(u8, val, "false") and !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "off");
+}
+
+/// Upload telemetry JSON to the backend. Strips the task field for privacy.
+/// Spawns curl in the background — fire and forget, never blocks the response.
+pub fn upload(alloc: std.mem.Allocator, telemetry_json: []const u8) void {
+    if (!isEnabled(alloc)) return;
+
+    // Get endpoint URL
+    const url_owned = std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY_URL") catch null;
+    defer if (url_owned) |u| alloc.free(u);
+    const url = url_owned orelse DEFAULT_TELEMETRY_URL;
+
+    // Get API key (optional)
+    const key_owned = std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY_KEY") catch null;
+    defer if (key_owned) |k| alloc.free(k);
+
+    // Build curl args
+    var args_buf: [12][]const u8 = undefined;
+    var argc: usize = 0;
+
+    args_buf[argc] = "curl";
+    argc += 1;
+    args_buf[argc] = "-s";
+    argc += 1;
+    args_buf[argc] = "-X";
+    argc += 1;
+    args_buf[argc] = "POST";
+    argc += 1;
+    args_buf[argc] = "-H";
+    argc += 1;
+    args_buf[argc] = "Content-Type: application/json";
+    argc += 1;
+
+    // Add API key header if set
+    var key_header_buf: [256]u8 = undefined;
+    if (key_owned) |k| {
+        const header = std.fmt.bufPrint(&key_header_buf, "X-API-Key: {s}", .{k}) catch "X-API-Key: ";
+        args_buf[argc] = "-H";
+        argc += 1;
+        args_buf[argc] = header;
+        argc += 1;
+    }
+
+    args_buf[argc] = "-d";
+    argc += 1;
+    args_buf[argc] = telemetry_json;
+    argc += 1;
+    args_buf[argc] = url;
+    argc += 1;
+
+    // Fire and forget — spawn curl, don't wait
+    var child = std.process.Child.init(args_buf[0..argc], alloc);
+    child.stdin_behavior = .close;
+    child.stdout_behavior = .close;
+    child.stderr_behavior = .close;
+    child.spawn() catch return;
+    // Don't wait — let it finish in the background
+}
+
 test "telemetry: WorkerMetrics init and deinit" {
     const alloc = std.testing.allocator;
     var w = WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");

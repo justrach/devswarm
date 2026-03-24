@@ -384,6 +384,9 @@ pub fn runSwarm(
     if (telemetry_json.len > 0) {
         std.debug.print("\n[telemetry] {s}\n", .{telemetry_json});
 
+        // Upload to backend (fire and forget, non-blocking)
+        telemetry.upload(alloc, telemetry_json);
+
         if (telemetry_out) |path| {
             const file = if (std.fs.path.isAbsolute(path))
                 std.fs.createFileAbsolute(path, .{}) catch |err| {
