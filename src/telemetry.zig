@@ -313,7 +313,7 @@ fn estimateCost(model: []const u8, tokens_in: u64, tokens_out: u64) f64 {
 
 // ── Remote telemetry upload ───────────────────────────────────────────────────
 
-const DEFAULT_TELEMETRY_URL = "https://devswarm-backend.justrach.workers.dev/v1/telemetry";
+const DEFAULT_TELEMETRY_URL = "https://devswarm.codegraff.com/v1/telemetry";
 
 /// Check if remote telemetry is enabled. On by default.
 /// Set DEVSWARM_TELEMETRY=false to disable.
