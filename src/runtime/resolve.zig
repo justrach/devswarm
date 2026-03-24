@@ -182,8 +182,13 @@ pub fn resolveWithProbe(alloc: std.mem.Allocator, request: AgentRequest) Resolve
     const backends = detect.probe(alloc);
     const tools = cascade.probe(alloc);
     var cfg = config.loadDefault(alloc);
-    defer if (cfg) |*c| c.deinit(alloc);
-    return resolve(alloc, request, backends, tools, cfg);
+    var result = resolve(alloc, request, backends, tools, cfg);
+    // model may point into cfg-owned memory (expandAlias returns full model IDs
+    // unchanged — same pointer into cfg's heap).  Dupe it before freeing cfg so
+    // the returned ResolvedAgent owns its model string independently of cfg.
+    result.model = alloc.dupe(u8, result.model) catch unreachable;
+    if (cfg) |*c| c.deinit(alloc);
+    return result;
 }
 
 /// Expand short model aliases to full canonical IDs.

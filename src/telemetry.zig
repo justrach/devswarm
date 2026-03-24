@@ -46,9 +46,10 @@ pub const GridMetrics = struct {
         self.workers.deinit(alloc);
     }
 
-    pub fn addWorker(self: *GridMetrics, alloc: std.mem.Allocator, worker: WorkerMetrics) void {
-        self.workers.append(alloc, worker) catch {};
+    pub fn addWorker(self: *GridMetrics, alloc: std.mem.Allocator, worker: WorkerMetrics) !void {
+        try self.workers.append(alloc, worker);
     }
+
 
     pub fn aggregate(self: *GridMetrics) void {
         self.total_tokens = 0;
@@ -145,10 +146,14 @@ pub const SwarmTelemetry = struct {
         if (self.repo) |r| self.alloc.free(r);
         self.repo = self.alloc.dupe(u8, repo) catch null;
     }
-
-    pub fn addGrid(self: *Self, alloc: std.mem.Allocator, grid: GridMetrics) void {
-        self.grids.append(alloc, grid) catch {};
+    pub fn addGrid(self: *Self, grid: GridMetrics) !void {
+        self.grids.append(self.alloc, grid) catch |err| {
+            var g = grid;
+            g.deinit(self.alloc);
+            return err;
+        };
     }
+
 
     pub fn finalize(self: *Self) void {
         const end_ms = std.time.milliTimestamp();
@@ -415,9 +420,10 @@ test "telemetry: SwarmTelemetry toJson produces valid JSON" {
     w.tokens_out = 1800;
     w.wall_ms = 3400;
     w.tool_calls = 12;
-    grid.addWorker(alloc, w);
-    t.addGrid(alloc, grid);
+    try grid.addWorker(alloc, w);
+    try t.addGrid(grid);
     t.parallelism_theoretical = 4;
+
 
     const json = t.toJson(alloc);
     defer alloc.free(json);
