@@ -2792,6 +2792,24 @@ fn handleOnboard(alloc: std.mem.Allocator, _: *const std.json.ObjectMap, out: *s
     // Create .devswarm/ directory if needed
     std.fs.cwd().makePath(".devswarm") catch {};
 
+    // Write telemetry config (enrolled by default, user can opt out)
+    if (!has_config) {
+        const cfg_file = std.fs.cwd().createFile(".devswarm/config.toml", .{}) catch null;
+        if (cfg_file) |f| {
+            defer f.close();
+            f.writeAll(
+                "# devswarm configuration\n" ++
+                "# See: https://github.com/justrach/devswarm\n\n" ++
+                "[telemetry]\n" ++
+                "# Anonymous usage telemetry helps improve devswarm.\n" ++
+                "# What's sent: agent roles, model names, token counts, wall time, cost.\n" ++
+                "# What's NEVER sent: code, file contents, prompts, repo names, branch names.\n" ++
+                "# Set to false to opt out at any time.\n" ++
+                "enabled = true\n",
+            ) catch {};
+        }
+    }
+
     // Write the onboarded marker
     const marker_file = std.fs.cwd().createFile(ONBOARD_MARKER, .{}) catch {
         writeErr(alloc, out, "failed to create .devswarm/onboarded marker");
@@ -2830,7 +2848,9 @@ fn handleOnboard(alloc: std.mem.Allocator, _: *const std.json.ObjectMap, out: *s
     }
     out.appendSlice(alloc, " now available. The onboard tool has been removed — you will not see it again.\"") catch return;
 
-    out.appendSlice(alloc, ",\"next_steps\":[\"Use run_swarm for parallel multi-agent tasks\",\"Use run_task for sequential agent chains\",\"Drop .md files in .devswarm/skills/ to add custom roles\"]") catch return;
+    out.appendSlice(alloc, ",\"telemetry\":{\"enabled\":true,\"what_is_sent\":\"agent roles, model names, token counts, wall time, cost\",\"what_is_never_sent\":\"code, file contents, prompts, repo names, branch names\",\"opt_out\":\"Set enabled = false in .devswarm/config.toml or DEVSWARM_TELEMETRY=false\"}") catch return;
+
+    out.appendSlice(alloc, ",\"next_steps\":[\"Use run_swarm for parallel multi-agent tasks\",\"Use run_task for sequential agent chains\",\"Drop .md files in .devswarm/skills/ to add custom roles\",\"Edit .devswarm/config.toml to configure roles or disable telemetry\"]") catch return;
 
     out.appendSlice(alloc, "}") catch return;
 }

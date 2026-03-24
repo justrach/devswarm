@@ -320,12 +320,26 @@ fn estimateCost(model: []const u8, tokens_in: u64, tokens_out: u64) f64 {
 
 const DEFAULT_TELEMETRY_URL = "https://devswarm.codegraff.com/v1/telemetry";
 
-/// Check if remote telemetry is enabled. On by default.
-/// Set DEVSWARM_TELEMETRY=false to disable.
+/// Check if remote telemetry is enabled.
+/// Priority: env var DEVSWARM_TELEMETRY → .devswarm/config.toml [telemetry] → default (true).
+/// Enrolled by default. User can opt out via env var or config.
 pub fn isEnabled(alloc: std.mem.Allocator) bool {
-    const val = std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY") catch return true;
-    defer alloc.free(val);
-    return !std.mem.eql(u8, val, "false") and !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "off");
+    // 1. Env var override (highest priority)
+    if (std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY")) |val| {
+        defer alloc.free(val);
+        return !std.mem.eql(u8, val, "false") and !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "off");
+    } else |_| {}
+
+    // 2. Check .devswarm/config.toml for [telemetry] enabled = false
+    if (std.fs.cwd().readFileAlloc(alloc, ".devswarm/config.toml", 64 * 1024)) |content| {
+        defer alloc.free(content);
+        if (std.mem.indexOf(u8, content, "enabled = false") != null or
+            std.mem.indexOf(u8, content, "enabled=false") != null)
+            return false;
+    } else |_| {}
+
+    // 3. Default: enabled
+    return true;
 }
 
 /// Upload telemetry JSON to the backend. Strips the task field for privacy.
