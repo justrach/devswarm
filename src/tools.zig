@@ -2550,6 +2550,32 @@ fn handleRunTask(
 
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, fixer_out.items);
+                out.appendSlice(alloc, "\"},") catch return;
+
+                // Step 4: verify (read-only) — score the fix against the contract
+                var verify_out: std.ArrayList(u8) = .empty;
+                defer verify_out.deinit(alloc);
+
+                const verify_prompt = std.fmt.allocPrint(
+                    alloc,
+                    "You are verifying a fix against its sprint contract. " ++
+                        "Score each axis 1-10 and PASS or FAIL.\n\n" ++
+                        "GRADING AXES:\n" ++
+                        "  CORRECTNESS (threshold 8): does the fix compile and not break existing tests?\n" ++
+                        "  SAFETY (threshold 9): does the fix resolve the safety issue without introducing new ones?\n" ++
+                        "  COMPLETENESS (threshold 7): does the fix satisfy ALL acceptance criteria?\n" ++
+                        "  QUALITY (threshold 6): is the fix minimal and clean, not over-engineered?\n\n" ++
+                        "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+                        "PASS or FAIL, then explain what passed/failed and why.\n\n" ++
+                        "TASK: {s}\n\nACCEPTANCE CRITERIA:\n{s}\n\nFIXER OUTPUT:\n{s}",
+                    .{ task, contract_out.items, fixer_out.items },
+                ) catch task;
+                defer if (verify_prompt.ptr != task.ptr) alloc.free(verify_prompt);
+
+                runChainStep(alloc, "reviewer", mode, false, permission_mode, verify_prompt, 180, &verify_out);
+
+                out.appendSlice(alloc, "{\"role\":\"verify\",\"output\":\"") catch return;
+                mj.writeEscaped(alloc, out, verify_out.items);
                 out.appendSlice(alloc, "\"}") catch return;
             }
         },
