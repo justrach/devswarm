@@ -224,7 +224,7 @@ System prompts are assembled dynamically from agency rules, role instructions, m
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please open an issue before submitting a large PR so we can discuss the approach.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for Rach's Agentic Contribution Template before opening a PR.
 
 ```bash
 git clone https://github.com/justrach/codedb.git
