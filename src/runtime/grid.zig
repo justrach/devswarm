@@ -64,6 +64,12 @@ const default_grid = [_]GridEntry{
     .{ .role = "explorer",      .tier = .sonnet },
     .{ .role = "architect",     .tier = .opus },
 
+    // Specialist roles
+    .{ .role = "safety_auditor", .tier = .opus },
+    .{ .role = "zig_specialist", .tier = .sonnet },
+    .{ .role = "api_reviewer",   .tier = .sonnet },
+    .{ .role = "test_writer",    .tier = .sonnet },
+
     // Budget roles
     .{ .role = "monitor",       .tier = .haiku },
     .{ .role = "linter",        .tier = .haiku },

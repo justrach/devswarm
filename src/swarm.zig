@@ -47,7 +47,7 @@ fn workerFn(args: *WorkerArgs) void {
 
     const req: rt.AgentRequest = .{
         .prompt = prompt,
-        .role = "fixer",
+        .role = args.worker.role,
         .mode = "smart",
         .writable = args.writable,
     };
@@ -141,10 +141,26 @@ pub fn runSwarm(
     const orch_prompt = std.fmt.allocPrint(
         alloc,
         "You are a task orchestrator. Decompose the task below into at most {d} " ++
-            "independent, self-contained sub-tasks that can execute in parallel.\n" ++
-            "Reply with ONLY a valid JSON array — no markdown fences, no commentary, no explanation:\n" ++
-            "[{{\"role\":\"<role label>\",\"prompt\":\"<full sub-task prompt>\"}},...]\n\n" ++
-            "Task: {s}",
+            "independent, self-contained sub-tasks that can execute in parallel.\n\n" ++
+            "AVAILABLE ROLES (use these exact names in your JSON):\n" ++
+            "  finder         — read-only code search, locates files/functions/patterns\n" ++
+            "  reviewer       — read-only code review for correctness and best practices\n" ++
+            "  fixer          — writable, fixes reported issues (one change per file)\n" ++
+            "  explorer       — read-only, traces execution paths and gathers evidence\n" ++
+            "  architect      — read-only, designs implementation plans\n" ++
+            "  safety_auditor — read-only, audits memory safety (UAF, double-free, OOM)\n" ++
+            "  zig_specialist — writable, fixes Zig-specific issues (errdefer, slices, allocators)\n" ++
+            "  api_reviewer   — read-only, checks API contracts and ownership semantics\n" ++
+            "  test_writer    — writable, writes regression tests for reported bugs\n" ++
+            "  monitor        — read-only, runs tests and reports results\n\n" ++
+            "RULES:\n" ++
+            "  - Pick the most specific role for each sub-task\n" ++
+            "  - Read-only roles CANNOT edit files; writable roles CAN\n" ++
+            "  - Each sub-task prompt must be fully self-contained (include file paths, context)\n" ++
+            "  - Do NOT create duplicate sub-tasks that cover the same files/issues\n\n" ++
+            "Reply with ONLY a valid JSON array — no markdown fences, no commentary:\n" ++
+            "[{{\"role\":\"<role name>\",\"prompt\":\"<full sub-task prompt>\"}},...]" ++
+            "\n\nTask: {s}",
         .{ cap, task },
     ) catch {
         appendErr(alloc, out, "OOM: orchestrator prompt");
@@ -152,13 +168,13 @@ pub fn runSwarm(
     };
     defer alloc.free(orch_prompt);
 
-    // Orchestrator: read-only, rush mode (concise JSON output), no role preamble
+    // Orchestrator: read-only, rush mode (concise JSON output)
     var orch_out: std.ArrayList(u8) = .empty;
     defer orch_out.deinit(alloc);
     {
         const req: rt.AgentRequest = .{
             .prompt = orch_prompt,
-            .role = null,
+            .role = "orchestrator",
             .mode = "rush",
             .writable = false,
         };
