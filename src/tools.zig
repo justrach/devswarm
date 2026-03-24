@@ -177,6 +177,8 @@ pub const Tool = enum {
     run_agent,
     // Smart executor — picks strategy, roles, and models automatically
     run_task,
+    // Onboarding — self-deregisters after first run
+    onboard,
 };
 
 // ── Step 2: Tool schemas ──────────────────────────────────────────────────────
@@ -290,6 +292,8 @@ pub fn dispatch(
         .run_agent => handleRunAgent(alloc, args, out),
         // Smart executor
         .run_task => handleRunTask(alloc, args, out),
+        // Onboarding
+        .onboard => handleOnboard(alloc, args, out),
     }
 }
 
@@ -2628,4 +2632,117 @@ fn handleRunTask(
     }
 
     out.appendSlice(alloc, "]}") catch return;
+}
+
+// ── Onboarding ────────────────────────────────────────────────────────────────
+
+const ONBOARD_MARKER = ".devswarm/onboarded";
+
+/// Check if the project has been onboarded.
+pub fn isOnboarded() bool {
+    std.fs.cwd().access(ONBOARD_MARKER, .{}) catch return false;
+    return true;
+}
+
+/// Onboard tool JSON schema (shown only when not onboarded).
+pub const onboard_tool_json =
+    \\{"tools":[
+    \\{"name":"onboard","description":"Set up devswarm for this project. Discovers your codebase, available skills, and configures quality preferences. This tool disappears after setup is complete — you will not see it again.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"get_project_state","description":"Return all open issues grouped by status label, all open branches, and all open PRs. Use this to understand current project state before picking up work.","inputSchema":{"type":"object","properties":{},"required":[]}}
+    \\]}
+;
+
+fn handleOnboard(alloc: std.mem.Allocator, _: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+    const skills_mod = @import("skills.zig");
+
+    // Discover project info
+    var repo_name: []const u8 = "unknown";
+    var repo_alloc: ?[]u8 = null;
+    defer if (repo_alloc) |r| alloc.free(r);
+    if (gh.run(alloc, &.{ "git", "remote", "get-url", "origin" })) |r| {
+        defer r.deinit(alloc);
+        const trimmed = std.mem.trim(u8, r.stdout, " \t\n\r");
+        if (trimmed.len > 0) {
+            repo_alloc = alloc.dupe(u8, trimmed) catch null;
+            if (repo_alloc) |ra| repo_name = ra;
+        }
+    } else |_| {}
+
+    // Discover skills
+    var skill_count: usize = 0;
+    var skill_names_buf: [512]u8 = undefined;
+    var skill_names_len: usize = 0;
+    if (skills_mod.discover(alloc)) |*set| {
+        defer @constCast(set).deinit();
+        skill_count = set.skills.count();
+        var it = set.skills.iterator();
+        while (it.next()) |entry| {
+            if (skill_names_len > 0 and skill_names_len + 2 < skill_names_buf.len) {
+                skill_names_buf[skill_names_len] = ',';
+                skill_names_buf[skill_names_len + 1] = ' ';
+                skill_names_len += 2;
+            }
+            const name = entry.key_ptr.*;
+            if (skill_names_len + name.len <= skill_names_buf.len) {
+                @memcpy(skill_names_buf[skill_names_len..][0..name.len], name);
+                skill_names_len += name.len;
+            }
+        }
+    }
+    const skill_names = if (skill_names_len > 0) skill_names_buf[0..skill_names_len] else "none";
+
+    // Count built-in roles
+    const roles_mod = @import("runtime.zig").roles;
+    const builtin_count = roles_mod.allRoleNames().len;
+
+    // Check for existing config
+    const has_config = blk: {
+        std.fs.cwd().access(".devswarm/config.toml", .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    // Create .devswarm/ directory if needed
+    std.fs.cwd().makePath(".devswarm") catch {};
+
+    // Write the onboarded marker
+    const marker_file = std.fs.cwd().createFile(ONBOARD_MARKER, .{}) catch {
+        writeErr(alloc, out, "failed to create .devswarm/onboarded marker");
+        return;
+    };
+    marker_file.close();
+
+    // Build response JSON
+    out.appendSlice(alloc, "{\"onboarded\":true") catch return;
+
+    out.appendSlice(alloc, ",\"project\":{\"repo\":\"") catch return;
+    mj.writeEscaped(alloc, out, repo_name);
+    out.appendSlice(alloc, "\"}") catch return;
+
+    out.appendSlice(alloc, ",\"roles\":{\"built_in\":") catch return;
+    var count_buf: [8]u8 = undefined;
+    out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{builtin_count}) catch "0") catch return;
+
+    out.appendSlice(alloc, ",\"discovered_skills\":") catch return;
+    out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{skill_count}) catch "0") catch return;
+
+    out.appendSlice(alloc, ",\"skill_names\":\"") catch return;
+    mj.writeEscaped(alloc, out, skill_names);
+    out.appendSlice(alloc, "\"}") catch return;
+
+    out.appendSlice(alloc, ",\"has_config\":") catch return;
+    out.appendSlice(alloc, if (has_config) "true" else "false") catch return;
+
+    out.appendSlice(alloc, ",\"message\":\"Setup complete. ") catch return;
+    out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{builtin_count}) catch "?") catch return;
+    out.appendSlice(alloc, " built-in roles") catch return;
+    if (skill_count > 0) {
+        out.appendSlice(alloc, " + ") catch return;
+        out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{skill_count}) catch "?") catch return;
+        out.appendSlice(alloc, " custom skills") catch return;
+    }
+    out.appendSlice(alloc, " now available. The onboard tool has been removed — you will not see it again.\"") catch return;
+
+    out.appendSlice(alloc, ",\"next_steps\":[\"Use run_swarm for parallel multi-agent tasks\",\"Use run_task for sequential agent chains\",\"Drop .md files in .devswarm/skills/ to add custom roles\"]") catch return;
+
+    out.appendSlice(alloc, "}") catch return;
 }
