@@ -277,7 +277,7 @@ test "resolve: model alias 'opus' expands to full ID" {
 
 test "resolve: grid overrides mode for known roles" {
     const alloc = std.testing.allocator;
-    // orchestrator is opus in grid, even if mode is rush (which defaults to haiku)
+    // orchestrator is bolt in grid, even if mode is rush (which defaults to haiku)
     const req = AgentRequest{ .prompt = "test", .role = "orchestrator", .mode = "rush" };
     const backends = Backends{ .claude = true };
     const tools = ToolAvailability{};
@@ -285,7 +285,7 @@ test "resolve: grid overrides mode for known roles" {
     const r = resolve(alloc, req, backends, tools, null);
     defer prompts.freeAssembled(alloc, r.system_prompt);
 
-    try std.testing.expectEqualStrings("claude-opus-4-6", r.model);
+    try std.testing.expectEqualStrings("gpt-5.4", r.model);
     try std.testing.expectEqual(AgentMode.rush, r.mode);
 }
 
