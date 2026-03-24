@@ -15,6 +15,7 @@
 // dispatch() (dispatch.zig) takes the ResolvedAgent and does the actual spawn.
 
 const std = @import("std");
+const skills = @import("../skills.zig");
 const types = @import("types.zig");
 const detect = @import("detect.zig");
 const cascade = @import("cascade.zig");
@@ -48,8 +49,8 @@ pub fn resolve(
         break :blk .smart; // default
     };
 
-    // 2. Resolve role spec (static built-in)
-    const role_spec = if (request.role) |rn| roles.getRole(rn) else null;
+    // 2. Resolve role spec (discovered skills override built-in)
+    const role_spec = if (request.role) |rn| (skills.getSkillRole(rn) orelse roles.getRole(rn)) else null;
 
     // 2b. Resolve per-role config override (from config.toml)
     const role_cfg: ?config.RoleConfig = blk: {
