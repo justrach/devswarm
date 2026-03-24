@@ -376,13 +376,17 @@ pub fn runSwarm(
     for (worker_metrics[0..count]) |*m| {
         m.*.role = workers[m.worker_id].role;
         m.*.model = workers[m.worker_id].model;
-        grid.addWorker(alloc, m.*);
+        grid.addWorker(alloc, m.*) catch {};
     }
-    swarm_telemetry.addGrid(alloc, grid);
+    swarm_telemetry.addGrid(grid) catch {};
+
 
     const telemetry_json = swarm_telemetry.toJson(alloc);
     if (telemetry_json.len > 0) {
         std.debug.print("\n[telemetry] {s}\n", .{telemetry_json});
+
+        // Upload to backend (fire and forget, non-blocking)
+        telemetry.upload(alloc, telemetry_json);
 
         if (telemetry_out) |path| {
             const file = if (std.fs.path.isAbsolute(path))

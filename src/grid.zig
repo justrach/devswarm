@@ -119,9 +119,10 @@ pub const Grid = struct {
 
     pub fn addWorkerMetrics(self: *Self, alloc: std.mem.Allocator, wm: telemetry.WorkerMetrics) void {
         if (self.metrics) |*m| {
-            m.addWorker(alloc, wm);
+            m.addWorker(alloc, wm) catch {};
         }
     }
+
 };
 
 pub const GridPipeline = struct {

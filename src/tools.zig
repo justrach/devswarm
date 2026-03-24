@@ -177,6 +177,8 @@ pub const Tool = enum {
     run_agent,
     // Smart executor — picks strategy, roles, and models automatically
     run_task,
+    // Onboarding — self-deregisters after first run
+    onboard,
 };
 
 // ── Step 2: Tool schemas ──────────────────────────────────────────────────────
@@ -290,6 +292,8 @@ pub fn dispatch(
         .run_agent => handleRunAgent(alloc, args, out),
         // Smart executor
         .run_task => handleRunTask(alloc, args, out),
+        // Onboarding
+        .onboard => handleOnboard(alloc, args, out),
     }
 }
 
@@ -2173,12 +2177,27 @@ fn handleReviewFixLoop(
     out: *std.ArrayList(u8),
 ) void {
     const default_review_prompt =
-        "Review the current branch for correctness and memory safety. " ++
-        "Check: errdefer on every allocation, RwLock ordering, " ++
-        "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
-        "PPR push rule correctness, and missing test coverage. " ++
-        "Lead with concrete findings, include file:line references. " ++
-        "If you find NO issues, respond with exactly: NO_ISSUES_FOUND";
+        "Review the current codebase for correctness and safety issues. " ++
+        "Score each axis 1-10 and FAIL any axis below its threshold.\n\n" ++
+        "GRADING AXES:\n" ++
+        "  CORRECTNESS (threshold 8): logic errors, off-by-one, missing edge cases, compilation.\n" ++
+        "  SAFETY (threshold 9): errdefer on every alloc, no UAF, no double-free, allocator consistency.\n" ++
+        "  COMPLETENESS (threshold 7): does the code address all parts of the task? Any stubs or TODOs left?\n" ++
+        "  QUALITY (threshold 6): abstraction quality, pattern adherence, no unnecessary complexity.\n\n" ++
+        "OUTPUT FORMAT (you MUST follow this exactly):\n" ++
+        "SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+        "PASS or FAIL (FAIL if ANY axis is below threshold)\n" ++
+        "Then list concrete findings with file:line references.\n" ++
+        "If ALL axes pass and no findings, respond with exactly: NO_ISSUES_FOUND\n\n" ++
+        "EXAMPLE (failing review):\n" ++
+        "SCORES: correctness=7 safety=5 completeness=8 quality=7\n" ++
+        "FAIL (safety below threshold)\n" ++
+        "- [SAFETY] resolve.zig:183 — cfg.deinit frees model string while ResolvedAgent still references it. UAF when config uses full model ID.\n" ++
+        "- [CORRECTNESS] telemetry.zig:150 — addGrid catch {} silently drops OOM, leaves GridMetrics workers buffer leaked.\n\n" ++
+        "EXAMPLE (passing review):\n" ++
+        "SCORES: correctness=9 safety=9 completeness=8 quality=8\n" ++
+        "PASS\n" ++
+        "NO_ISSUES_FOUND";
     const review_prompt = mj.getStr(args, "prompt") orelse default_review_prompt;
 
     const max_iter: u32 = blk: {
@@ -2220,17 +2239,22 @@ fn handleReviewFixLoop(
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
 
-        // Check convergence: reviewer found no issues
+        // Check convergence: reviewer scored PASS or found no issues
         const review_text = review_out.items;
-        if (std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null or
-            review_text.len == 0)
-        {
-            iter_json.appendSlice(alloc, ",\"fix\":null}") catch return;
+        const is_pass = std.mem.indexOf(u8, review_text, "\nPASS") != null or
+            std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
+        const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
+
+        if (is_pass or no_issues or review_text.len == 0) {
+            iter_json.appendSlice(alloc, ",\"verdict\":\"PASS\",\"fix\":null}") catch return;
             out_json.appendSlice(alloc, iter_json.items) catch return;
             completed = i + 1;
             converged = true;
             break;
         }
+
+        // Record FAIL verdict
+        iter_json.appendSlice(alloc, ",\"verdict\":\"FAIL\"") catch return;
 
         // ── Phase 2: Fix (writable) via runtime pipeline ─────────────────
         const fix_prompt = std.fmt.allocPrint(
@@ -2452,7 +2476,6 @@ fn handleRunTask(
         if (mj.getStr(args, "preset")) |p| {
             if (ChainPreset.fromString(p)) |cp| break :blk cp;
         }
-        // Auto-select: default to finder_fixer (most common pattern)
         break :blk .finder_fixer;
     };
 
@@ -2491,15 +2514,35 @@ fn handleRunTask(
             if (std.mem.trim(u8, finder_out.items, " \t\n\r").len == 0) {
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: finder returned empty output\"}") catch return;
             } else {
-                // Step 2: fixer (writable) — apply changes based on findings
+                // Step 2: contract (read-only) — define acceptance criteria before fixing
+                var contract_out: std.ArrayList(u8) = .empty;
+                defer contract_out.deinit(alloc);
+
+                const contract_prompt = std.fmt.allocPrint(
+                    alloc,
+                    "You are defining a sprint contract. Based on the task and findings below, " ++
+                        "write a numbered list of TESTABLE acceptance criteria that the fix must satisfy. " ++
+                        "Each criterion must be verifiable by reading code or running tests. " ++
+                        "Be specific — include file paths, function names, and expected behaviors.\n\n" ++
+                        "TASK: {s}\n\nFINDINGS:\n{s}",
+                    .{ task, finder_out.items },
+                ) catch task;
+                defer if (contract_prompt.ptr != task.ptr) alloc.free(contract_prompt);
+
+                runChainStep(alloc, "reviewer", mode, false, permission_mode, contract_prompt, 120, &contract_out);
+
+                out.appendSlice(alloc, "{\"role\":\"contract\",\"output\":\"") catch return;
+                mj.writeEscaped(alloc, out, contract_out.items);
+                out.appendSlice(alloc, "\"},") catch return;
+
+                // Step 3: fixer (writable) — apply changes against the contract
                 var fixer_out: std.ArrayList(u8) = .empty;
                 defer fixer_out.deinit(alloc);
                 const fixer_prompt = std.fmt.allocPrint(
                     alloc,
-                    "Fix the following task based on these findings. " ++
-                        "Read files before editing, verify each edit.\n\n" ++
-                        "TASK: {s}\n\nFINDINGS:\n{s}",
-                    .{ task, finder_out.items },
+                    "Fix the following task. You MUST satisfy all acceptance criteria in the contract.\n\n" ++
+                        "TASK: {s}\n\nFINDINGS:\n{s}\n\nACCEPTANCE CRITERIA (you must pass ALL):\n{s}",
+                    .{ task, finder_out.items, contract_out.items },
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
@@ -2507,31 +2550,80 @@ fn handleRunTask(
 
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, fixer_out.items);
+                out.appendSlice(alloc, "\"},") catch return;
+
+                // Step 4: verify (read-only) — score the fix against the contract
+                var verify_out: std.ArrayList(u8) = .empty;
+                defer verify_out.deinit(alloc);
+
+                const verify_prompt = std.fmt.allocPrint(
+                    alloc,
+                    "You are verifying a fix against its sprint contract. " ++
+                        "Score each axis 1-10 and PASS or FAIL.\n\n" ++
+                        "GRADING AXES:\n" ++
+                        "  CORRECTNESS (threshold 8): does the fix compile and not break existing tests?\n" ++
+                        "  SAFETY (threshold 9): does the fix resolve the safety issue without introducing new ones?\n" ++
+                        "  COMPLETENESS (threshold 7): does the fix satisfy ALL acceptance criteria?\n" ++
+                        "  QUALITY (threshold 6): is the fix minimal and clean, not over-engineered?\n\n" ++
+                        "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+                        "PASS or FAIL, then explain what passed/failed and why.\n\n" ++
+                        "TASK: {s}\n\nACCEPTANCE CRITERIA:\n{s}\n\nFIXER OUTPUT:\n{s}",
+                    .{ task, contract_out.items, fixer_out.items },
+                ) catch task;
+                defer if (verify_prompt.ptr != task.ptr) alloc.free(verify_prompt);
+
+                runChainStep(alloc, "reviewer", mode, false, permission_mode, verify_prompt, 180, &verify_out);
+
+                out.appendSlice(alloc, "{\"role\":\"verify\",\"output\":\"") catch return;
+                mj.writeEscaped(alloc, out, verify_out.items);
                 out.appendSlice(alloc, "\"}") catch return;
             }
         },
         .reviewer_fixer => {
-            // Step 1: reviewer (read-only) — find issues
+            // Step 1: reviewer (read-only) — find issues with scoring
             var review_out: std.ArrayList(u8) = .empty;
             defer review_out.deinit(alloc);
 
-            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, 300, &review_out);
+            const scored_review_prompt = std.fmt.allocPrint(
+                alloc,
+                "Review the codebase for issues related to the following task. " ++
+                    "Score each axis 1-10.\n\n" ++
+                    "GRADING AXES:\n" ++
+                    "  CORRECTNESS (threshold 8): logic errors, missing edge cases.\n" ++
+                    "  SAFETY (threshold 9): memory safety, allocator consistency.\n" ++
+                    "  COMPLETENESS (threshold 7): does existing code fully address the task?\n" ++
+                    "  QUALITY (threshold 6): abstraction quality, pattern adherence.\n\n" ++
+                    "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+                    "PASS or FAIL, then concrete findings with file:line.\n" ++
+                    "If no issues: NO_ISSUES_FOUND\n\nTASK: {s}",
+                .{task},
+            ) catch task;
+            defer if (scored_review_prompt.ptr != task.ptr) alloc.free(scored_review_prompt);
+
+            runChainStep(alloc, "reviewer", mode, false, permission_mode, scored_review_prompt, 300, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
             // Check convergence
-            if (std.mem.indexOf(u8, review_out.items, "NO_ISSUES_FOUND") != null or std.mem.trim(u8, review_out.items, " \t\n\r").len == 0) {
-                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"No issues to fix\"}") catch return;
+            const review_text = review_out.items;
+            const is_pass = std.mem.indexOf(u8, review_text, "\nPASS") != null or
+                std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
+            const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
+
+            if (is_pass or no_issues or std.mem.trim(u8, review_text, " \t\n\r").len == 0) {
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"No issues to fix — all axes passed\"}") catch return;
             } else {
-                // Step 2: fixer (writable) — fix found issues
+                // Step 2: fixer (writable) — fix found issues, must address all FAIL axes
                 var fixer_out: std.ArrayList(u8) = .empty;
                 defer fixer_out.deinit(alloc);
 
                 const fixer_prompt = std.fmt.allocPrint(
                     alloc,
-                    "Fix ALL issues listed below.\n\nREVIEW FINDINGS:\n{s}",
+                    "Fix ALL issues listed below. The reviewer scored axes and FAILed — " ++
+                        "you must address every finding to bring all axes above threshold.\n\n" ++
+                        "REVIEW FINDINGS:\n{s}",
                     .{review_out.items},
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
@@ -2628,4 +2720,117 @@ fn handleRunTask(
     }
 
     out.appendSlice(alloc, "]}") catch return;
+}
+
+// ── Onboarding ────────────────────────────────────────────────────────────────
+
+const ONBOARD_MARKER = ".devswarm/onboarded";
+
+/// Check if the project has been onboarded.
+pub fn isOnboarded() bool {
+    std.fs.cwd().access(ONBOARD_MARKER, .{}) catch return false;
+    return true;
+}
+
+/// Onboard tool JSON schema (shown only when not onboarded).
+pub const onboard_tool_json =
+    \\{"tools":[
+    \\{"name":"onboard","description":"Set up devswarm for this project. Discovers your codebase, available skills, and configures quality preferences. This tool disappears after setup is complete — you will not see it again.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"get_project_state","description":"Return all open issues grouped by status label, all open branches, and all open PRs. Use this to understand current project state before picking up work.","inputSchema":{"type":"object","properties":{},"required":[]}}
+    \\]}
+;
+
+fn handleOnboard(alloc: std.mem.Allocator, _: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+    const skills_mod = @import("skills.zig");
+
+    // Discover project info
+    var repo_name: []const u8 = "unknown";
+    var repo_alloc: ?[]u8 = null;
+    defer if (repo_alloc) |r| alloc.free(r);
+    if (gh.run(alloc, &.{ "git", "remote", "get-url", "origin" })) |r| {
+        defer r.deinit(alloc);
+        const trimmed = std.mem.trim(u8, r.stdout, " \t\n\r");
+        if (trimmed.len > 0) {
+            repo_alloc = alloc.dupe(u8, trimmed) catch null;
+            if (repo_alloc) |ra| repo_name = ra;
+        }
+    } else |_| {}
+
+    // Discover skills
+    var skill_count: usize = 0;
+    var skill_names_buf: [512]u8 = undefined;
+    var skill_names_len: usize = 0;
+    if (skills_mod.discover(alloc)) |*set| {
+        defer @constCast(set).deinit();
+        skill_count = set.skills.count();
+        var it = set.skills.iterator();
+        while (it.next()) |entry| {
+            if (skill_names_len > 0 and skill_names_len + 2 < skill_names_buf.len) {
+                skill_names_buf[skill_names_len] = ',';
+                skill_names_buf[skill_names_len + 1] = ' ';
+                skill_names_len += 2;
+            }
+            const name = entry.key_ptr.*;
+            if (skill_names_len + name.len <= skill_names_buf.len) {
+                @memcpy(skill_names_buf[skill_names_len..][0..name.len], name);
+                skill_names_len += name.len;
+            }
+        }
+    }
+    const skill_names = if (skill_names_len > 0) skill_names_buf[0..skill_names_len] else "none";
+
+    // Count built-in roles
+    const roles_mod = @import("runtime.zig").roles;
+    const builtin_count = roles_mod.allRoleNames().len;
+
+    // Check for existing config
+    const has_config = blk: {
+        std.fs.cwd().access(".devswarm/config.toml", .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    // Create .devswarm/ directory if needed
+    std.fs.cwd().makePath(".devswarm") catch {};
+
+    // Write the onboarded marker
+    const marker_file = std.fs.cwd().createFile(ONBOARD_MARKER, .{}) catch {
+        writeErr(alloc, out, "failed to create .devswarm/onboarded marker");
+        return;
+    };
+    marker_file.close();
+
+    // Build response JSON
+    out.appendSlice(alloc, "{\"onboarded\":true") catch return;
+
+    out.appendSlice(alloc, ",\"project\":{\"repo\":\"") catch return;
+    mj.writeEscaped(alloc, out, repo_name);
+    out.appendSlice(alloc, "\"}") catch return;
+
+    out.appendSlice(alloc, ",\"roles\":{\"built_in\":") catch return;
+    var count_buf: [8]u8 = undefined;
+    out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{builtin_count}) catch "0") catch return;
+
+    out.appendSlice(alloc, ",\"discovered_skills\":") catch return;
+    out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{skill_count}) catch "0") catch return;
+
+    out.appendSlice(alloc, ",\"skill_names\":\"") catch return;
+    mj.writeEscaped(alloc, out, skill_names);
+    out.appendSlice(alloc, "\"}") catch return;
+
+    out.appendSlice(alloc, ",\"has_config\":") catch return;
+    out.appendSlice(alloc, if (has_config) "true" else "false") catch return;
+
+    out.appendSlice(alloc, ",\"message\":\"Setup complete. ") catch return;
+    out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{builtin_count}) catch "?") catch return;
+    out.appendSlice(alloc, " built-in roles") catch return;
+    if (skill_count > 0) {
+        out.appendSlice(alloc, " + ") catch return;
+        out.appendSlice(alloc, std.fmt.bufPrint(&count_buf, "{d}", .{skill_count}) catch "?") catch return;
+        out.appendSlice(alloc, " custom skills") catch return;
+    }
+    out.appendSlice(alloc, " now available. The onboard tool has been removed — you will not see it again.\"") catch return;
+
+    out.appendSlice(alloc, ",\"next_steps\":[\"Use run_swarm for parallel multi-agent tasks\",\"Use run_task for sequential agent chains\",\"Drop .md files in .devswarm/skills/ to add custom roles\"]") catch return;
+
+    out.appendSlice(alloc, "}") catch return;
 }

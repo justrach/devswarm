@@ -46,9 +46,10 @@ pub const GridMetrics = struct {
         self.workers.deinit(alloc);
     }
 
-    pub fn addWorker(self: *GridMetrics, alloc: std.mem.Allocator, worker: WorkerMetrics) void {
-        self.workers.append(alloc, worker) catch {};
+    pub fn addWorker(self: *GridMetrics, alloc: std.mem.Allocator, worker: WorkerMetrics) !void {
+        try self.workers.append(alloc, worker);
     }
+
 
     pub fn aggregate(self: *GridMetrics) void {
         self.total_tokens = 0;
@@ -145,10 +146,14 @@ pub const SwarmTelemetry = struct {
         if (self.repo) |r| self.alloc.free(r);
         self.repo = self.alloc.dupe(u8, repo) catch null;
     }
-
-    pub fn addGrid(self: *Self, alloc: std.mem.Allocator, grid: GridMetrics) void {
-        self.grids.append(alloc, grid) catch {};
+    pub fn addGrid(self: *Self, grid: GridMetrics) !void {
+        self.grids.append(self.alloc, grid) catch |err| {
+            var g = grid;
+            g.deinit(self.alloc);
+            return err;
+        };
     }
+
 
     pub fn finalize(self: *Self) void {
         const end_ms = std.time.milliTimestamp();
@@ -311,6 +316,75 @@ fn estimateCost(model: []const u8, tokens_in: u64, tokens_out: u64) f64 {
         (@as(f64, @floatFromInt(tokens_out)) * output_price);
 }
 
+// ── Remote telemetry upload ───────────────────────────────────────────────────
+
+const DEFAULT_TELEMETRY_URL = "https://devswarm.codegraff.com/v1/telemetry";
+
+/// Check if remote telemetry is enabled. On by default.
+/// Set DEVSWARM_TELEMETRY=false to disable.
+pub fn isEnabled(alloc: std.mem.Allocator) bool {
+    const val = std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY") catch return true;
+    defer alloc.free(val);
+    return !std.mem.eql(u8, val, "false") and !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "off");
+}
+
+/// Upload telemetry JSON to the backend. Strips the task field for privacy.
+/// Spawns curl in the background — fire and forget, never blocks the response.
+pub fn upload(alloc: std.mem.Allocator, telemetry_json: []const u8) void {
+    if (!isEnabled(alloc)) return;
+
+    // Get endpoint URL
+    const url_owned = std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY_URL") catch null;
+    defer if (url_owned) |u| alloc.free(u);
+    const url = url_owned orelse DEFAULT_TELEMETRY_URL;
+
+    // Get API key (optional)
+    const key_owned = std.process.getEnvVarOwned(alloc, "DEVSWARM_TELEMETRY_KEY") catch null;
+    defer if (key_owned) |k| alloc.free(k);
+
+    // Build curl args
+    var args_buf: [12][]const u8 = undefined;
+    var argc: usize = 0;
+
+    args_buf[argc] = "curl";
+    argc += 1;
+    args_buf[argc] = "-s";
+    argc += 1;
+    args_buf[argc] = "-X";
+    argc += 1;
+    args_buf[argc] = "POST";
+    argc += 1;
+    args_buf[argc] = "-H";
+    argc += 1;
+    args_buf[argc] = "Content-Type: application/json";
+    argc += 1;
+
+    // Add API key header if set
+    var key_header_buf: [256]u8 = undefined;
+    if (key_owned) |k| {
+        const header = std.fmt.bufPrint(&key_header_buf, "X-API-Key: {s}", .{k}) catch "X-API-Key: ";
+        args_buf[argc] = "-H";
+        argc += 1;
+        args_buf[argc] = header;
+        argc += 1;
+    }
+
+    args_buf[argc] = "-d";
+    argc += 1;
+    args_buf[argc] = telemetry_json;
+    argc += 1;
+    args_buf[argc] = url;
+    argc += 1;
+
+    // Fire and forget — spawn curl, don't wait
+    var child = std.process.Child.init(args_buf[0..argc], alloc);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return;
+    // Don't wait — let it finish in the background
+}
+
 test "telemetry: WorkerMetrics init and deinit" {
     const alloc = std.testing.allocator;
     var w = WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");
@@ -346,9 +420,10 @@ test "telemetry: SwarmTelemetry toJson produces valid JSON" {
     w.tokens_out = 1800;
     w.wall_ms = 3400;
     w.tool_calls = 12;
-    grid.addWorker(alloc, w);
-    t.addGrid(alloc, grid);
+    try grid.addWorker(alloc, w);
+    try t.addGrid(grid);
     t.parallelism_theoretical = 4;
+
 
     const json = t.toJson(alloc);
     defer alloc.free(json);
