@@ -2241,8 +2241,10 @@ fn handleReviewFixLoop(
 
         // Check convergence: reviewer scored PASS or found no issues
         const review_text = review_out.items;
-        const is_pass = std.mem.indexOf(u8, review_text, "\nPASS") != null or
-            std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
+        const is_pass = std.mem.indexOf(u8, review_text, "\nPASS\n") != null or
+            std.mem.indexOf(u8, review_text, "\nPASS\r") != null or
+            std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS\n") or
+            std.mem.eql(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
         const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
 
         if (is_pass or no_issues or review_text.len == 0) {
@@ -2429,7 +2431,15 @@ fn runChainStep(
             ctx.done.set();
         }
     };
-    var ctx: Ctx = .{
+
+    // Heap-allocate ctx so the thread can safely outlive this function on timeout.
+    // Without this, a timeout returns and frees the stack frame while the thread
+    // still holds &ctx — a use-after-free.
+    const ctx = alloc.create(Ctx) catch {
+        step_out.appendSlice(alloc, "{\"error\":\"OOM: failed to allocate agent context\"}") catch {};
+        return;
+    };
+    ctx.* = .{
         .alloc = alloc,
         .resolved = resolved,
         .prompt = prompt,
@@ -2437,14 +2447,20 @@ fn runChainStep(
         .done = .{},
     };
 
-    const thread = std.Thread.spawn(.{}, Ctx.run, .{&ctx}) catch {
+    const thread = std.Thread.spawn(.{}, Ctx.run, .{ctx}) catch {
+        alloc.destroy(ctx);
         step_out.appendSlice(alloc, "{\"error\":\"failed to spawn agent thread\"}") catch {};
         return;
     };
 
     if (ctx.done.timedWait(timeout_ns)) |_| {
         thread.join();
+        alloc.destroy(ctx);
     } else |_| {
+        // Thread still running — detach it. ctx is heap-allocated so the thread
+        // can safely finish writing. The thread will leak ctx when done, which is
+        // acceptable for a timeout (rare path, bounded allocation).
+        thread.detach();
         var ts_buf: [16]u8 = undefined;
         const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{timeout_seconds orelse 300}) catch "300";
         step_out.appendSlice(alloc, "{\"timed_out\":true,\"error\":\"agent execution exceeded timeout\",\"timeout_seconds\":") catch {};
@@ -2535,6 +2551,12 @@ fn handleRunTask(
                 mj.writeEscaped(alloc, out, contract_out.items);
                 out.appendSlice(alloc, "\"},") catch return;
 
+                // Guard: if contract is empty or timed out, skip fixer + verify
+                const contract_text = std.mem.trim(u8, contract_out.items, " \t\n\r");
+                if (contract_text.len == 0 or std.mem.startsWith(u8, contract_text, "{\"timed_out\"")) {
+                    out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: contract returned empty or timed out\"},") catch return;
+                    out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"SKIP\",\"output\":\"No contract to verify against\"}") catch return;
+                } else {
                 // Step 3: fixer (writable) — apply changes against the contract
                 var fixer_out: std.ArrayList(u8) = .empty;
                 defer fixer_out.deinit(alloc);
@@ -2574,9 +2596,20 @@ fn handleRunTask(
 
                 runChainStep(alloc, "reviewer", mode, false, permission_mode, verify_prompt, 180, &verify_out);
 
-                out.appendSlice(alloc, "{\"role\":\"verify\",\"output\":\"") catch return;
+                // Parse verify verdict
+                const verify_text = verify_out.items;
+                const verify_pass = std.mem.indexOf(u8, verify_text, "\nPASS\n") != null or
+                    std.mem.indexOf(u8, verify_text, "\nPASS\r") != null or
+                    std.mem.startsWith(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS\n") or
+                    std.mem.eql(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS") or
+                    std.mem.indexOf(u8, verify_text, "NO_ISSUES_FOUND") != null;
+
+                out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"") catch return;
+                out.appendSlice(alloc, if (verify_pass) "PASS" else "FAIL") catch return;
+                out.appendSlice(alloc, "\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, verify_out.items);
                 out.appendSlice(alloc, "\"}") catch return;
+                } // close else (contract not empty)
             }
         },
         .reviewer_fixer => {
@@ -2608,8 +2641,10 @@ fn handleRunTask(
 
             // Check convergence
             const review_text = review_out.items;
-            const is_pass = std.mem.indexOf(u8, review_text, "\nPASS") != null or
-                std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
+            const is_pass = std.mem.indexOf(u8, review_text, "\nPASS\n") != null or
+                std.mem.indexOf(u8, review_text, "\nPASS\r") != null or
+                std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS\n") or
+                std.mem.eql(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
             const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
 
             if (is_pass or no_issues or std.mem.trim(u8, review_text, " \t\n\r").len == 0) {
