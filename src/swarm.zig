@@ -63,6 +63,12 @@ fn workerFn(args: *WorkerArgs) void {
     args.metrics.*.wall_ms = @intCast(@max(0, args.worker.end_ms - args.worker.start_ms));
 
     parseMetricsFromOutput(alloc, args.worker.out.items, args.metrics);
+
+    // Mark success: non-empty output that isn't an error/timeout JSON
+    const out_trimmed = std.mem.trim(u8, args.worker.out.items, " \t\n\r");
+    args.metrics.*.success = out_trimmed.len > 0 and
+        !std.mem.startsWith(u8, out_trimmed, "{\"error\"") and
+        !std.mem.startsWith(u8, out_trimmed, "{\"timed_out\"");
 }
 
 fn parseMetricsFromOutput(_: std.mem.Allocator, output: []const u8, metrics: *telemetry.WorkerMetrics) void {
