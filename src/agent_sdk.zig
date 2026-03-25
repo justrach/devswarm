@@ -236,11 +236,30 @@ fn parseClaudeLine(
     };
 
     if (std.mem.eql(u8, type_str, "result")) {
-        // {"type":"result","subtype":"success","result":"<final text>",...}
+        // {"type":"result","subtype":"success","result":"<final text>","usage":{...},...}
         if (obj.get("result")) |rv| {
             if (rv == .string) {
                 out.appendSlice(alloc, rv.string) catch {};
                 found_result.* = true;
+            }
+        }
+        // Append usage metadata as a trailing marker for telemetry extraction
+        if (obj.get("usage")) |usage_v| {
+            if (usage_v == .object) {
+                var buf: [128]u8 = undefined;
+                const in_tok = if (usage_v.object.get("input_tokens")) |v| switch (v) {
+                    .integer => |i| @as(u64, @intCast(i)),
+                    else => @as(u64, 0),
+                } else 0;
+                const out_tok = if (usage_v.object.get("output_tokens")) |v| switch (v) {
+                    .integer => |i| @as(u64, @intCast(i)),
+                    else => @as(u64, 0),
+                } else 0;
+                const marker = std.fmt.bufPrint(&buf,
+                    "\n__USAGE__:tokens_in={d},tokens_out={d}",
+                    .{ in_tok, out_tok },
+                ) catch "";
+                out.appendSlice(alloc, marker) catch {};
             }
         }
     } else if (std.mem.eql(u8, type_str, "assistant")) {
