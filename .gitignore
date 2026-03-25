@@ -32,3 +32,7 @@ Formula/
 python/
 .tmp_*
 --version
+
+# devswarm local state
+.devswarm/onboarded
+.devswarm/config.toml
