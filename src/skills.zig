@@ -37,6 +37,7 @@ pub const SkillSet = struct {
     pub fn deinit(self: *SkillSet) void {
         var it = self.skills.iterator();
         while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
             self.alloc.free(entry.value_ptr._backing);
         }
         self.skills.deinit();
@@ -273,8 +274,12 @@ test "skills: parseSkill defaults writable to false" {
     try std.testing.expect(!skill.writable);
 }
 
-test "skills: discover returns null when no skill dirs exist" {
+test "skills: discover handles presence or absence of skill dirs" {
     const alloc = std.testing.allocator;
-    // Running in test env — no .devswarm/skills/ or skills/ dirs
-    try std.testing.expect(discover(alloc) == null);
+    // discover() may return null or a SkillSet depending on whether
+    // .devswarm/skills/ exists in the working directory. Either is valid.
+    if (discover(alloc)) |*set| {
+        var s = @constCast(set);
+        s.deinit();
+    }
 }
