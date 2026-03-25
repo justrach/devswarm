@@ -178,17 +178,34 @@ pub fn resolve(
     };
 }
 
+// ── Cached config (loaded once per process, reused safely across calls) ────────
+
+var g_cfg_mu: std.Thread.Mutex = .{};
+var g_cfg_probed: bool = false;
+var g_cfg: ?config.Config = null;
+
+fn getCachedConfig() ?*const config.Config {
+    g_cfg_mu.lock();
+    defer g_cfg_mu.unlock();
+    if (!g_cfg_probed) {
+        g_cfg = config.loadDefault(std.heap.page_allocator);
+        g_cfg_probed = true;
+    }
+    if (g_cfg) |*c| return c;
+    return null;
+}
+
 /// Convenience: resolve with live-probed backends, tools, and default config.
+/// Config is loaded from disk once and cached for all subsequent calls.
 pub fn resolveWithProbe(alloc: std.mem.Allocator, request: AgentRequest) ResolvedAgent {
     const backends = detect.probe(alloc);
     const tools = cascade.probe(alloc);
-    var cfg = config.loadDefault(alloc);
+    const cfg: ?config.Config = if (getCachedConfig()) |cp| cp.* else null;
     var result = resolve(alloc, request, backends, tools, cfg);
     // model may point into cfg-owned memory (expandAlias returns full model IDs
-    // unchanged — same pointer into cfg's heap).  Dupe it before freeing cfg so
-    // the returned ResolvedAgent owns its model string independently of cfg.
+    // unchanged — same pointer into cfg's heap).  Dupe it so the returned
+    // ResolvedAgent owns its model string independently of the cached cfg.
     result.model = alloc.dupe(u8, result.model) catch unreachable;
-    if (cfg) |*c| c.deinit(alloc);
     return result;
 }
 
