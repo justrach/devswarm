@@ -10,6 +10,7 @@ pub const WorkerMetrics = struct {
     tokens_out: u64 = 0,
     wall_ms: u64 = 0,
     errors: u32 = 0,
+    success: bool = false,  // true if worker produced non-empty, non-error output
 
     pub fn init(id: u32, role: []const u8, model: []const u8) WorkerMetrics {
         return .{
@@ -289,6 +290,9 @@ pub const SwarmTelemetry = struct {
         buf.appendSlice(alloc, ",\"errors\":") catch return;
         const err_str = std.fmt.bufPrint(&tmp, "{d}", .{w.errors}) catch "";
         buf.appendSlice(alloc, err_str) catch return;
+
+        buf.appendSlice(alloc, ",\"success\":") catch return;
+        buf.appendSlice(alloc, if (w.success) "true" else "false") catch return;
 
         buf.appendSlice(alloc, "}") catch return;
     }
