@@ -8,7 +8,8 @@
 //   devswarm --mcp           — explicit MCP mode (default when no subcommand)
 //   devswarm                 — MCP mode (default)
 
-const std = @import("std");
+const std    = @import("std");
+const notify = @import("notify.zig");
 const build_options = @import("build_options");
 const mj = @import("mcp").json; // readLine, getStr/Int/Bool, eql, writeEscaped
 const tools = @import("tools.zig");
@@ -100,7 +101,6 @@ fn printHelp() void {
 }
 
 fn runMcpServer() void {
-
     const act = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
         .mask = std.posix.sigemptyset(),
@@ -159,6 +159,7 @@ fn run(alloc: std.mem.Allocator, active_repo: *?[]const u8) void {
             break;
         } orelse break;
         g_use_headers = g_use_headers or message_uses_headers;
+        notify.init(g_use_headers);
         defer alloc.free(line);
 
         const input = std.mem.trim(u8, line, " \t\r\n");
@@ -191,7 +192,11 @@ fn run(alloc: std.mem.Allocator, active_repo: *?[]const u8) void {
                 writeResult(alloc, stdout, id, "null");
             }
         } else if (mj.eql(method, "tools/list")) {
-            writeResult(alloc, stdout, id, tools.tools_list);
+            if (tools.isOnboarded()) {
+                writeResult(alloc, stdout, id, tools.tools_list);
+            } else {
+                writeResult(alloc, stdout, id, tools.onboard_tool_json);
+            }
         } else if (mj.eql(method, "tools/call")) {
             handleCall(alloc, root, active_repo, stdout, id);
         } else if (mj.eql(method, "ping")) {
@@ -207,16 +212,34 @@ fn readLineAny(alloc: std.mem.Allocator, reader: anytype) ?[]u8 {
     var line: std.ArrayList(u8) = .empty;
     var buf: [1]u8 = undefined;
     while (true) {
-        const n = reader.read(&buf) catch { line.deinit(alloc); return null; };
+        const n = reader.read(&buf) catch {
+            line.deinit(alloc);
+            return null;
+        };
         if (n == 0) {
-            if (line.items.len == 0) { line.deinit(alloc); return null; }
-            return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+            if (line.items.len == 0) {
+                line.deinit(alloc);
+                return null;
+            }
+            return line.toOwnedSlice(alloc) catch {
+                line.deinit(alloc);
+                return null;
+            };
         }
         if (buf[0] == '\n') {
-            return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+            return line.toOwnedSlice(alloc) catch {
+                line.deinit(alloc);
+                return null;
+            };
         }
-        line.append(alloc, buf[0]) catch { line.deinit(alloc); return null; };
-        if (line.items.len > 4 * 1024 * 1024) { line.deinit(alloc); return null; }
+        line.append(alloc, buf[0]) catch {
+            line.deinit(alloc);
+            return null;
+        };
+        if (line.items.len > 4 * 1024 * 1024) {
+            line.deinit(alloc);
+            return null;
+        }
     }
 }
 
@@ -413,12 +436,13 @@ fn handleInitialize(
     stdout: std.fs.File,
     id: ?std.json.Value,
 ) void {
-    writeResult(
+    const response = std.fmt.allocPrint(
         alloc,
-        stdout,
-        id,
-        "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"gitagent-mcp\",\"version\":\"0.1.0\"}}",
-    );
+        "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"devswarm\",\"version\":\"{s}\"}}}}",
+        .{build_options.version},
+    ) catch return;
+    defer alloc.free(response);
+    writeResult(alloc, stdout, id, response);
 }
 
 fn resolveThreadId(
@@ -645,7 +669,7 @@ test "resolveThreadId reads params first, then args, then default" {
 }
 
 test "normalizeThreadId rejects empty and oversized ids" {
-    const long = [_]u8{ 'x' } ** (MaxThreadIdLen + 1);
+    const long = [_]u8{'x'} ** (MaxThreadIdLen + 1);
     try std.testing.expectEqualStrings(DefaultThreadId, normalizeThreadId(""));
     try std.testing.expectEqualStrings(DefaultThreadId, normalizeThreadId(&long));
     try std.testing.expectEqualStrings("abc", normalizeThreadId("abc"));
@@ -703,7 +727,7 @@ test "protocol: readMessage accepts line-delimited JSON" {
 
     const payload = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n";
     try writer.writeAll(payload);
-writer.close();
+    writer.close();
 
     var uses_headers = false;
     const line = (try readMessage(alloc, reader, &uses_headers)) orelse
@@ -730,7 +754,7 @@ test "protocol: readMessage accepts header-framed JSON" {
     );
     defer alloc.free(frame);
     try writer.writeAll(frame);
-writer.close();
+    writer.close();
 
     var uses_headers = false;
     const read = (try readMessage(alloc, reader, &uses_headers)) orelse
@@ -871,15 +895,11 @@ test "protocol: writeError emits valid JSON-RPC 2.0 error structure" {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const obj = &parsed.value.object;
-    try std.testing.expectEqualStrings("2.0",
-        (obj.get("jsonrpc") orelse return error.MissingJsonrpc).string);
-    try std.testing.expectEqual(@as(i64, 7),
-        (obj.get("id") orelse return error.MissingId).integer);
+    try std.testing.expectEqualStrings("2.0", (obj.get("jsonrpc") orelse return error.MissingJsonrpc).string);
+    try std.testing.expectEqual(@as(i64, 7), (obj.get("id") orelse return error.MissingId).integer);
     const err_obj = (obj.get("error") orelse return error.MissingError).object;
-    try std.testing.expectEqual(@as(i64, -32600),
-        (err_obj.get("code") orelse return error.MissingCode).integer);
-    try std.testing.expectEqualStrings("Invalid Request",
-        (err_obj.get("message") orelse return error.MissingMessage).string);
+    try std.testing.expectEqual(@as(i64, -32600), (err_obj.get("code") orelse return error.MissingCode).integer);
+    try std.testing.expectEqualStrings("Invalid Request", (err_obj.get("message") orelse return error.MissingMessage).string);
 }
 
 test "protocol: writeResult emits valid JSON-RPC 2.0 result structure" {
@@ -896,14 +916,26 @@ test "protocol: writeResult emits valid JSON-RPC 2.0 result structure" {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const obj = &parsed.value.object;
-    try std.testing.expectEqualStrings("2.0",
-        (obj.get("jsonrpc") orelse return error.MissingJsonrpc).string);
-    try std.testing.expectEqualStrings("my-id",
-        (obj.get("id") orelse return error.MissingId).string);
+    try std.testing.expectEqualStrings("2.0", (obj.get("jsonrpc") orelse return error.MissingJsonrpc).string);
+    try std.testing.expectEqualStrings("my-id", (obj.get("id") orelse return error.MissingId).string);
     try std.testing.expect(obj.get("result") != null);
 }
 
 // Force test discovery for all modules
 comptime {
     _ = runtime;
+    _ = @import("telemetry.zig");
+    _ = @import("auth.zig");
+    _ = @import("rate_limit.zig");
+    _ = @import("graph/edge_weights.zig");
+    _ = @import("graph/watcher.zig");
+    _ = @import("graph/hot_cache.zig");
+    _ = @import("graph/harness.zig");
+    _ = @import("graph/tenant.zig");
+    _ = @import("graph/ingest.zig");
+    _ = @import("graph/monorepo.zig");
+    _ = @import("graph/tier_manager.zig");
+    _ = @import("graph/wal.zig");
+    _ = @import("graph/ppr_incremental.zig");
+    _ = @import("skills.zig");
 }

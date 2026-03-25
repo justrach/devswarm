@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""End-to-end test for all 21 gitagent-mcp tools."""
+"""End-to-end test for all 21 devswarm tools."""
 import json, os, subprocess, sys
 from pathlib import Path
 
 _DIR   = Path(__file__).resolve().parent
-BINARY = str(_DIR / "zig-out" / "bin" / "gitagent-mcp")
+BINARY = str(_DIR / "zig-out" / "bin" / "devswarm")
 REPO   = str(_DIR)
 
 class MCP:

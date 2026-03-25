@@ -27,11 +27,30 @@ jobs:
         run: |
           sed -i 's/"version": "[^"]*"/"version": "${{ inputs.version }}"/' npm/package.json
 
+      - name: Update build.zig fallback version
+        run: |
+          sed -i 's/orelse "[^"]*"/orelse "${{ inputs.version }}"/' build.zig
+
+      - name: Verify version updates
+        run: |
+          echo "Checking version consistency..."
+          ZON_VER=$(grep '\.version = "' build.zig.zon | sed 's/.*"\([^"]*\)".*/\1/')
+          NPM_VER=$(node -p "require('./npm/package.json').version")
+          BUILD_VER=$(grep 'orelse "' build.zig | sed 's/.*orelse "\([^"]*\)".*/\1/')
+          echo "build.zig.zon: $ZON_VER"
+          echo "npm/package.json: $NPM_VER"
+          echo "build.zig: $BUILD_VER"
+          if [ "$ZON_VER" != "${{ inputs.version }}" ] || [ "$NPM_VER" != "${{ inputs.version }}" ] || [ "$BUILD_VER" != "${{ inputs.version }}" ]; then
+            echo "::error::Version update failed - one or more files not updated correctly"
+            exit 1
+          fi
+          echo "All versions updated to ${{ inputs.version }}"
+
       - name: Commit and tag
         run: |
           git config user.name "github-actions"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add build.zig.zon npm/package.json
+          git add build.zig.zon npm/package.json build.zig
           git commit -m "chore: bump version to v${{ inputs.version }}"
           git tag "v${{ inputs.version }}"
           git push origin main --tags

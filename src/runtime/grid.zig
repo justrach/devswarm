@@ -54,7 +54,7 @@ const GridEntry = struct {
 /// Default grid — can be overridden by model_grid.toml.
 const default_grid = [_]GridEntry{
     // Orchestration
-    .{ .role = "orchestrator",  .tier = .opus },
+    .{ .role = "orchestrator",  .tier = .bolt },
     .{ .role = "synthesizer",   .tier = .sonnet },
 
     // Worker roles
@@ -63,6 +63,12 @@ const default_grid = [_]GridEntry{
     .{ .role = "fixer",         .tier = .sonnet },
     .{ .role = "explorer",      .tier = .sonnet },
     .{ .role = "architect",     .tier = .opus },
+
+    // Specialist roles
+    .{ .role = "safety_auditor", .tier = .opus },
+    .{ .role = "zig_specialist", .tier = .sonnet },
+    .{ .role = "api_reviewer",   .tier = .sonnet },
+    .{ .role = "test_writer",    .tier = .sonnet },
 
     // Budget roles
     .{ .role = "monitor",       .tier = .haiku },
@@ -94,14 +100,14 @@ pub fn resolveModel(role: ?[]const u8, mode: AgentMode) []const u8 {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "grid: tierForRole returns correct tiers" {
-    try std.testing.expectEqual(ModelTier.opus,   tierForRole("orchestrator").?);
+    try std.testing.expectEqual(ModelTier.bolt,   tierForRole("orchestrator").?);
     try std.testing.expectEqual(ModelTier.sonnet, tierForRole("finder").?);
     try std.testing.expectEqual(ModelTier.haiku,  tierForRole("monitor").?);
     try std.testing.expectEqual(@as(?ModelTier, null), tierForRole("unknown_role"));
 }
 
 test "grid: resolveModel uses grid for known roles" {
-    try std.testing.expectEqualStrings("claude-opus-4-6", resolveModel("orchestrator", .smart));
+    try std.testing.expectEqualStrings("gpt-5.4", resolveModel("orchestrator", .smart));
     try std.testing.expectEqualStrings("claude-sonnet-4-6", resolveModel("finder", .rush));
 }
 

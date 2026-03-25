@@ -20,3 +20,20 @@ jobs:
 
       - name: Run tests
         run: zig build test
+
+  version-check:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version consistency
+        run: |
+          ZON_VERSION=$(grep '\.version = "' build.zig.zon | sed 's/.*"\([^"]*\)".*/\1/')
+          NPM_VERSION=$(node -p "require('./npm/package.json').version")
+          echo "build.zig.zon version: $ZON_VERSION"
+          echo "npm/package.json version: $NPM_VERSION"
+          if [ "$ZON_VERSION" != "$NPM_VERSION" ]; then
+            echo "::error::Version mismatch: build.zig.zon has $ZON_VERSION but npm/package.json has $NPM_VERSION"
+            exit 1
+          fi

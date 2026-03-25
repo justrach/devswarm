@@ -222,17 +222,43 @@ System prompts are assembled dynamically from agency rules, role instructions, m
 
 ---
 
-## 🤝 Contributing
+## Telemetry
 
-Contributions are welcome! Please open an issue before submitting a large PR so we can discuss the approach.
+devswarm collects **anonymous usage telemetry** to help improve the project. This is enabled by default.
 
-```bash
-git clone https://github.com/justrach/codedb.git
-cd codedb
-zig build test     # make sure tests pass before and after your change
+### What's collected
+- Agent roles used (e.g. "finder", "reviewer", "fixer")
+- Model names (e.g. "claude-sonnet-4-6")
+- Token counts (input/output per worker)
+- Wall time and estimated cost
+- Worker count and parallelism metrics
+
+### What's NEVER collected
+- Your code, file contents, or diffs
+- Prompts, task descriptions, or agent outputs
+- Repository names, file paths, or branch names
+- Any personally identifiable information
+
+### How to opt out
+
+Edit `.devswarm/config.toml`:
+```toml
+[telemetry]
+enabled = false
 ```
 
+Or set the environment variable:
+```bash
+export DEVSWARM_TELEMETRY=false
+```
+
+You can opt out at any time. The telemetry preference is set during onboarding and stored in `.devswarm/config.toml`.
+
 ---
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines before opening a PR.
 
 ## License
 

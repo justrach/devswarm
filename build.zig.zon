@@ -33,7 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .mcp_zig = .{
-            .url = "https://github.com/justrach/mcp-zig/archive/main.tar.gz",
+            .url = "https://github.com/justrach/mcp-zig/archive/849ea75425a673b0ba595cf6f52bdbe1baa24dc7.tar.gz",
             .hash = "mcp_zig-0.1.0-_PilzKqwAADQMtOMDCNpisumVz7YufhjqFJxG1rsEc1Z",
         },
     },
