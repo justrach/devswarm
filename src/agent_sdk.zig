@@ -93,6 +93,7 @@ pub fn tryClaudeAgent(
     argv_buf[argc] = perm_mode;           argc += 1;
     argv_buf[argc] = "--model";          argc += 1;
     argv_buf[argc] = model;              argc += 1;
+    argv_buf[argc] = "--no-mcp-servers"; argc += 1;
 
     if (opts.reasoning_effort) |effort| {
         argv_buf[argc] = "--reasoning-effort"; argc += 1;
@@ -183,12 +184,12 @@ fn streamClaudeOutput(
     var total_in: u64 = 0;
     var total_out: u64 = 0;
 
+
     while (!found_result) {
         const line = readLine(alloc, file) orelse break;
         defer alloc.free(line);
         parseClaudeLine(alloc, line, out, &accumulated, &found_result, &total_in, &total_out);
     }
-
     if (!found_result and accumulated.items.len > 0) {
         out.appendSlice(alloc, accumulated.items) catch {};
     }
