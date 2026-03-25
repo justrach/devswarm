@@ -101,8 +101,9 @@ pub fn resolve(
     //    Priority: explicit codex model → config [agents.<role>].backend
     //              → config [provider].primary → probed preferred
     const backend: Backend = blk: {
-        // If model is explicitly a Codex model, use codex backend
-        if (std.mem.indexOf(u8, model, "codex") != null and backends.codex)
+        // If model is a Codex/OpenAI model, use codex backend
+        if ((std.mem.indexOf(u8, model, "codex") != null or
+            std.mem.indexOf(u8, model, "gpt-") != null) and backends.codex)
             break :blk .codex;
         // config.toml per-role backend override
         if (role_cfg) |rc| {
