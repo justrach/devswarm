@@ -249,34 +249,6 @@ fn parseClaudeLine(
         else => return,
     };
 
-    // Extract usage from any event that has it (assistant, result, etc.)
-    // Claude CLI emits usage on every assistant turn — accumulate across all of them
-    if (obj.get("usage")) |usage_v| {
-        if (usage_v == .object) {
-            if (usage_v.object.get("input_tokens")) |v| {
-                if (v == .integer) total_in.* += @intCast(@as(u64, @intCast(v.integer)));
-            }
-            if (usage_v.object.get("output_tokens")) |v| {
-                if (v == .integer) total_out.* += @intCast(@as(u64, @intCast(v.integer)));
-            }
-        }
-    }
-    // Also check message.usage (nested in assistant events)
-    if (obj.get("message")) |msg_v| {
-        if (msg_v == .object) {
-            if (msg_v.object.get("usage")) |usage_v| {
-                if (usage_v == .object) {
-                    if (usage_v.object.get("input_tokens")) |v| {
-                        if (v == .integer) total_in.* += @intCast(@as(u64, @intCast(v.integer)));
-                    }
-                    if (usage_v.object.get("output_tokens")) |v| {
-                        if (v == .integer) total_out.* += @intCast(@as(u64, @intCast(v.integer)));
-                    }
-                }
-            }
-        }
-    }
-
     if (std.mem.eql(u8, type_str, "result")) {
         if (obj.get("result")) |rv| {
             if (rv == .string) {
@@ -284,9 +256,50 @@ fn parseClaudeLine(
                 found_result.* = true;
             }
         }
+        // Result event has authoritative cumulative usage including cache tokens.
+        // Format: usage.input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+        if (obj.get("usage")) |usage_v| {
+            if (usage_v == .object) {
+                var in_total: u64 = 0;
+                if (usage_v.object.get("input_tokens")) |v| {
+                    if (v == .integer and v.integer > 0) in_total += @intCast(v.integer);
+                }
+                if (usage_v.object.get("cache_creation_input_tokens")) |v| {
+                    if (v == .integer and v.integer > 0) in_total += @intCast(v.integer);
+                }
+                if (usage_v.object.get("cache_read_input_tokens")) |v| {
+                    if (v == .integer and v.integer > 0) in_total += @intCast(v.integer);
+                }
+                if (in_total > 0) total_in.* = in_total; // replace, not accumulate
+                if (usage_v.object.get("output_tokens")) |v| {
+                    if (v == .integer and v.integer > 0) total_out.* = @intCast(v.integer);
+                }
+            }
+        }
     } else if (std.mem.eql(u8, type_str, "assistant")) {
         // Accumulate assistant text as fallback when result event is absent.
         extractAssistantText(alloc, obj, accumulated);
+        // Accumulate usage from assistant turns (fallback if no result event)
+        if (obj.get("message")) |msg_v| {
+            if (msg_v == .object) {
+                if (msg_v.object.get("usage")) |usage_v| {
+                    if (usage_v == .object) {
+                        if (usage_v.object.get("input_tokens")) |v| {
+                            if (v == .integer and v.integer > 0) total_in.* += @intCast(v.integer);
+                        }
+                        if (usage_v.object.get("cache_creation_input_tokens")) |v| {
+                            if (v == .integer and v.integer > 0) total_in.* += @intCast(v.integer);
+                        }
+                        if (usage_v.object.get("cache_read_input_tokens")) |v| {
+                            if (v == .integer and v.integer > 0) total_in.* += @intCast(v.integer);
+                        }
+                        if (usage_v.object.get("output_tokens")) |v| {
+                            if (v == .integer and v.integer > 0) total_out.* += @intCast(v.integer);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
