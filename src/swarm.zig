@@ -66,30 +66,33 @@ fn workerFn(args: *WorkerArgs) void {
 }
 
 fn parseMetricsFromOutput(_: std.mem.Allocator, output: []const u8, metrics: *telemetry.WorkerMetrics) void {
-    var i: usize = 0;
-    while (i < output.len) {
-        if (std.mem.indexOfPos(u8, output, i, "\"tokens\"")) |tok_pos| {
-            i = tok_pos + 9;
-            while (i < output.len and output[i] != '{' and output[i] != ':') i += 1;
-            if (i < output.len and output[i] == ':') {
-                i += 1;
-                while (i < output.len and (output[i] == ' ' or output[i] == '\t')) i += 1;
-                const start = i;
-                while (i < output.len and output[i] >= '0' and output[i] <= '9') i += 1;
-                if (i > start) {
-                    const num_str = output[start..i];
-                    if (std.fmt.parseInt(u64, num_str, 10)) |val| {
-                        metrics.tokens_in = val;
-                    } else |_| {}
-                }
+    // Parse __USAGE__ marker appended by agent_sdk.zig
+    // Format: \n__USAGE__:tokens_in=N,tokens_out=N
+    if (std.mem.indexOf(u8, output, "__USAGE__:")) |marker_pos| {
+        const after = output[marker_pos + 10 ..]; // skip "__USAGE__:"
+        // Parse tokens_in
+        if (std.mem.indexOf(u8, after, "tokens_in=")) |ti_pos| {
+            const num_start = ti_pos + 10;
+            var num_end = num_start;
+            while (num_end < after.len and after[num_end] >= '0' and after[num_end] <= '9') num_end += 1;
+            if (num_end > num_start) {
+                metrics.tokens_in = std.fmt.parseInt(u64, after[num_start..num_end], 10) catch 0;
             }
-        } else {
-            break;
+        }
+        // Parse tokens_out
+        if (std.mem.indexOf(u8, after, "tokens_out=")) |to_pos| {
+            const num_start = to_pos + 11;
+            var num_end = num_start;
+            while (num_end < after.len and after[num_end] >= '0' and after[num_end] <= '9') num_end += 1;
+            if (num_end > num_start) {
+                metrics.tokens_out = std.fmt.parseInt(u64, after[num_start..num_end], 10) catch 0;
+            }
         }
     }
 
+    // Count tool_use occurrences
     var tool_count: u32 = 0;
-    i = 0;
+    var i: usize = 0;
     while (i < output.len) {
         if (std.mem.indexOfPos(u8, output, i, "tool_use")) |tu| {
             tool_count += 1;
@@ -235,6 +238,13 @@ pub fn runSwarm(
     var swarm_telemetry = telemetry.SwarmTelemetry.init(alloc, task);
     defer swarm_telemetry.deinit();
     swarm_telemetry.parallelism_theoretical = @intCast(cap);
+
+    // Auto-detect repo for telemetry
+    if (@import("gh.zig").run(alloc, &.{ "git", "remote", "get-url", "origin" })) |r| {
+        defer r.deinit(alloc);
+        const trimmed = std.mem.trim(u8, r.stdout, " \t\n\r");
+        if (trimmed.len > 0) swarm_telemetry.setRepo(trimmed);
+    } else |_| {}
 
     var count: usize = 0;
 
