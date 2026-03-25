@@ -180,15 +180,27 @@ fn streamClaudeOutput(
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found_result = false;
+    var total_in: u64 = 0;
+    var total_out: u64 = 0;
 
     while (!found_result) {
         const line = readLine(alloc, file) orelse break;
         defer alloc.free(line);
-        parseClaudeLine(alloc, line, out, &accumulated, &found_result);
+        parseClaudeLine(alloc, line, out, &accumulated, &found_result, &total_in, &total_out);
     }
 
     if (!found_result and accumulated.items.len > 0) {
         out.appendSlice(alloc, accumulated.items) catch {};
+    }
+
+    // Append cumulative usage marker for telemetry extraction
+    if (total_in > 0 or total_out > 0) {
+        var buf: [128]u8 = undefined;
+        const marker = std.fmt.bufPrint(&buf,
+            "\n__USAGE__:tokens_in={d},tokens_out={d}",
+            .{ total_in, total_out },
+        ) catch "";
+        out.appendSlice(alloc, marker) catch {};
     }
 }
 
@@ -217,6 +229,8 @@ fn parseClaudeLine(
     out: *std.ArrayList(u8),
     accumulated: *std.ArrayList(u8),
     found_result: *bool,
+    total_in: *u64,
+    total_out: *u64,
 ) void {
     const s = std.mem.trimRight(u8, line, "\r");
     if (s.len == 0) return;
@@ -235,31 +249,39 @@ fn parseClaudeLine(
         else => return,
     };
 
+    // Extract usage from any event that has it (assistant, result, etc.)
+    // Claude CLI emits usage on every assistant turn — accumulate across all of them
+    if (obj.get("usage")) |usage_v| {
+        if (usage_v == .object) {
+            if (usage_v.object.get("input_tokens")) |v| {
+                if (v == .integer) total_in.* += @intCast(@as(u64, @intCast(v.integer)));
+            }
+            if (usage_v.object.get("output_tokens")) |v| {
+                if (v == .integer) total_out.* += @intCast(@as(u64, @intCast(v.integer)));
+            }
+        }
+    }
+    // Also check message.usage (nested in assistant events)
+    if (obj.get("message")) |msg_v| {
+        if (msg_v == .object) {
+            if (msg_v.object.get("usage")) |usage_v| {
+                if (usage_v == .object) {
+                    if (usage_v.object.get("input_tokens")) |v| {
+                        if (v == .integer) total_in.* += @intCast(@as(u64, @intCast(v.integer)));
+                    }
+                    if (usage_v.object.get("output_tokens")) |v| {
+                        if (v == .integer) total_out.* += @intCast(@as(u64, @intCast(v.integer)));
+                    }
+                }
+            }
+        }
+    }
+
     if (std.mem.eql(u8, type_str, "result")) {
-        // {"type":"result","subtype":"success","result":"<final text>","usage":{...},...}
         if (obj.get("result")) |rv| {
             if (rv == .string) {
                 out.appendSlice(alloc, rv.string) catch {};
                 found_result.* = true;
-            }
-        }
-        // Append usage metadata as a trailing marker for telemetry extraction
-        if (obj.get("usage")) |usage_v| {
-            if (usage_v == .object) {
-                var buf: [128]u8 = undefined;
-                const in_tok = if (usage_v.object.get("input_tokens")) |v| switch (v) {
-                    .integer => |i| @as(u64, @intCast(i)),
-                    else => @as(u64, 0),
-                } else 0;
-                const out_tok = if (usage_v.object.get("output_tokens")) |v| switch (v) {
-                    .integer => |i| @as(u64, @intCast(i)),
-                    else => @as(u64, 0),
-                } else 0;
-                const marker = std.fmt.bufPrint(&buf,
-                    "\n__USAGE__:tokens_in={d},tokens_out={d}",
-                    .{ in_tok, out_tok },
-                ) catch "";
-                out.appendSlice(alloc, marker) catch {};
             }
         }
     } else if (std.mem.eql(u8, type_str, "assistant")) {
@@ -299,11 +321,13 @@ test "agent_sdk: parseClaudeLine extracts result text" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
     const line =
         \\{"type":"result","subtype":"success","is_error":false,"result":"Hello world","session_id":"s1"}
     ;
-    parseClaudeLine(alloc, line, &out, &accumulated, &found);
+    parseClaudeLine(alloc, line, &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(found);
     try std.testing.expectEqualStrings("Hello world", out.items);
@@ -317,11 +341,13 @@ test "agent_sdk: parseClaudeLine accumulates assistant text" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
     const line =
         \\{"type":"assistant","message":{"id":"m1","type":"message","role":"assistant","content":[{"type":"text","text":"partial response"}],"stop_reason":null},"session_id":"s1"}
     ;
-    parseClaudeLine(alloc, line, &out, &accumulated, &found);
+    parseClaudeLine(alloc, line, &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(!found);
     try std.testing.expect(out.items.len == 0);
@@ -336,10 +362,12 @@ test "agent_sdk: parseClaudeLine ignores system init events" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
     parseClaudeLine(alloc,
         \\{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}
-    , &out, &accumulated, &found);
+    , &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(!found);
     try std.testing.expect(out.items.len == 0);
@@ -354,8 +382,10 @@ test "agent_sdk: parseClaudeLine handles malformed JSON gracefully" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
-    parseClaudeLine(alloc, "not json at all", &out, &accumulated, &found);
+    parseClaudeLine(alloc, "not json at all", &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(!found);
     try std.testing.expect(out.items.len == 0);
@@ -369,9 +399,11 @@ test "agent_sdk: parseClaudeLine skips empty and whitespace-only lines" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
-    parseClaudeLine(alloc, "", &out, &accumulated, &found);
-    parseClaudeLine(alloc, "\r", &out, &accumulated, &found);
+    parseClaudeLine(alloc, "", &out, &accumulated, &found, &ti, &to);
+    parseClaudeLine(alloc, "\r", &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(!found);
     try std.testing.expect(out.items.len == 0);
@@ -386,10 +418,12 @@ test "agent_sdk: error result is still captured in out" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
     parseClaudeLine(alloc,
         \\{"type":"result","subtype":"error_during_execution","is_error":true,"result":"partial before crash","session_id":"s1"}
-    , &out, &accumulated, &found);
+    , &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(found);
     try std.testing.expectEqualStrings("partial before crash", out.items);
@@ -403,20 +437,22 @@ test "agent_sdk: multi-turn assistant text accumulates, result event wins" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
     parseClaudeLine(alloc,
         \\{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "}]},"session_id":"s1"}
-    , &out, &accumulated, &found);
+    , &out, &accumulated, &found, &ti, &to);
     parseClaudeLine(alloc,
         \\{"type":"assistant","message":{"content":[{"type":"text","text":"world"}]},"session_id":"s1"}
-    , &out, &accumulated, &found);
+    , &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(!found);
     try std.testing.expectEqualStrings("Hello world", accumulated.items);
 
     parseClaudeLine(alloc,
         \\{"type":"result","subtype":"success","result":"Final answer","session_id":"s1"}
-    , &out, &accumulated, &found);
+    , &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(found);
     try std.testing.expectEqualStrings("Final answer", out.items);
@@ -430,10 +466,12 @@ test "agent_sdk: non-text content blocks in assistant message are skipped" {
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(alloc);
     var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
 
     parseClaudeLine(alloc,
         \\{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"text","text":"after tool"}]},"session_id":"s1"}
-    , &out, &accumulated, &found);
+    , &out, &accumulated, &found, &ti, &to);
 
     try std.testing.expect(!found);
     try std.testing.expectEqualStrings("after tool", accumulated.items);
