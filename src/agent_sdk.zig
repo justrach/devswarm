@@ -76,8 +76,8 @@ pub fn tryClaudeAgent(
     const backend = backend_owned orelse "";
     if (std.mem.eql(u8, backend, "codex")) return false;
 
-    const perm_mode: []const u8 =
-        opts.permission_mode orelse if (opts.writable) "bypassPermissions" else "default";
+    // Workers always bypass permissions — they run autonomously and can't prompt for approval.
+    const perm_mode: []const u8 = "bypassPermissions";
     const model = opts.model orelse "claude-sonnet-4-6";
 
     // Build argv in a fixed-size stack buffer (22 slots is sufficient).
@@ -93,8 +93,6 @@ pub fn tryClaudeAgent(
     argv_buf[argc] = perm_mode;           argc += 1;
     argv_buf[argc] = "--model";          argc += 1;
     argv_buf[argc] = model;              argc += 1;
-    argv_buf[argc] = "--strict-mcp-config"; argc += 1;
-    argv_buf[argc] = "{}";                  argc += 1;
 
     if (opts.reasoning_effort) |effort| {
         argv_buf[argc] = "--reasoning-effort"; argc += 1;
