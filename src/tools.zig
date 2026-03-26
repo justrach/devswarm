@@ -2771,7 +2771,8 @@ pub fn isOnboarded() bool {
 pub const onboard_tool_json =
     \\{"tools":[
     \\{"name":"onboard","description":"Set up devswarm for this project. Discovers your codebase, available skills, and configures quality preferences. This tool disappears after setup is complete — you will not see it again.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"get_project_state","description":"Return all open issues grouped by status label, all open branches, and all open PRs. Use this to understand current project state before picking up work.","inputSchema":{"type":"object","properties":{},"required":[]}}
+    \\{"name":"get_project_state","description":"Return all open issues grouped by status label, all open branches, and all open PRs. Use this to understand current project state before picking up work.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"set_repo","description":"Switch the active repository path. Call this FIRST if devswarm is pointing at the wrong project. All subsequent tool calls will operate against this repo.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the git repository root"}},"required":["path"]}}
     \\]}
 ;
 
