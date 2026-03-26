@@ -93,7 +93,8 @@ pub fn tryClaudeAgent(
     argv_buf[argc] = perm_mode;           argc += 1;
     argv_buf[argc] = "--model";          argc += 1;
     argv_buf[argc] = model;              argc += 1;
-    argv_buf[argc] = "--bare";            argc += 1;
+    argv_buf[argc] = "--strict-mcp-config"; argc += 1;
+    argv_buf[argc] = "{}";                  argc += 1;
 
     if (opts.reasoning_effort) |effort| {
         argv_buf[argc] = "--reasoning-effort"; argc += 1;
