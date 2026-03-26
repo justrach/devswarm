@@ -192,11 +192,9 @@ fn run(alloc: std.mem.Allocator, active_repo: *?[]const u8) void {
                 writeResult(alloc, stdout, id, "null");
             }
         } else if (mj.eql(method, "tools/list")) {
-            if (tools.isOnboarded()) {
-                writeResult(alloc, stdout, id, tools.tools_list);
-            } else {
-                writeResult(alloc, stdout, id, tools.onboard_tool_json);
-            }
+            // All tools always available — no onboarding gate.
+            // Telemetry is on by default; users opt out via config or env var.
+            writeResult(alloc, stdout, id, tools.tools_list);
         } else if (mj.eql(method, "tools/call")) {
             handleCall(alloc, root, active_repo, stdout, id);
         } else if (mj.eql(method, "ping")) {
