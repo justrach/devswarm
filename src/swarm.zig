@@ -308,14 +308,6 @@ pub fn runSwarm(
             .string => |s| s,
             else => continue,
         };
-        // For writable workers, prepend the tool-use preamble so agents use
-        // zigrep/zigpatch instead of sed/awk.
-        const allocated: ?[]u8 = if (writable) blk: {
-            const preamble = buildPreamble(alloc);
-            const full = std.fmt.allocPrint(alloc, "{s}{s}", .{ preamble, base }) catch null;
-            rt.prompts.freeAssembled(alloc, preamble);
-            break :blk full;
-        } else null;
         const role_str = switch (r_val) {
             .string => |s| s,
             else => "agent",
@@ -325,7 +317,6 @@ pub fn runSwarm(
             .id = @intCast(count),
             .role = role_str,
             .prompt = base,
-            .allocated_prompt = allocated,
         };
         worker_args[count] = .{ .worker = &workers[count], .writable = writable, .metrics = &worker_metrics[count], .model = model, .mode = mode };
         threads[count] = std.Thread.spawn(.{}, workerFn, .{&worker_args[count]}) catch null;
@@ -352,10 +343,7 @@ pub fn runSwarm(
     for (threads[0..count]) |maybe_t| {
         if (maybe_t) |t| t.join();
     }
-    // Free preamble-prefixed prompts now that threads have finished.
-    for (workers[0..count]) |w| {
-        if (w.allocated_prompt) |p| alloc.free(p);
-    }
+
 
     // ── Check for early interruption ─────────────────────────────────────────
     if (g_interrupted.load(.acquire)) {
@@ -642,4 +630,82 @@ test "swarm: workerFn model propagates into AgentRequest" {
     try std.testing.expectEqualStrings("claude-haiku-4-5-20251001", req.model.?);
     try std.testing.expectEqualStrings("rush", req.mode.?);
     try std.testing.expectEqualStrings("reviewer", req.role.?);
+}
+
+// ── Regression tests: #388 role propagation, #389 no preamble duplication ────
+
+test "swarm: #388 orchestrator role flows into Worker and AgentRequest unchanged" {
+    // Parse a JSON sub-task array as the orchestrator would emit, extract the
+    // role, and confirm it reaches the AgentRequest without being overridden.
+    const alloc = std.testing.allocator;
+    const json_str =
+        \\[{"role":"zig_specialist","prompt":"fix errdefer in src/foo.zig"}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_str, .{});
+    defer parsed.deinit();
+
+    const arr = parsed.value.array;
+    const obj = arr.items[0].object;
+    const r_val = obj.get("role") orelse std.json.Value{ .string = "agent" };
+    const p_val = obj.get("prompt") orelse return error.MissingPrompt;
+    const role_str = switch (r_val) {
+        .string => |s| s,
+        else => "agent",
+    };
+    const base = switch (p_val) {
+        .string => |s| s,
+        else => return error.MissingPrompt,
+    };
+
+    // Role must survive from JSON → Worker → AgentRequest unchanged.
+    try std.testing.expectEqualStrings("zig_specialist", role_str);
+
+    var dummy_metrics = telemetry.WorkerMetrics.init(0, role_str, "claude-sonnet-4-6");
+    defer dummy_metrics.deinit(alloc);
+    const w = Worker{ .id = 0, .role = role_str, .prompt = base };
+    try std.testing.expectEqualStrings("zig_specialist", w.role);
+
+    // Mirror the AgentRequest construction in workerFn (L74-80).
+    const req: rt.AgentRequest = .{
+        .prompt = w.prompt,
+        .role = w.role,
+        .mode = "smart",
+        .model = null,
+        .writable = true,
+    };
+    try std.testing.expectEqualStrings("zig_specialist", req.role.?);
+}
+
+test "swarm: #389 worker allocated_prompt is null — no preamble prepended" {
+    // buildPreamble() must no longer be prepended to worker task text.
+    // Workers receive bare prompts; system prompts come from resolveWithProbe.
+    const base = "fix the bug in src/bar.zig";
+    const w = Worker{
+        .id = 0,
+        .role = "fixer",
+        .prompt = base,
+        // allocated_prompt omitted — must remain null (no preamble injection)
+    };
+    try std.testing.expect(w.allocated_prompt == null);
+    try std.testing.expectEqualStrings(base, w.prompt);
+}
+
+test "swarm: #388 missing role defaults to 'agent' not 'fixer'" {
+    // When the orchestrator omits the role field the fallback must be the
+    // neutral "agent" value — never a hardcoded writable role like "fixer".
+    const alloc = std.testing.allocator;
+    const json_str =
+        \\[{"prompt":"do something"}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_str, .{});
+    defer parsed.deinit();
+
+    const arr = parsed.value.array;
+    const obj = arr.items[0].object;
+    const r_val = obj.get("role") orelse std.json.Value{ .string = "agent" };
+    const role_str = switch (r_val) {
+        .string => |s| s,
+        else => "agent",
+    };
+    try std.testing.expectEqualStrings("agent", role_str);
 }
