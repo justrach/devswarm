@@ -104,10 +104,12 @@ pub fn tryClaudeAgent(
         argv_buf[argc] = at;               argc += 1;
     }
 
-    // Inherit environment but strip CLAUDECODE (nested-session guard).
+    // Inherit environment but strip CLAUDECODE (nested-session guard) and
+    // any CODEX_* vars inherited from a parent desktop session.
     var env_map = std.process.getEnvMap(alloc) catch std.process.EnvMap.init(alloc);
     defer env_map.deinit();
     env_map.remove("CLAUDECODE");
+    stripCodexEnv(alloc, &env_map);
 
     // ── Option 1: direct spawn ────────────────────────────────────────────────
     var child = std.process.Child.init(argv_buf[0..argc], alloc);
@@ -332,9 +334,26 @@ fn extractAssistantText(
     }
 }
 
+/// Removes all env entries whose key starts with "CODEX_".
+/// Prevents desktop-session CODEX_* vars from leaking into nested spawns.
+fn stripCodexEnv(alloc: std.mem.Allocator, env: *std.process.EnvMap) void {
+    var keys: std.ArrayList([]u8) = .empty;
+    defer {
+        for (keys.items) |k| alloc.free(k);
+        keys.deinit(alloc);
+    }
+    var it = env.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.key_ptr.*, "CODEX_"))
+            keys.append(alloc, alloc.dupe(u8, entry.key_ptr.*) catch continue) catch {};
+    }
+    for (keys.items) |k| env.remove(k);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
 
 test "agent_sdk: parseClaudeLine extracts result text" {
     const alloc = std.testing.allocator;
@@ -665,4 +684,24 @@ test "integration: agent_sdk model param is forwarded" {
         std.debug.print("\n[integration] sonnet got: {s}\n", .{out2.items});
         return error.UnexpectedResponse;
     }
+}
+
+test "agent_sdk: stripCodexEnv removes CODEX_* vars but preserves unrelated env" {
+    const alloc = std.testing.allocator;
+    var env = std.process.EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("CODEX_SESSION_ID", "sess-abc");
+    try env.put("CODEX_THREAD_ID", "thread-def");
+    try env.put("CODEX_SOMETHING_ELSE", "val");
+    try env.put("PATH", "/usr/bin:/bin");
+    try env.put("HOME", "/home/user");
+    try env.put("CLAUDECODE", "1");
+    env.remove("CLAUDECODE");
+    stripCodexEnv(alloc, &env);
+    try std.testing.expectEqual(@as(?[]const u8, null), env.get("CODEX_SESSION_ID"));
+    try std.testing.expectEqual(@as(?[]const u8, null), env.get("CODEX_THREAD_ID"));
+    try std.testing.expectEqual(@as(?[]const u8, null), env.get("CODEX_SOMETHING_ELSE"));
+    try std.testing.expectEqual(@as(?[]const u8, null), env.get("CLAUDECODE"));
+    try std.testing.expectEqualStrings("/usr/bin:/bin", env.get("PATH").?);
+    try std.testing.expectEqualStrings("/home/user", env.get("HOME").?);
 }
