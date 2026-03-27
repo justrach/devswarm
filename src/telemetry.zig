@@ -178,7 +178,7 @@ pub const SwarmTelemetry = struct {
         }
     }
 
-    pub fn toJson(self: *Self, alloc: std.mem.Allocator) []const u8 {
+    pub fn toJson(self: *Self, alloc: std.mem.Allocator, interrupted: bool) []const u8 {
         self.finalize();
 
         var buf: std.ArrayList(u8) = .empty;
@@ -222,6 +222,10 @@ pub const SwarmTelemetry = struct {
         buf.appendSlice(alloc, ",\"parallelism_theoretical\":") catch return "";
         const pt_str = std.fmt.bufPrint(&ms_buf, "{d}", .{self.parallelism_theoretical}) catch "";
         buf.appendSlice(alloc, pt_str) catch return "";
+
+        if (interrupted) {
+            buf.appendSlice(alloc, ",\"interrupted\":true") catch return "";
+        }
 
         buf.appendSlice(alloc, "}") catch return "";
 
@@ -443,7 +447,7 @@ test "telemetry: SwarmTelemetry toJson produces valid JSON" {
     t.parallelism_theoretical = 4;
 
 
-    const json = t.toJson(alloc);
+    const json = t.toJson(alloc, false);
     defer alloc.free(json);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
@@ -456,6 +460,104 @@ test "telemetry: SwarmTelemetry toJson produces valid JSON" {
     try std.testing.expect(obj.get("grids") != null);
     try std.testing.expect(obj.get("total_cost_usd") != null);
     try std.testing.expect(obj.get("total_wall_ms") != null);
+    try std.testing.expect(obj.get("total_wall_ms") != null);
+    // Non-interrupted should NOT have "interrupted" field
+    try std.testing.expect(obj.get("interrupted") == null);
+}
+
+test "telemetry: toJson with interrupted=true includes interrupted field" {
+    const alloc = std.testing.allocator;
+    var t = SwarmTelemetry.init(alloc, "interrupted task");
+    defer t.deinit();
+
+    var grid = GridMetrics.init(alloc, "worker");
+    var w = WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");
+    w.tokens_in = 1000;
+    w.tokens_out = 500;
+    w.wall_ms = 2000;
+    w.success = true;
+    try grid.addWorker(alloc, w);
+    try t.addGrid(grid);
+
+    const json = t.toJson(alloc, true);
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const obj = &parsed.value.object;
+    try std.testing.expect(obj.get("interrupted") != null);
+    try std.testing.expect(obj.get("interrupted").?.bool == true);
+    try std.testing.expectEqualStrings("interrupted task", obj.get("task").?.string);
+}
+
+test "telemetry: toJson with interrupted=false omits interrupted field" {
+    const alloc = std.testing.allocator;
+    var t = SwarmTelemetry.init(alloc, "normal task");
+    defer t.deinit();
+
+    const json = t.toJson(alloc, false);
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const obj = &parsed.value.object;
+    try std.testing.expect(obj.get("interrupted") == null);
+}
+
+test "telemetry: partial telemetry with mixed worker success" {
+    const alloc = std.testing.allocator;
+    var t = SwarmTelemetry.init(alloc, "partial swarm");
+    defer t.deinit();
+
+    var grid = GridMetrics.init(alloc, "worker");
+
+    // Worker 0: completed successfully
+    var w0 = WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");
+    w0.tokens_in = 3000;
+    w0.tokens_out = 1200;
+    w0.wall_ms = 5000;
+    w0.tool_calls = 8;
+    w0.success = true;
+    try grid.addWorker(alloc, w0);
+
+    // Worker 1: interrupted mid-run (no output)
+    var w1 = WorkerMetrics.init(1, "reviewer", "claude-sonnet-4-6");
+    w1.tokens_in = 500;
+    w1.tokens_out = 0;
+    w1.wall_ms = 1200;
+    w1.success = false;
+    try grid.addWorker(alloc, w1);
+
+    // Worker 2: completed successfully
+    var w2 = WorkerMetrics.init(2, "fixer", "claude-sonnet-4-6");
+    w2.tokens_in = 2000;
+    w2.tokens_out = 800;
+    w2.wall_ms = 4000;
+    w2.tool_calls = 5;
+    w2.success = true;
+    try grid.addWorker(alloc, w2);
+
+    try t.addGrid(grid);
+
+    const json = t.toJson(alloc, true);
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const obj = &parsed.value.object;
+    try std.testing.expect(obj.get("interrupted").?.bool == true);
+
+    // Should have all 3 workers in the grid (including the failed one)
+    const grids = obj.get("grids").?.array;
+    try std.testing.expectEqual(@as(usize, 1), grids.items.len);
+    const workers = grids.items[0].object.get("workers").?.array;
+    try std.testing.expectEqual(@as(usize, 3), workers.items.len);
+
+    // Cost should still be calculated for workers that ran
+    try std.testing.expect(obj.get("total_cost_usd").?.float > 0);
 }
 
 test "telemetry: estimateCost returns expected values" {

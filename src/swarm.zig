@@ -20,6 +20,30 @@ const notify = @import("notify.zig");
 /// Hard ceiling on parallel agents regardless of what the caller requests.
 pub const HARD_MAX: u32 = 100;
 
+// ── SIGINT handling for partial telemetry ──────────────────────────────────────
+var g_interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn sigintHandler(_: c_int) callconv(.c) void {
+    g_interrupted.store(true, .release);
+}
+
+fn installSigintHandler() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = sigintHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
+fn restoreDefaultSigint() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = null },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
 // ── Worker ────────────────────────────────────────────────────────────────────
 
 const Worker = struct {
@@ -134,6 +158,10 @@ pub fn runSwarm(
 ) void {
     const cap: usize = @min(max_agents, HARD_MAX);
 
+    // ── Install SIGINT handler for partial telemetry ──────────────────────────
+    g_interrupted.store(false, .release);
+    installSigintHandler();
+    defer restoreDefaultSigint();
     // ── Phase 0: Announce swarm start ────────────────────────────────────────
     {
         var msg_buf: [256]u8 = undefined;
@@ -323,7 +351,58 @@ pub fn runSwarm(
         if (w.allocated_prompt) |p| alloc.free(p);
     }
 
-    // ── Phase 3b: Capture file manifest for writable swarms ──────────────
+    // ── Check for early interruption ─────────────────────────────────────────
+    if (g_interrupted.load(.acquire)) {
+        // Count how many workers actually completed successfully
+        var completed: usize = 0;
+        for (worker_metrics[0..count]) |m| {
+            if (m.success) completed += 1;
+        }
+
+        if (completed > 0) {
+            // Send partial telemetry — at least one agent finished
+            var grid = telemetry.GridMetrics.init(alloc, "worker");
+            for (worker_metrics[0..count]) |*m| {
+                m.*.role = workers[m.worker_id].role;
+                m.*.model = workers[m.worker_id].model;
+                grid.addWorker(alloc, m.*) catch {};
+            }
+            swarm_telemetry.addGrid(grid) catch {};
+
+            const telemetry_json = swarm_telemetry.toJson(alloc, true);
+            if (telemetry_json.len > 0) {
+                std.debug.print("\n[telemetry:interrupted] {d}/{d} agents completed\n", .{ completed, count });
+                std.debug.print("[telemetry] {s}\n", .{telemetry_json});
+                telemetry.upload(alloc, telemetry_json);
+
+                if (telemetry_out) |path| {
+                    const file = if (std.fs.path.isAbsolute(path))
+                        std.fs.createFileAbsolute(path, .{}) catch null
+                    else
+                        std.fs.cwd().createFile(path, .{}) catch null;
+                    if (file) |f| {
+                        defer f.close();
+                        f.writeAll(telemetry_json) catch {};
+                        f.writeAll("\n") catch {};
+                    }
+                }
+                alloc.free(telemetry_json);
+            }
+        } else {
+            std.debug.print("\n[telemetry:interrupted] no agents completed — skipping telemetry\n", .{});
+        }
+
+        // Write partial results to output
+        for (workers[0..count]) |*w| {
+            if (w.out.items.len > 0) {
+                out.appendSlice(alloc, w.out.items) catch {};
+                out.appendSlice(alloc, "\n") catch {};
+            }
+            w.out.deinit(std.heap.page_allocator);
+        }
+        appendErr(alloc, out, "swarm interrupted by user (Ctrl+C)");
+        return;
+    }
     var manifest: []const u8 = "";
     var manifest_alloc: ?[]u8 = null;
     defer if (manifest_alloc) |m| alloc.free(m);
@@ -397,7 +476,7 @@ pub fn runSwarm(
     swarm_telemetry.addGrid(grid) catch {};
 
 
-    const telemetry_json = swarm_telemetry.toJson(alloc);
+    const telemetry_json = swarm_telemetry.toJson(alloc, false);
     if (telemetry_json.len > 0) {
         std.debug.print("\n[telemetry] {s}\n", .{telemetry_json});
 
@@ -461,4 +540,42 @@ test "swarm: appendErr writes JSON error object" {
     try std.testing.expect(parsed.value == .object);
     const msg = parsed.value.object.get("error") orelse return error.MissingError;
     try std.testing.expectEqualStrings("something went wrong", msg.string);
+    try std.testing.expectEqualStrings("something went wrong", msg.string);
+}
+
+test "swarm: g_interrupted starts false" {
+    try std.testing.expect(!g_interrupted.load(.acquire));
+}
+
+test "swarm: sigint handler sets interrupted flag" {
+    // Reset to known state
+    g_interrupted.store(false, .release);
+    try std.testing.expect(!g_interrupted.load(.acquire));
+
+    // Simulate what the signal handler does
+    sigintHandler(0);
+
+    try std.testing.expect(g_interrupted.load(.acquire));
+
+    // Reset
+    g_interrupted.store(false, .release);
+}
+
+test "swarm: install and restore sigint handler" {
+    // Should not crash
+    installSigintHandler();
+    restoreDefaultSigint();
+}
+
+test "swarm: sigint handler is idempotent" {
+    g_interrupted.store(false, .release);
+
+    // Multiple signals should not cause issues
+    sigintHandler(0);
+    sigintHandler(0);
+    sigintHandler(0);
+
+    try std.testing.expect(g_interrupted.load(.acquire));
+
+    g_interrupted.store(false, .release);
 }
