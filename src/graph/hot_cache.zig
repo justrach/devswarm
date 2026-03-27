@@ -72,6 +72,7 @@ pub fn LruCache(comptime V: type) type {
 
             // Insert new entry
             const entry = try self.pool.create();
+            errdefer self.pool.destroy(entry);
             entry.* = .{ .key = key, .value = value };
             try self.map.put(key, entry);
             self.pushFront(entry);
@@ -495,4 +496,22 @@ test "large number of operations stress test" {
     for (90..100) |i| {
         try std.testing.expectEqual(@as(u32, @intCast(i)), cache.get(@intCast(i)).?);
     }
+}
+
+test "put OOM on map.put destroys pool node (no leak)" {
+    // fail_index=1: pool.create() alloc (0) succeeds; map.put alloc (1) fails.
+    // errdefer must call pool.destroy(entry) so the node returns to the free list
+    // and std.testing.allocator detects no leaked allocation.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 1,
+    });
+    var cache = LruCache(u32).init(failing.allocator(), 4);
+    defer cache.deinit();
+
+    const result = cache.put(1, 100);
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // No entry must have been inserted.
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
+    try std.testing.expectEqual(@as(?u32, null), cache.get(1));
 }

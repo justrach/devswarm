@@ -183,7 +183,6 @@ fn streamClaudeOutput(
     var total_in: u64 = 0;
     var total_out: u64 = 0;
 
-
     while (!found_result) {
         const line = readLine(alloc, file) orelse break;
         defer alloc.free(line);
@@ -205,9 +204,9 @@ fn streamClaudeOutput(
 }
 
 /// Read one newline-delimited line from `file`. Returns null on EOF or error.
-/// Caller owns the returned slice.  Lines larger than 8 MiB are dropped.
+/// Caller owns the returned slice. Lines larger than 8 MiB are dropped.
 fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
-    var buf: [1]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var line: std.ArrayList(u8) = .empty;
     while (true) {
         const n = file.read(&buf) catch { line.deinit(alloc); return null; };
@@ -215,10 +214,21 @@ fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
             if (line.items.len == 0) { line.deinit(alloc); return null; }
             return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
         }
-        if (buf[0] == '\n') {
-            return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+        // Scan the chunk for newline
+        for (buf[0..n], 0..) |byte, i| {
+            if (byte == '\n') {
+                // Append everything before the newline
+                line.appendSlice(alloc, buf[0..i]) catch { line.deinit(alloc); return null; };
+                // Seek back to just after the newline so next read picks up there
+                const leftover = n - i - 1;
+                if (leftover > 0) {
+                    file.seekBy(-@as(i64, @intCast(leftover))) catch {};
+                }
+                return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+            }
         }
-        line.append(alloc, buf[0]) catch { line.deinit(alloc); return null; };
+        // No newline found — append entire chunk and keep reading
+        line.appendSlice(alloc, buf[0..n]) catch { line.deinit(alloc); return null; };
         if (line.items.len > 8 * 1024 * 1024) { line.deinit(alloc); return null; }
     }
 }
@@ -544,7 +554,6 @@ test "agent_sdk: readLine reads lines delimited by newline" {
 
     _ = try write_fd.write("hello\nworld\n");
     write_fd.close();
-
     const line1 = readLine(alloc, read_fd).?;
     defer alloc.free(line1);
     try std.testing.expectEqualStrings("hello", line1);
@@ -585,6 +594,30 @@ test "agent_sdk: readLine returns null on immediate EOF" {
     read_fd.close();
 }
 
+test "agent_sdk: readLine handles lines spanning read boundary" {
+    const alloc = std.testing.allocator;
+
+    const pipe = try std.posix.pipe();
+    const read_fd  = std.fs.File{ .handle = pipe[0] };
+    const write_fd = std.fs.File{ .handle = pipe[1] };
+
+    // Two lines: first is 5000 bytes (exceeds 4096 internal buffer), second is short
+    const line_a = "A" ** 5000;
+    const line_b = "B" ** 200;
+    _ = try write_fd.write(line_a ++ "\n" ++ line_b ++ "\n");
+    write_fd.close();
+
+    const got_a = readLine(alloc, read_fd).?;
+    defer alloc.free(got_a);
+    try std.testing.expectEqualStrings(line_a, got_a);
+
+    const got_b = readLine(alloc, read_fd).?;
+    defer alloc.free(got_b);
+    try std.testing.expectEqualStrings(line_b, got_b);
+
+    try std.testing.expect(readLine(alloc, read_fd) == null);
+    read_fd.close();
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Integration tests  (require `claude` on PATH + valid auth, ~5-10s each)
 // Run with:  zig build test -Dtest-filter="integration"

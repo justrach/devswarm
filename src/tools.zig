@@ -171,6 +171,8 @@ pub const Tool = enum {
     run_zig_infra,
     // Swarm — parallel multi-agent execution
     run_swarm,
+    // Batch parallel agents — run N independent agents concurrently in one call
+    run_agents,
     // Iterative review-fix loop
     review_fix_loop,
     // Claude Agent SDK — single agent turn with tool/permission controls
@@ -219,10 +221,11 @@ pub const tools_list =
     \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":[]}},
     \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
-    \\{"name":"run_swarm","description":"Spawn a self-organizing swarm of parallel Codex sub-agents to tackle a task. An orchestrator agent decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The high-level task for the swarm to solve"},"title":{"type":"string","description":"Short human-readable label shown during execution"},"max_agents":{"type":"integer","description":"Maximum parallel sub-agents (default 5, hard cap 100)"},"writable":{"type":"boolean","description":"Allow agents to edit files and run shell commands (default false = read-only analysis)"},"telemetry_out":{"type":"string","description":"Optional file path to write telemetry JSON (cost, tokens, wall time, parallelism)"}},"required":["prompt"]}},
-    \\{"name":"review_fix_loop","description":"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review criteria"},"max_iterations":{"type":"integer","description":"Maximum review-fix cycles (default 3, max 5)"}},"required":[]}},
-    \\{"name":"run_agent","description":"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"The task or question for the agent"},"model":{"type":"string","description":"Model alias or full ID (default: claude-sonnet-4-6). Use \"opus\" for hardest tasks, \"haiku\" for fast/cheap."},"role":{"type":"string","description":"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor"},"mode":{"type":"string","enum":["smart","rush","deep","free"],"description":"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)"},"allowed_tools":{"type":"string","description":"Comma-separated tool allowlist, e.g. \"Bash,Read,Edit\". Omit to allow all tools."},"permission_mode":{"type":"string","enum":["default","acceptEdits","bypassPermissions"],"description":"Permission mode for file and shell operations"},"writable":{"type":"boolean","description":"Allow file writes (maps to bypassPermissions when permission_mode is unset)"},"cwd":{"type":"string","description":"Working directory override (default: current repo path)"}},"required":["prompt"]}},
-    \\{"name":"run_task","description":"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Task description — what needs to be done"},"preset":{"type":"string","enum":["finder_fixer","reviewer_fixer","explore_report","architect_build","custom"],"description":"Chain preset (default: auto-select based on task)"},"mode":{"type":"string","enum":["smart","rush","deep","free"],"description":"Agent mode for all agents in the chain"},"max_agents":{"type":"integer","description":"Max agents to spawn (default: preset-determined)"},"writable":{"type":"boolean","description":"Override write access (default: role-determined)"},"permission_mode":{"type":"string","enum":["default","acceptEdits","bypassPermissions"],"description":"Permission mode for file and shell operations"}},"required":["task"]}}
+    \\{\"name\":\"run_swarm\",\"description\":\"Spawn a self-organizing swarm of parallel sub-agents to tackle a task. Provider-agnostic: resolves the best backend (Claude/Codex) based on the model/mode you specify. An orchestrator decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The high-level task for the swarm to solve\"},\"title\":{\"type\":\"string\",\"description\":\"Short human-readable label shown during execution\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Maximum parallel sub-agents (default 5, hard cap 100)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow agents to edit files and run shell commands (default false = read-only analysis)\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID for all swarm agents (default: auto-resolved per role). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap parallel work.\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode applied to workers and synthesis agent (default: smart). Orchestrator uses rush unless overridden.\"},\"telemetry_out\":{\"type\":\"string\",\"description\":\"Optional file path to write telemetry JSON (cost, tokens, wall time, parallelism)\"}},\"required\":[\"prompt\"]}},
+    \\{\"name\":\"run_agents\",\"description\":\"Run multiple agents in parallel within a single tool call. Each element of the agents array is a run_agent spec (same fields as run_agent). All agents execute concurrently via Zig threads; results are collected and returned as a JSON array once every agent completes. Use this instead of multiple sequential run_agent calls when the tasks are independent.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"agents\":{\"type\":\"array\",\"description\":\"Array of agent specs to run in parallel\",\"items\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for this agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: auto-resolved)\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"]},\"writable\":{\"type\":\"boolean\"},\"allowed_tools\":{\"type\":\"string\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"]},\"cwd\":{\"type\":\"string\"}},\"required\":[\"prompt\"]}}},\"required\":[\"agents\"]}},
+    \\{\"name\":\"review_fix_loop\",\"description\":\"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Override the default review criteria\"},\"max_iterations\":{\"type\":\"integer\",\"description\":\"Maximum review-fix cycles (default 3, max 5)\"}},\"required\":[]}},
+    \\{\"name\":\"run_agent\",\"description\":\"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for the agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: claude-sonnet-4-6). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap.\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)\"},\"allowed_tools\":{\"type\":\"string\",\"description\":\"Comma-separated tool allowlist, e.g. \\\"Bash,Read,Edit\\\". Omit to allow all tools.\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow file writes (maps to bypassPermissions when permission_mode is unset)\"},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory override (default: current repo path)\"}},\"required\":[\"prompt\"]}},
+    \\{\"name\":\"run_task\",\"description\":\"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"Task description — what needs to be done\"},\"preset\":{\"type\":\"string\",\"enum\":[\"finder_fixer\",\"reviewer_fixer\",\"explore_report\",\"architect_build\",\"custom\"],\"description\":\"Chain preset (default: auto-select based on task)\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode for all agents in the chain\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Max agents to spawn (default: preset-determined)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Override write access (default: role-determined)\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"}},\"required\":[\"task\"]}}
     \\]}
 ;
 
@@ -284,6 +287,8 @@ pub fn dispatch(
         .run_zig_infra => handleRunZigInfra(alloc, args, out),
         // Swarm
         .run_swarm => handleRunSwarm(alloc, args, out),
+        // Batch parallel agents
+        .run_agents => handleRunAgents(alloc, args, out),
         // Iterative review-fix loop
         .review_fix_loop => handleReviewFixLoop(alloc, args, out),
         // Claude Agent SDK
@@ -2164,7 +2169,9 @@ fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
         break :blk false;
     };
     const telemetry_out: ?[]const u8 = mj.getStr(args, "telemetry_out");
-    swarm.runSwarm(alloc, prompt, title, max_agents, out, writable, telemetry_out);
+    const model: ?[]const u8 = mj.getStr(args, "model");
+    const mode: ?[]const u8 = mj.getStr(args, "mode");
+    swarm.runSwarm(alloc, prompt, title, max_agents, out, writable, telemetry_out, model, mode);
 }
 
 fn handleReviewFixLoop(
@@ -2292,6 +2299,138 @@ fn handleReviewFixLoop(
     } else {
         out_json.appendSlice(alloc, ",\"converged\":false}") catch return;
     }
+}
+
+
+// ── run_agents: batch parallel agent execution ────────────────────────────────
+//
+// Each agent spec runs in its own Zig thread (via page_allocator to avoid
+// allocator contention). All threads are joined before results are returned,
+// so the caller gets a single JSON response with all outputs.
+
+const BatchAgentSpec = struct {
+    prompt: []const u8,
+    model: ?[]const u8,
+    role: ?[]const u8,
+    mode: ?[]const u8,
+    writable: ?bool,
+    allowed_tools: ?[]const u8,
+    permission_mode: ?[]const u8,
+    cwd: ?[]const u8,
+    out: std.ArrayList(u8) = .empty,
+};
+
+fn batchAgentWorkerFn(spec: *BatchAgentSpec) void {
+    const alloc = std.heap.page_allocator;
+    const rt = @import("runtime.zig");
+    const req: rt.AgentRequest = .{
+        .prompt = spec.prompt,
+        .role = spec.role,
+        .mode = spec.mode,
+        .model = spec.model,
+        .allowed_tools = spec.allowed_tools,
+        .permission_mode = spec.permission_mode,
+        .cwd = spec.cwd,
+        .writable = spec.writable,
+    };
+    const resolved = rt.resolve.resolveWithProbe(alloc, req);
+    defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
+    rt.dispatch.dispatch(alloc, resolved, spec.prompt, &spec.out);
+}
+
+fn handleRunAgents(
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+) void {
+    const agents_val = args.get("agents") orelse {
+        writeErr(alloc, out, "run_agents requires an agents array");
+        return;
+    };
+    const arr = switch (agents_val) {
+        .array => |a| a,
+        else => {
+            writeErr(alloc, out, "run_agents: agents must be a JSON array");
+            return;
+        },
+    };
+
+    if (arr.items.len == 0) {
+        out.appendSlice(alloc, "{\"results\":[]}") catch {};
+        return;
+    }
+
+    const n = arr.items.len;
+
+    var specs = alloc.alloc(BatchAgentSpec, n) catch {
+        writeErr(alloc, out, "OOM: run_agents specs");
+        return;
+    };
+    defer alloc.free(specs);
+
+    var threads = alloc.alloc(?std.Thread, n) catch {
+        writeErr(alloc, out, "OOM: run_agents threads");
+        return;
+    };
+    defer alloc.free(threads);
+
+    // Parse each spec and spawn a thread
+    for (arr.items, 0..) |item, i| {
+        const obj: std.json.ObjectMap = switch (item) {
+            .object => |o| o,
+            else => {
+                specs[i] = .{
+                    .prompt = "",
+                    .model = null, .role = null, .mode = null,
+                    .writable = null, .allowed_tools = null,
+                    .permission_mode = null, .cwd = null,
+                };
+                threads[i] = null;
+                continue;
+            },
+        };
+
+        const prompt: []const u8 = mj.getStr(&obj, "prompt") orelse "";
+        const writable: ?bool = blk: {
+            if (obj.get("writable")) |v| if (v == .bool) break :blk v.bool;
+            break :blk null;
+        };
+
+        specs[i] = .{
+            .prompt = prompt,
+            .model = mj.getStr(&obj, "model"),
+            .role = mj.getStr(&obj, "role"),
+            .mode = mj.getStr(&obj, "mode"),
+            .writable = writable,
+            .allowed_tools = mj.getStr(&obj, "allowed_tools"),
+            .permission_mode = mj.getStr(&obj, "permission_mode"),
+            .cwd = mj.getStr(&obj, "cwd"),
+        };
+
+        if (prompt.len == 0) {
+            threads[i] = null;
+        } else {
+            threads[i] = std.Thread.spawn(.{}, batchAgentWorkerFn, .{&specs[i]}) catch null;
+        }
+    }
+
+    // Join all threads
+    for (threads[0..n]) |maybe_t| {
+        if (maybe_t) |t| t.join();
+    }
+
+    // Emit results as JSON array
+    out.appendSlice(alloc, "{\"results\":[") catch return;
+    for (specs[0..n], 0..) |*spec, i| {
+        if (i > 0) out.appendSlice(alloc, ",") catch return;
+        out.appendSlice(alloc, "{\"prompt\":\"") catch return;
+        mj.writeEscaped(alloc, out, spec.prompt);
+        out.appendSlice(alloc, "\",\"result\":\"") catch return;
+        mj.writeEscaped(alloc, out, spec.out.items);
+        out.appendSlice(alloc, "\"}") catch return;
+        spec.out.deinit(std.heap.page_allocator);
+    }
+    out.appendSlice(alloc, "]}") catch return;
 }
 
 fn handleRunAgent(

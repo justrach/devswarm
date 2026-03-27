@@ -40,6 +40,8 @@ pub fn main() void {
     var args = std.process.args();
     _ = args.next(); // skip argv[0]
 
+    var forced_cwd: ?[]const u8 = null;
+
     // Parse first argument as subcommand / flag
     const first_arg = args.next();
     if (first_arg) |arg| {
@@ -71,7 +73,16 @@ pub fn main() void {
             return;
         }
 
+        if (std.mem.eql(u8, arg, "--cwd")) {
+            forced_cwd = args.next();
+        }
+
         // --mcp or unknown → fall through to MCP server mode
+    }
+    // Scan remaining args for --cwd (handles: devswarm --mcp --cwd /path)
+    while (forced_cwd == null) {
+        const a = args.next() orelse break;
+        if (std.mem.eql(u8, a, "--cwd")) forced_cwd = args.next();
     }
 
     // If stdin is a TTY (human ran it directly), show help instead of hanging
@@ -80,7 +91,7 @@ pub fn main() void {
         return;
     }
 
-    runMcpServer();
+    runMcpServer(forced_cwd);
 }
 
 fn printHelp() void {
@@ -100,7 +111,7 @@ fn printHelp() void {
     ) catch {};
 }
 
-fn runMcpServer() void {
+fn runMcpServer(forced_cwd: ?[]const u8) void {
     const act = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
         .mask = std.posix.sigemptyset(),
@@ -112,7 +123,11 @@ fn runMcpServer() void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var active_repo = detectRepo(alloc);
+    // --cwd flag takes priority; fall back to env/git detection.
+    var active_repo = if (forced_cwd) |cwd|
+        (alloc.dupe(u8, cwd) catch null)
+    else
+        detectRepo(alloc);
     defer if (active_repo) |path| alloc.free(path);
     defer cleanupThreadContexts(alloc);
 
@@ -184,7 +199,7 @@ fn run(alloc: std.mem.Allocator, active_repo: *?[]const u8) void {
         const id = root.get("id");
 
         if (mj.eql(method, "initialize")) {
-            handleInitialize(alloc, stdout, id);
+            handleInitialize(alloc, root, active_repo, stdout, id);
         } else if (mj.eql(method, "notifications/initialized") or mj.eql(method, "initialized")) {
             // Warm the session cache now that the client is ready.
             cache.prefetch(alloc);
@@ -431,9 +446,27 @@ fn handleCall(
 
 fn handleInitialize(
     alloc: std.mem.Allocator,
-    stdout: std.fs.File,
+    root: *const std.json.ObjectMap,
+    active_repo: *?[]const u8,
+    stdout: anytype,
     id: ?std.json.Value,
 ) void {
+    // Use workspace from initialize params so a global MCP server launch
+    // (no --cwd, no REPO_PATH) targets the client's workspace, not process cwd.
+    if (resolveWorkspaceFromInitParams(root)) |ws_path| {
+        if (alloc.dupe(u8, ws_path)) |duped| {
+            if (std.posix.chdir(duped)) {
+                if (active_repo.*) |old| alloc.free(old);
+                active_repo.* = duped;
+                setThreadRepoPath(alloc, getThreadContext(DefaultThreadId), duped);
+                cache.invalidate();
+                tools.detectAndUpdateRepo(alloc);
+            } else |err| {
+                std.debug.print("[gitagent] warning: chdir({s}) from initialize: {}\n", .{ duped, err });
+                alloc.free(duped);
+            }
+        } else |_| {}
+    }
     const response = std.fmt.allocPrint(
         alloc,
         "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"devswarm\",\"version\":\"{s}\"}}}}",
@@ -510,6 +543,38 @@ fn resolveRepoFromArgs(
         return path;
     }
 
+    return null;
+}
+
+/// Extract workspace path from MCP initialize params (fixes #379: global server binds wrong repo).
+/// Checks rootPath (plain path), rootUri (file:// URI), then workspaceFolders[0].uri.
+/// Returns a slice into the parsed JSON value — valid for the caller's parsed lifetime.
+fn resolveWorkspaceFromInitParams(root: *const std.json.ObjectMap) ?[]const u8 {
+    const params_val = root.get("params") orelse return null;
+    if (params_val != .object) return null;
+    const params = &params_val.object;
+
+    // rootPath is a plain filesystem path (legacy LSP field, still widely sent)
+    if (mj.getStr(params, "rootPath")) |p| {
+        if (p.len > 0) return p;
+    }
+    // rootUri uses file:// scheme; strip the prefix to get a usable path
+    if (mj.getStr(params, "rootUri")) |uri| {
+        if (std.mem.startsWith(u8, uri, "file://")) return uri["file://".len..];
+        if (uri.len > 0) return uri;
+    }
+    // workspaceFolders[0].uri (multi-root workspaces — use first folder)
+    if (params.get("workspaceFolders")) |wf_val| {
+        if (wf_val == .array and wf_val.array.items.len > 0) {
+            const first = wf_val.array.items[0];
+            if (first == .object) {
+                if (mj.getStr(&first.object, "uri")) |uri| {
+                    if (std.mem.startsWith(u8, uri, "file://")) return uri["file://".len..];
+                    if (uri.len > 0) return uri;
+                }
+            }
+        }
+    }
     return null;
 }
 
@@ -918,6 +983,75 @@ test "protocol: writeResult emits valid JSON-RPC 2.0 result structure" {
     try std.testing.expectEqualStrings("my-id", (obj.get("id") orelse return error.MissingId).string);
     try std.testing.expect(obj.get("result") != null);
 }
+
+// ── Tests: global MCP server workspace resolution (#379) ─────────────────────
+
+test "resolveWorkspaceFromInitParams returns null for empty params" {
+    const alloc = std.testing.allocator;
+    var root = std.json.ObjectMap.init(alloc);
+    defer root.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), resolveWorkspaceFromInitParams(&root));
+}
+
+test "resolveWorkspaceFromInitParams returns rootPath" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"method":"initialize","params":{"rootPath":"/home/user/myrepo"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = &parsed.value.object;
+    const result = resolveWorkspaceFromInitParams(root);
+    try std.testing.expectEqualStrings("/home/user/myrepo", result orelse return error.ExpectedPath);
+}
+
+test "resolveWorkspaceFromInitParams strips file:// from rootUri" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"method":"initialize","params":{"rootUri":"file:///Users/rachpradhan/devswarm"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = &parsed.value.object;
+    const result = resolveWorkspaceFromInitParams(root);
+    try std.testing.expectEqualStrings("/Users/rachpradhan/devswarm", result orelse return error.ExpectedPath);
+}
+
+test "resolveWorkspaceFromInitParams reads workspaceFolders[0].uri" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"method":"initialize","params":{"workspaceFolders":[{"uri":"file:///srv/project","name":"project"}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = &parsed.value.object;
+    const result = resolveWorkspaceFromInitParams(root);
+    try std.testing.expectEqualStrings("/srv/project", result orelse return error.ExpectedPath);
+}
+
+test "resolveWorkspaceFromInitParams prefers rootPath over rootUri" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"method":"initialize","params":{"rootPath":"/explicit/path","rootUri":"file:///other/path"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = &parsed.value.object;
+    const result = resolveWorkspaceFromInitParams(root);
+    try std.testing.expectEqualStrings("/explicit/path", result orelse return error.ExpectedPath);
+}
+
+test "resolveWorkspaceFromInitParams returns null when rootUri is empty string" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"method":"initialize","params":{"rootUri":""}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = &parsed.value.object;
+    try std.testing.expectEqual(@as(?[]const u8, null), resolveWorkspaceFromInitParams(root));
+}
+
 
 // Force test discovery for all modules
 comptime {
