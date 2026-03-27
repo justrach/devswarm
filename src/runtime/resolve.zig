@@ -184,15 +184,29 @@ var g_cfg_mu: std.Thread.Mutex = .{};
 var g_cfg_probed: bool = false;
 var g_cfg: ?config.Config = null;
 
+var g_load_count: usize = 0; // incremented each time loadDefault is actually called; stays 1 in prod
+
 fn getCachedConfig() ?*const config.Config {
     g_cfg_mu.lock();
     defer g_cfg_mu.unlock();
     if (!g_cfg_probed) {
+        g_load_count +%= 1;
         g_cfg = config.loadDefault(std.heap.page_allocator);
         g_cfg_probed = true;
     }
     if (g_cfg) |*c| return c;
     return null;
+}
+
+/// Reset the config cache. Only call from tests — not safe for concurrent production use.
+/// Frees any previously loaded Config so the next getCachedConfig() re-reads disk.
+pub fn testOnly_resetCfgCache() void {
+    g_cfg_mu.lock();
+    defer g_cfg_mu.unlock();
+    if (g_cfg) |*c| c.deinit(std.heap.page_allocator);
+    g_cfg = null;
+    g_cfg_probed = false;
+    g_load_count = 0;
 }
 
 /// Convenience: resolve with live-probed backends, tools, and default config.
@@ -435,4 +449,27 @@ test "resolve: config.toml claude_default=opus applies when no role/grid overrid
     defer prompts.freeAssembled(alloc, r.system_prompt);
 
     try std.testing.expectEqualStrings("claude-opus-4-6", r.model);
+}
+
+test "getCachedConfig: loadDefault called exactly once across repeated calls" {
+    // Regression for issue #376: config.loadDefault was being called N+2 times per swarm.
+    // After the first call the probe flag is set and subsequent calls must reuse the cache.
+    testOnly_resetCfgCache();
+    _ = getCachedConfig(); // 1st — hits disk (or returns null if no config file present)
+    _ = getCachedConfig(); // 2nd — must serve from cache, NOT re-read disk
+    _ = getCachedConfig(); // 3rd — same
+    try std.testing.expectEqual(@as(usize, 1), g_load_count);
+    testOnly_resetCfgCache(); // clean up global state for subsequent tests
+}
+
+test "getCachedConfig: returns identical pointer on every call" {
+    // The same *const Config pointer must be returned on every call so callers
+    // can safely dereference it without worrying about stale copies.
+    testOnly_resetCfgCache();
+    const first  = getCachedConfig();
+    const second = getCachedConfig();
+    const third  = getCachedConfig();
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(second, third);
+    testOnly_resetCfgCache();
 }

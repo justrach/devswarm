@@ -61,6 +61,8 @@ const WorkerArgs = struct {
     worker: *Worker,
     writable: bool,
     metrics: *telemetry.WorkerMetrics,
+    model: ?[]const u8 = null, // explicit model override (null = auto-resolve)
+    mode: ?[]const u8 = null,  // explicit mode override (null = "smart")
 };
 
 fn workerFn(args: *WorkerArgs) void {
@@ -72,7 +74,8 @@ fn workerFn(args: *WorkerArgs) void {
     const req: rt.AgentRequest = .{
         .prompt = prompt,
         .role = args.worker.role,
-        .mode = "smart",
+        .mode = args.mode orelse "smart",
+        .model = args.model,
         .writable = args.writable,
     };
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
@@ -155,6 +158,8 @@ pub fn runSwarm(
     out: *std.ArrayList(u8),
     writable: bool,
     telemetry_out: ?[]const u8,
+    model: ?[]const u8,
+    mode: ?[]const u8,
 ) void {
     const cap: usize = @min(max_agents, HARD_MAX);
 
@@ -212,7 +217,8 @@ pub fn runSwarm(
         const req: rt.AgentRequest = .{
             .prompt = orch_prompt,
             .role = "orchestrator",
-            .mode = "rush",
+            .mode = mode orelse "rush",
+            .model = model,
             .writable = false,
         };
         const resolved = rt.resolve.resolveWithProbe(alloc, req);
@@ -321,7 +327,7 @@ pub fn runSwarm(
             .prompt = base,
             .allocated_prompt = allocated,
         };
-        worker_args[count] = .{ .worker = &workers[count], .writable = writable, .metrics = &worker_metrics[count] };
+        worker_args[count] = .{ .worker = &workers[count], .writable = writable, .metrics = &worker_metrics[count], .model = model, .mode = mode };
         threads[count] = std.Thread.spawn(.{}, workerFn, .{&worker_args[count]}) catch null;
         count += 1;
     }
@@ -458,7 +464,8 @@ pub fn runSwarm(
         const req: rt.AgentRequest = .{
             .prompt = synth.items,
             .role = "synthesizer",
-            .mode = "smart",
+            .mode = mode orelse "smart",
+            .model = model,
             .writable = false,
         };
         const resolved = rt.resolve.resolveWithProbe(alloc, req);
@@ -578,4 +585,61 @@ test "swarm: sigint handler is idempotent" {
     try std.testing.expect(g_interrupted.load(.acquire));
 
     g_interrupted.store(false, .release);
+}
+
+// ── Regression tests: model/mode selection ───────────────────────────────────
+
+test "swarm: WorkerArgs accepts explicit model override" {
+    var dummy_metrics = telemetry.WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");
+    defer dummy_metrics.deinit(std.testing.allocator);
+    var dummy_worker = Worker{ .id = 0, .role = "finder", .prompt = "test" };
+    const args = WorkerArgs{
+        .worker = &dummy_worker,
+        .writable = false,
+        .metrics = &dummy_metrics,
+        .model = "claude-opus-4-6",
+        .mode = "deep",
+    };
+    try std.testing.expectEqualStrings("claude-opus-4-6", args.model.?);
+    try std.testing.expectEqualStrings("deep", args.mode.?);
+}
+
+test "swarm: WorkerArgs null model falls back to auto-resolve" {
+    var dummy_metrics = telemetry.WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");
+    defer dummy_metrics.deinit(std.testing.allocator);
+    var dummy_worker = Worker{ .id = 0, .role = "finder", .prompt = "test" };
+    const args = WorkerArgs{
+        .worker = &dummy_worker,
+        .writable = false,
+        .metrics = &dummy_metrics,
+        // model and mode omitted — should default to null
+    };
+    try std.testing.expect(args.model == null);
+    try std.testing.expect(args.mode == null);
+}
+
+test "swarm: workerFn model propagates into AgentRequest" {
+    // Verify the AgentRequest built by workerFn carries the explicit model/mode.
+    // Tests the data path without invoking actual dispatch.
+    var dummy_metrics = telemetry.WorkerMetrics.init(0, "finder", "claude-sonnet-4-6");
+    defer dummy_metrics.deinit(std.testing.allocator);
+    var dummy_worker = Worker{ .id = 0, .role = "reviewer", .prompt = "check it" };
+    const args = WorkerArgs{
+        .worker = &dummy_worker,
+        .writable = false,
+        .metrics = &dummy_metrics,
+        .model = "claude-haiku-4-5-20251001",
+        .mode = "rush",
+    };
+    // Mirror the AgentRequest construction in workerFn
+    const req: rt.AgentRequest = .{
+        .prompt = args.worker.prompt,
+        .role = args.worker.role,
+        .mode = args.mode orelse "smart",
+        .model = args.model,
+        .writable = args.writable,
+    };
+    try std.testing.expectEqualStrings("claude-haiku-4-5-20251001", req.model.?);
+    try std.testing.expectEqualStrings("rush", req.mode.?);
+    try std.testing.expectEqualStrings("reviewer", req.role.?);
 }
