@@ -278,7 +278,7 @@ fn parseRecord(data: []const u8, start: usize, op_byte: u8) !ParseResult {
             const id = try readU32(data, &pos);
             const path = try readBytesView(data, &pos);
             if (pos >= data.len) return error.Truncated;
-            const language: Language = @enumFromInt(data[pos]);
+            const language: Language = std.meta.intToEnum(Language, data[pos]) catch return error.InvalidOp;
             pos += 1;
             const last_modified = try readI64(data, &pos);
             if (pos + 32 > data.len) return error.Truncated;
@@ -316,7 +316,7 @@ fn parseRecord(data: []const u8, start: usize, op_byte: u8) !ParseResult {
             const src = try readU64(data, &pos);
             const dst = try readU64(data, &pos);
             if (pos >= data.len) return error.Truncated;
-            const kind: EdgeKind = @enumFromInt(data[pos]);
+            const kind: EdgeKind = std.meta.intToEnum(EdgeKind, data[pos]) catch return error.InvalidOp;
             pos += 1;
             if (pos + 4 > data.len) return error.Truncated;
             const weight: f32 = @bitCast(data[pos..][0..4].*);
@@ -793,6 +793,50 @@ test "WAL single byte of garbage produces zero records" {
     var g = CodeGraph.init(std.testing.allocator);
     defer g.deinit();
     var result = try replay(&garbage, &g, std.testing.allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.records_applied);
+}
+
+test "WAL invalid Language byte stops replay gracefully" {
+    var w = WalWriter.init(std.testing.allocator);
+    defer w.deinit();
+
+    try w.logAddFile(.{ .id = 1, .path = "", .language = .zig, .last_modified = 0, .hash = [_]u8{0} ** 32 });
+
+    var data = try std.testing.allocator.alloc(u8, w.data().len);
+    defer std.testing.allocator.free(data);
+    @memcpy(data, w.data());
+
+    // Record layout: [op:1][id:4][path_len:4][language:1][...]
+    // Language byte is at offset 9 (1 op + 4 id + 4 path_len, empty path)
+    data[9] = 0xFE; // invalid Language value (not 0-3 or 255)
+
+    var g = CodeGraph.init(std.testing.allocator);
+    defer g.deinit();
+    var result = try replay(data, &g, std.testing.allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.records_applied);
+}
+
+test "WAL invalid EdgeKind byte stops replay gracefully" {
+    var w = WalWriter.init(std.testing.allocator);
+    defer w.deinit();
+
+    try w.logAddEdge(.{ .src = 1, .dst = 2, .kind = .calls, .weight = 1.0 });
+
+    var data = try std.testing.allocator.alloc(u8, w.data().len);
+    defer std.testing.allocator.free(data);
+    @memcpy(data, w.data());
+
+    // Record layout: [op:1][src:8][dst:8][kind:1][...]
+    // EdgeKind byte is at offset 17 (1 op + 8 src + 8 dst)
+    data[17] = 0x05; // invalid EdgeKind value (valid range is 0-4)
+
+    var g = CodeGraph.init(std.testing.allocator);
+    defer g.deinit();
+    var result = try replay(data, &g, std.testing.allocator);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.records_applied);

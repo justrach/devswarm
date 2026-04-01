@@ -84,6 +84,7 @@ pub const Server = struct {
     alloc: std.mem.Allocator,
     handler: Handler,
     running: bool,
+    bound_path: []const u8,
 
     /// Create a server listening on the given Unix socket path.
     pub fn listen(path: []const u8, handler: Handler, alloc: std.mem.Allocator) !Server {
@@ -95,6 +96,9 @@ pub const Server = struct {
             std.fs.cwd().makePath(dir) catch {};
         }
 
+        const bound_path = try alloc.dupe(u8, path);
+        errdefer alloc.free(bound_path);
+
         const addr = std.net.Address.initUnix(path) catch return error.InvalidSocketPath;
         const socket = try addr.listen(.{});
 
@@ -103,6 +107,7 @@ pub const Server = struct {
             .alloc = alloc,
             .handler = handler,
             .running = true,
+            .bound_path = bound_path,
         };
     }
 
@@ -138,8 +143,9 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.socket.deinit();
-        // Clean up socket file
-        std.fs.cwd().deleteFile(SOCKET_PATH) catch {};
+        // Clean up socket file using the actual bound path
+        std.fs.cwd().deleteFile(self.bound_path) catch {};
+        self.alloc.free(self.bound_path);
     }
 };
 
@@ -343,4 +349,76 @@ test "multiple frames with varying sizes" {
     const f3 = try readFrame(stream.reader(), std.testing.allocator);
     defer std.testing.allocator.free(f3);
     try std.testing.expectEqualStrings("hello world, this is a longer frame payload for testing", f3);
+}
+
+// ── Server bound_path regression tests ──────────────────────────────────────
+
+test "Server.deinit removes actual bound path not SOCKET_PATH" {
+    // Bind to a custom temp path and verify deinit removes that file, not
+    // the hardcoded SOCKET_PATH constant.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Build an absolute socket path inside the temp dir.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/test.sock", .{tmp_abs});
+    defer alloc.free(sock_path);
+
+    // Dummy handler — never called in this test.
+    const noop: Handler = struct {
+        fn h(_: []const u8, _: std.mem.Allocator) ?[]u8 {
+            return null;
+        }
+    }.h;
+
+    var srv = try Server.listen(sock_path, noop, alloc);
+
+    // Socket file must exist after listen.
+    tmp.dir.access("test.sock", .{}) catch |err| {
+        std.debug.panic("socket file missing after listen: {}", .{err});
+    };
+
+    // deinit must remove the actual bound path.
+    srv.deinit();
+
+    // Socket file must be gone.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("test.sock", .{}));
+
+    // SOCKET_PATH must NOT have been deleted (it was never created here).
+    // We simply verify the default constant differs from our custom path.
+    try std.testing.expect(!std.mem.eql(u8, sock_path, SOCKET_PATH));
+}
+
+test "Server.deinit uses bound_path stored at listen time" {
+    // Verify that the bound_path field reflects the path passed to listen,
+    // independent of the SOCKET_PATH constant.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/alt.sock", .{tmp_abs});
+    defer alloc.free(sock_path);
+
+    const noop: Handler = struct {
+        fn h(_: []const u8, _: std.mem.Allocator) ?[]u8 {
+            return null;
+        }
+    }.h;
+
+    var srv = try Server.listen(sock_path, noop, alloc);
+
+    // bound_path must equal the path we passed, not SOCKET_PATH.
+    try std.testing.expectEqualStrings(sock_path, srv.bound_path);
+    try std.testing.expect(!std.mem.eql(u8, srv.bound_path, SOCKET_PATH));
+
+    srv.deinit();
+
+    // File must be cleaned up.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("alt.sock", .{}));
 }

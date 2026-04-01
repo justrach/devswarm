@@ -41,6 +41,7 @@ const WatchEntry = struct {
     exists: bool,
     last_change_ms: i64, // for debouncing
     pending: bool, // change detected but not yet reported (debounce)
+    is_new: bool, // true when pending event is a creation (not a modification)
 };
 
 // ── FileWatcher ─────────────────────────────────────────────────────────────
@@ -82,6 +83,7 @@ pub const FileWatcher = struct {
             .exists = stat != null,
             .last_change_ms = 0,
             .pending = false,
+            .is_new = false,
         });
     }
 
@@ -126,12 +128,14 @@ pub const FileWatcher = struct {
                     entry.last_size = s.size;
                     entry.last_change_ms = now_ms;
                     entry.pending = true;
+                    entry.is_new = true;
                 } else if (s.mtime != entry.last_modified_ns or s.size != entry.last_size) {
                     // File modified
                     entry.last_modified_ns = s.mtime;
                     entry.last_size = s.size;
                     entry.last_change_ms = now_ms;
                     entry.pending = true;
+                    entry.is_new = false;
                 }
             } else {
                 if (entry.exists) {
@@ -141,6 +145,7 @@ pub const FileWatcher = struct {
                     entry.last_size = 0;
                     entry.last_change_ms = now_ms;
                     entry.pending = true;
+                    entry.is_new = false;
                 }
             }
 
@@ -148,7 +153,7 @@ pub const FileWatcher = struct {
             if (entry.pending and (now_ms - entry.last_change_ms) >= self.debounce_ms) {
                 const kind: ChangeKind = if (!entry.exists)
                     .deleted
-                else if (entry.last_modified_ns == 0)
+                else if (entry.is_new)
                     .created
                 else
                     .modified;
@@ -159,6 +164,7 @@ pub const FileWatcher = struct {
                     .timestamp_ms = now_ms,
                 });
                 entry.pending = false;
+                entry.is_new = false;
             }
         }
 
@@ -399,4 +405,31 @@ test "debounce window prevents immediate reporting" {
     const events3 = try fw.pollAt(5300);
     defer std.testing.allocator.free(events3);
     try std.testing.expectEqual(@as(usize, 1), events3.len);
+}
+
+// Regression test for issue #224: newly created files must emit .created, not .modified
+test "new file emits ChangeKind.created" {
+    var fw = FileWatcher.init(std.testing.allocator);
+    defer fw.deinit();
+
+    const tmp = "_test_issue224_created.txt";
+
+    // Watch a path that does not exist yet
+    try fw.watch(tmp);
+
+    // Create the file
+    const f = try std.fs.cwd().createFile(tmp, .{});
+    f.close();
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    // First poll: detects creation, marks pending (debounce starts at t=1000)
+    const ev1 = try fw.pollAt(1000);
+    defer std.testing.allocator.free(ev1);
+    try std.testing.expectEqual(@as(usize, 0), ev1.len); // still within debounce
+
+    // Second poll: debounce elapsed — must emit exactly one .created event
+    const ev2 = try fw.pollAt(1400);
+    defer std.testing.allocator.free(ev2);
+    try std.testing.expectEqual(@as(usize, 1), ev2.len);
+    try std.testing.expectEqual(ChangeKind.created, ev2[0].kind);
 }
