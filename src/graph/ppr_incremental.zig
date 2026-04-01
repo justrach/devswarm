@@ -75,22 +75,26 @@ pub const IncrementalPpr = struct {
     /// Notify that an edge was added from src to dst with the given weight.
     /// Injects residual at the source node so the next deltaUpdate propagates
     /// the score change through the new edge.
+    /// Notify that an edge was added from src to dst with the given weight.
+    /// Un-absorbs src's current score back to residual so that the next
+    /// deltaUpdate re-pushes it through the updated edge list (including the
+    /// new edge), faithfully applying the push rule:
+    ///   r[v] += (1-α)·r[u]·W(u,v)/W_out(u)
     pub fn onEdgeAdded(self: *IncrementalPpr, src: u64, dst: u64, weight: f32) !void {
         _ = dst;
-        // The source node's outgoing weight distribution changed, so its
-        // current score needs to be partially redistributed. We inject
-        // residual proportional to the source's current score and the
-        // weight of the new edge, scaled by (1-alpha).
-        const src_score = self.scores.get(src) orelse 0;
-        const injection = (1.0 - self.alpha) * src_score * weight;
-
-        if (injection > 0) {
-            const entry = try self.residuals.getOrPut(src);
-            if (!entry.found_existing) entry.value_ptr.* = 0;
-            entry.value_ptr.* += injection;
+        // A zero-weight edge does not change any distribution; skip injection.
+        if (weight > 0) {
+            // Un-absorb src's score back to residual so deltaUpdate re-pushes
+            // through the updated edge list with proper W_out normalisation.
+            const src_score = self.scores.get(src) orelse 0;
+            if (src_score > 0) {
+                const entry = try self.residuals.getOrPut(src);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                entry.value_ptr.* += src_score;
+                self.scores.putAssumeCapacity(src, 0);
+            }
         }
-
-        // Mark source as dirty regardless (edge topology changed)
+        // Mark source dirty regardless (edge topology changed).
         try self.dirty_nodes.put(src, {});
     }
 
@@ -102,31 +106,32 @@ pub const IncrementalPpr = struct {
     /// Marks the source node dirty so deltaUpdate can recompute its local
     /// neighbourhood. Also redistributes the score that was flowing through
     /// the removed edge back as residual on the source.
+    /// Notify that an edge from src to dst was removed.
+    /// Un-absorbs both src's and dst's current scores back to residual so
+    /// that the next deltaUpdate re-pushes them through the updated topology,
+    /// faithfully applying the push rule with no edge from src to dst.
     pub fn onEdgeRemoved(self: *IncrementalPpr, src: u64, dst: u64) !void {
-        // The score that was flowing to dst through this edge needs to be
-        // reclaimed. We approximate by marking both nodes dirty and injecting
-        // residual at the source.
+        // Un-absorb src's score: deltaUpdate will re-push through remaining
+        // edges only (the removed edge is gone), applying the push rule with
+        // the correct updated W_out normalisation.
         const src_score = self.scores.get(src) orelse 0;
-        const dst_score = self.scores.get(dst) orelse 0;
-
-        // Inject residual at source proportional to its score
         if (src_score > 0) {
             const entry = try self.residuals.getOrPut(src);
             if (!entry.found_existing) entry.value_ptr.* = 0;
-            entry.value_ptr.* += (1.0 - self.alpha) * src_score;
+            entry.value_ptr.* += src_score;
+            self.scores.putAssumeCapacity(src, 0);
         }
 
-        // Reduce dst score (it was partially derived from the removed edge)
-        // and convert to residual for redistribution
+        // Un-absorb dst's score: dst was receiving flow through the removed
+        // edge; returning its absorbed score to residual lets deltaUpdate
+        // redistribute it through dst's own out-edges with the updated
+        // topology (no arbitrary 0.5 estimate).
+        const dst_score = self.scores.get(dst) orelse 0;
         if (dst_score > 0) {
-            const reduction = dst_score * 0.5; // conservative estimate
-            if (self.scores.getPtr(dst)) |ptr| {
-                ptr.* -= reduction;
-                if (ptr.* < 0) ptr.* = 0;
-            }
             const dst_entry = try self.residuals.getOrPut(dst);
             if (!dst_entry.found_existing) dst_entry.value_ptr.* = 0;
-            dst_entry.value_ptr.* += reduction;
+            dst_entry.value_ptr.* += dst_score;
+            self.scores.putAssumeCapacity(dst, 0);
         }
 
         try self.dirty_nodes.put(src, {});
@@ -575,8 +580,8 @@ test "onEdgeAdded with weight=0 does not inject residual" {
 
     try ippr.onEdgeAdded(1, 2, 0.0);
 
-    // injection = (1-alpha) * 0.5 * 0.0 = 0, so no residual injected
-    // But dirty node is still marked
+    // weight=0 does not change any distribution; no residual injected.
+    // But dirty node is still marked.
     try std.testing.expectEqual(@as(usize, 1), ippr.dirtyCount());
     // Residual should be null or 0
     const r = ippr.residuals.get(1);
@@ -603,17 +608,18 @@ test "multiple rapid edge additions accumulate residual" {
 
     try ippr.scores.put(1, 1.0);
 
-    // Add 5 edges rapidly from same source
+    // Add 5 edges rapidly from the same source.
+    // The first call un-absorbs p[1]=1.0 into residual and zeros p[1].
+    // Subsequent calls see p[1]=0 and inject nothing (no double-counting).
     try ippr.onEdgeAdded(1, 10, 1.0);
     try ippr.onEdgeAdded(1, 11, 1.0);
     try ippr.onEdgeAdded(1, 12, 1.0);
     try ippr.onEdgeAdded(1, 13, 1.0);
     try ippr.onEdgeAdded(1, 14, 1.0);
 
-    // Each injection adds (1-alpha)*score*weight to residual
-    // Total = 5 * (1-0.15) * 1.0 * 1.0 = 4.25
+    // Residual equals the original score (un-absorbed once, not five times).
     const r = ippr.residuals.get(1) orelse 0;
-    try std.testing.expectApproxEqAbs(@as(f32, 4.25), r, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r, 1e-6);
 }
 
 test "onFileInvalidated with empty symbol list" {
@@ -721,4 +727,122 @@ test "deltaUpdate with self-loop preserves residual correctly" {
     try std.testing.expect(score > 0.5); // must be well above alpha
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), score, 0.1);
     try std.testing.expectEqual(@as(usize, 0), ippr.dirtyCount());
+}
+
+// ── Regression tests: incremental vs full PPR ────────────────────────────────
+
+test "regression: incremental from scratch matches full PPR" {
+    const ppr_mod = @import("ppr.zig");
+    var g = makeTestGraph(std.testing.allocator);
+    defer g.deinit();
+
+    // Chain: 1 -> 2 -> 3
+    try g.addEdge(.{ .src = 1, .dst = 2, .kind = .calls });
+    try g.addEdge(.{ .src = 2, .dst = 3, .kind = .calls });
+
+    // Full batch PPR from query node 1
+    var full = try ppr_mod.pprPush(&g, 1, DEFAULT_ALPHA, DEFAULT_EPSILON, std.testing.allocator);
+    defer full.deinit();
+
+    // Incremental from scratch: seed residual r[1]=1.0, run deltaUpdate.
+    // Both paths execute the same push algorithm, so scores must match exactly.
+    var ippr = IncrementalPpr.init(std.testing.allocator);
+    defer ippr.deinit();
+    try ippr.residuals.put(1, 1.0);
+    try ippr.dirty_nodes.put(1, {});
+    try ippr.deltaUpdate(&g);
+
+    try std.testing.expectApproxEqAbs(full.get(1) orelse 0, ippr.getScore(1), 1e-3);
+    try std.testing.expectApproxEqAbs(full.get(2) orelse 0, ippr.getScore(2), 1e-3);
+    try std.testing.expectApproxEqAbs(full.get(3) orelse 0, ippr.getScore(3), 1e-3);
+}
+
+test "regression: edge addition - new dst scored, equal-weight neighbours get equal share" {
+    const ppr_mod = @import("ppr.zig");
+
+    // Part 1: fresh-start proportionality check.
+    // Graph: 1->2, 1->3 (equal weight). Seed r[1]=1.0.
+    // The push rule must distribute equally to both neighbours.
+    {
+        var g = makeTestGraph(std.testing.allocator);
+        defer g.deinit();
+        try g.addEdge(.{ .src = 1, .dst = 2, .kind = .calls });
+        try g.addEdge(.{ .src = 1, .dst = 3, .kind = .calls });
+
+        var ippr = IncrementalPpr.init(std.testing.allocator);
+        defer ippr.deinit();
+        try ippr.residuals.put(1, 1.0);
+        try ippr.dirty_nodes.put(1, {});
+        try ippr.deltaUpdate(&g);
+
+        const s2 = ippr.getScore(2);
+        const s3 = ippr.getScore(3);
+        try std.testing.expect(s2 > 0);
+        try std.testing.expect(s3 > 0);
+        // Equal-weight edges → equal scores (push rule: W(u,v)/W_out(u) = 0.5 for both)
+        try std.testing.expectApproxEqAbs(s2, s3, 1e-4);
+    }
+
+    // Part 2: incremental update causes new dst to score.
+    // Node 2 keeps its accumulated history; node 3 starts from zero but must be scored.
+    {
+        var g = makeTestGraph(std.testing.allocator);
+        defer g.deinit();
+        try g.addEdge(.{ .src = 1, .dst = 2, .kind = .calls });
+
+        var full0 = try ppr_mod.pprPush(&g, 1, DEFAULT_ALPHA, DEFAULT_EPSILON, std.testing.allocator);
+        defer full0.deinit();
+
+        var ippr = try IncrementalPpr.initFromFull(full0, std.testing.allocator);
+        defer ippr.deinit();
+
+        try g.addEdge(.{ .src = 1, .dst = 3, .kind = .calls });
+        try ippr.onEdgeAdded(1, 3, 1.0);
+        try ippr.deltaUpdate(&g);
+
+        try std.testing.expect(ippr.getScore(3) > 0);
+        try std.testing.expect(ippr.getScore(2) > 0);
+        try std.testing.expect(ippr.getScore(1) > 0);
+    }
+}
+
+test "regression: edge removal - removed dst score decreases, topology reflected" {
+    const ppr_mod = @import("ppr.zig");
+
+    // Initial graph: 1 -> 2, 1 -> 3 (symmetric)
+    var g_init = makeTestGraph(std.testing.allocator);
+    defer g_init.deinit();
+    try g_init.addEdge(.{ .src = 1, .dst = 2, .kind = .calls });
+    try g_init.addEdge(.{ .src = 1, .dst = 3, .kind = .calls });
+
+    var full0 = try ppr_mod.pprPush(&g_init, 1, DEFAULT_ALPHA, DEFAULT_EPSILON, std.testing.allocator);
+    defer full0.deinit();
+
+    var ippr = try IncrementalPpr.initFromFull(full0, std.testing.allocator);
+    defer ippr.deinit();
+
+    const s3_before = ippr.getScore(3);
+
+    // Build updated graph without edge 1 -> 3
+    var g2 = makeTestGraph(std.testing.allocator);
+    defer g2.deinit();
+    try g2.addEdge(.{ .src = 1, .dst = 2, .kind = .calls });
+
+    // Notify incremental of removal and update against the new topology
+    try ippr.onEdgeRemoved(1, 3);
+    try ippr.deltaUpdate(&g2);
+
+    // dst's score must decrease (no longer receives flow from src)
+    const s3_after = ippr.getScore(3);
+    try std.testing.expect(s3_after < s3_before);
+
+    // src and the remaining neighbour must still score positively
+    try std.testing.expect(ippr.getScore(1) > 0);
+    try std.testing.expect(ippr.getScore(2) > 0);
+
+    // Fresh full PPR on the updated graph confirms node 3 is unreachable
+    var full1 = try ppr_mod.pprPush(&g2, 1, DEFAULT_ALPHA, DEFAULT_EPSILON, std.testing.allocator);
+    defer full1.deinit();
+    try std.testing.expectEqual(@as(?f32, null), full1.get(3));
+    try std.testing.expect((full1.get(2) orelse 0) > 0);
 }
