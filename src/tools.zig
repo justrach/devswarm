@@ -2588,20 +2588,35 @@ fn runChainStep(
         return;
     };
 
-    if (ctx.done.timedWait(timeout_ns)) |_| {
-        thread.join();
-        alloc.destroy(ctx);
-    } else |_| {
-        // Thread still running — detach it. ctx is heap-allocated so the thread
-        // can safely finish writing. The thread will leak ctx when done, which is
-        // acceptable for a timeout (rare path, bounded allocation).
-        thread.detach();
-        var ts_buf: [16]u8 = undefined;
-        const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{timeout_seconds orelse 300}) catch "300";
-        step_out.appendSlice(alloc, "{\"timed_out\":true,\"error\":\"agent execution exceeded timeout\",\"timeout_seconds\":") catch {};
-        step_out.appendSlice(alloc, ts) catch {};
-        step_out.appendSlice(alloc, "}") catch {};
+    // Heartbeat loop: send periodic notifications/message every 15s to keep
+    // external MCP bridge connections alive (they typically timeout at ~60s).
+    const notify = @import("notify.zig");
+    const heartbeat_ns: u64 = 15 * std.time.ns_per_s;
+    var remaining_ns: u64 = timeout_ns;
+    var elapsed_s: u64 = 0;
+    while (remaining_ns > 0) {
+        const wait_ns = @min(heartbeat_ns, remaining_ns);
+        if (ctx.done.timedWait(wait_ns)) |_| {
+            // Agent finished
+            thread.join();
+            alloc.destroy(ctx);
+            return;
+        } else |_| {
+            remaining_ns -= wait_ns;
+            elapsed_s += wait_ns / std.time.ns_per_s;
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "agent '{s}' running ({d}s elapsed)", .{ role, elapsed_s }) catch "agent running…";
+            notify.send(alloc, msg);
+        }
     }
+
+    // Timeout — detach thread, return error
+    thread.detach();
+    var ts_buf: [16]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{timeout_seconds orelse 300}) catch "300";
+    step_out.appendSlice(alloc, "{\"timed_out\":true,\"error\":\"agent execution exceeded timeout\",\"timeout_seconds\":") catch {};
+    step_out.appendSlice(alloc, ts) catch {};
+    step_out.appendSlice(alloc, "}") catch {};
 }
 
 fn handleRunTask(
