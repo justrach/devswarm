@@ -332,7 +332,7 @@ fn handleDecomposeFeature(
         out.appendSlice(alloc, "[]") catch {};
     }
     out.appendSlice(alloc,
-        \\,"instructions":"Use create_issues_batch to create the issues. status:backlog is auto-applied by create_issue when available. For ordering, add one of priority:p0, priority:p1, priority:p2, or priority:p3 as needed. Return an array of objects with title, body, and labels fields."}
+        \\,"instructions":"Use create_issues_batch to create the issues. status:backlog is auto-applied by create_issue when available. For ordering, add one of priority:p0, priority:p1, priority:p2, or priority:p3 as needed. Return an array of objects with title, body, and labels fields. This tool is for feature planning; manual create_issue/create_issues_batch filing remains direct. For agent-discovered bugs or regressions, do not file from casual inspection alone: each drafted issue body must include Exact repro, Observed result, Expected result, Nearby passing checks, Acceptance criteria, and Non-goals."}
     ) catch {};
 }
 
@@ -2301,7 +2301,6 @@ fn handleReviewFixLoop(
     }
 }
 
-
 // ── run_agents: batch parallel agent execution ────────────────────────────────
 //
 // Each agent spec runs in its own Zig thread (via page_allocator to avoid
@@ -2381,9 +2380,13 @@ fn handleRunAgents(
             else => {
                 specs[i] = .{
                     .prompt = "",
-                    .model = null, .role = null, .mode = null,
-                    .writable = null, .allowed_tools = null,
-                    .permission_mode = null, .cwd = null,
+                    .model = null,
+                    .role = null,
+                    .mode = null,
+                    .writable = null,
+                    .allowed_tools = null,
+                    .permission_mode = null,
+                    .cwd = null,
                 };
                 threads[i] = null;
                 continue;
@@ -2707,58 +2710,58 @@ fn handleRunTask(
                     out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: contract returned empty or timed out\"},") catch return;
                     out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"SKIP\",\"output\":\"No contract to verify against\"}") catch return;
                 } else {
-                // Step 3: fixer (writable) — apply changes against the contract
-                var fixer_out: std.ArrayList(u8) = .empty;
-                defer fixer_out.deinit(alloc);
-                const fixer_prompt = std.fmt.allocPrint(
-                    alloc,
-                    "Fix the following task. You MUST satisfy all acceptance criteria in the contract.\n\n" ++
-                        "TASK: {s}\n\nFINDINGS:\n{s}\n\nACCEPTANCE CRITERIA (you must pass ALL):\n{s}",
-                    .{ task, finder_out.items, contract_out.items },
-                ) catch task;
-                defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
+                    // Step 3: fixer (writable) — apply changes against the contract
+                    var fixer_out: std.ArrayList(u8) = .empty;
+                    defer fixer_out.deinit(alloc);
+                    const fixer_prompt = std.fmt.allocPrint(
+                        alloc,
+                        "Fix the following task. You MUST satisfy all acceptance criteria in the contract.\n\n" ++
+                            "TASK: {s}\n\nFINDINGS:\n{s}\n\nACCEPTANCE CRITERIA (you must pass ALL):\n{s}",
+                        .{ task, finder_out.items, contract_out.items },
+                    ) catch task;
+                    defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
+                    runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
 
-                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
-                mj.writeEscaped(alloc, out, fixer_out.items);
-                out.appendSlice(alloc, "\"},") catch return;
+                    out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
+                    mj.writeEscaped(alloc, out, fixer_out.items);
+                    out.appendSlice(alloc, "\"},") catch return;
 
-                // Step 4: verify (read-only) — score the fix against the contract
-                var verify_out: std.ArrayList(u8) = .empty;
-                defer verify_out.deinit(alloc);
+                    // Step 4: verify (read-only) — score the fix against the contract
+                    var verify_out: std.ArrayList(u8) = .empty;
+                    defer verify_out.deinit(alloc);
 
-                const verify_prompt = std.fmt.allocPrint(
-                    alloc,
-                    "You are verifying a fix against its sprint contract. " ++
-                        "Score each axis 1-10 and PASS or FAIL.\n\n" ++
-                        "GRADING AXES:\n" ++
-                        "  CORRECTNESS (threshold 8): does the fix compile and not break existing tests?\n" ++
-                        "  SAFETY (threshold 9): does the fix resolve the safety issue without introducing new ones?\n" ++
-                        "  COMPLETENESS (threshold 7): does the fix satisfy ALL acceptance criteria?\n" ++
-                        "  QUALITY (threshold 6): is the fix minimal and clean, not over-engineered?\n\n" ++
-                        "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
-                        "PASS or FAIL, then explain what passed/failed and why.\n\n" ++
-                        "TASK: {s}\n\nACCEPTANCE CRITERIA:\n{s}\n\nFIXER OUTPUT:\n{s}",
-                    .{ task, contract_out.items, fixer_out.items },
-                ) catch task;
-                defer if (verify_prompt.ptr != task.ptr) alloc.free(verify_prompt);
+                    const verify_prompt = std.fmt.allocPrint(
+                        alloc,
+                        "You are verifying a fix against its sprint contract. " ++
+                            "Score each axis 1-10 and PASS or FAIL.\n\n" ++
+                            "GRADING AXES:\n" ++
+                            "  CORRECTNESS (threshold 8): does the fix compile and not break existing tests?\n" ++
+                            "  SAFETY (threshold 9): does the fix resolve the safety issue without introducing new ones?\n" ++
+                            "  COMPLETENESS (threshold 7): does the fix satisfy ALL acceptance criteria?\n" ++
+                            "  QUALITY (threshold 6): is the fix minimal and clean, not over-engineered?\n\n" ++
+                            "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+                            "PASS or FAIL, then explain what passed/failed and why.\n\n" ++
+                            "TASK: {s}\n\nACCEPTANCE CRITERIA:\n{s}\n\nFIXER OUTPUT:\n{s}",
+                        .{ task, contract_out.items, fixer_out.items },
+                    ) catch task;
+                    defer if (verify_prompt.ptr != task.ptr) alloc.free(verify_prompt);
 
-                runChainStep(alloc, "reviewer", mode, false, permission_mode, verify_prompt, 180, &verify_out);
+                    runChainStep(alloc, "reviewer", mode, false, permission_mode, verify_prompt, 180, &verify_out);
 
-                // Parse verify verdict
-                const verify_text = verify_out.items;
-                const verify_pass = std.mem.indexOf(u8, verify_text, "\nPASS\n") != null or
-                    std.mem.indexOf(u8, verify_text, "\nPASS\r") != null or
-                    std.mem.startsWith(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS\n") or
-                    std.mem.eql(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS") or
-                    std.mem.indexOf(u8, verify_text, "NO_ISSUES_FOUND") != null;
+                    // Parse verify verdict
+                    const verify_text = verify_out.items;
+                    const verify_pass = std.mem.indexOf(u8, verify_text, "\nPASS\n") != null or
+                        std.mem.indexOf(u8, verify_text, "\nPASS\r") != null or
+                        std.mem.startsWith(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS\n") or
+                        std.mem.eql(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS") or
+                        std.mem.indexOf(u8, verify_text, "NO_ISSUES_FOUND") != null;
 
-                out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"") catch return;
-                out.appendSlice(alloc, if (verify_pass) "PASS" else "FAIL") catch return;
-                out.appendSlice(alloc, "\",\"output\":\"") catch return;
-                mj.writeEscaped(alloc, out, verify_out.items);
-                out.appendSlice(alloc, "\"}") catch return;
+                    out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"") catch return;
+                    out.appendSlice(alloc, if (verify_pass) "PASS" else "FAIL") catch return;
+                    out.appendSlice(alloc, "\",\"output\":\"") catch return;
+                    mj.writeEscaped(alloc, out, verify_out.items);
+                    out.appendSlice(alloc, "\"}") catch return;
                 } // close else (contract not empty)
             }
         },
@@ -2905,4 +2908,27 @@ fn handleRunTask(
     }
 
     out.appendSlice(alloc, "]}") catch return;
+}
+
+test "decompose_feature instructions require evidence for agent-discovered bugs" {
+    const alloc = std.testing.allocator;
+    setCurrentRepo("justrach/devswarm");
+
+    var args = std.json.ObjectMap.init(alloc);
+    defer args.deinit();
+    try args.put("feature_description", .{ .string = "add full-text search" });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    handleDecomposeFeature(alloc, &args, &out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "create_issue/create_issues_batch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "agent-discovered bugs or regressions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Exact repro") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Observed result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Expected result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Nearby passing checks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Acceptance criteria") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Non-goals") != null);
 }
