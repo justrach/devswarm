@@ -219,13 +219,13 @@ pub const tools_list =
     \\{"name":"find_dependents","description":"Find all symbols that transitively depend on the given symbol, ranked by Personalized PageRank score. Use this to understand the full blast radius of changing a symbol. Requires a CodeGraph DB file at .codegraph/graph.bin.","inputSchema":{"type":"object","properties":{"symbol_id":{"type":"integer","description":"Symbol ID to find dependents of"},"max_results":{"type":"integer","description":"Maximum number of results to return (default 10)"}},"required":["symbol_id"]}},
     \\{"name":"set_repo","description":"Switch the active repository path. All subsequent tool calls will operate against this repo. Invalidates the session cache.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the git repository root"}},"required":["path"]}},
     \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":[]}},
-    \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"}},"required":["prompt"]}},
+    \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
     \\{\"name\":\"run_swarm\",\"description\":\"Spawn a self-organizing swarm of parallel sub-agents to tackle a task. Provider-agnostic: resolves the best backend (Claude/Codex) based on the model/mode you specify. An orchestrator decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The high-level task for the swarm to solve\"},\"title\":{\"type\":\"string\",\"description\":\"Short human-readable label shown during execution\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Maximum parallel sub-agents (default 5, hard cap 100)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow agents to edit files and run shell commands (default false = read-only analysis)\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID for all swarm agents (default: auto-resolved per role). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap parallel work.\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode applied to workers and synthesis agent (default: smart). Orchestrator uses rush unless overridden.\"},\"telemetry_out\":{\"type\":\"string\",\"description\":\"Optional file path to write telemetry JSON (cost, tokens, wall time, parallelism)\"}},\"required\":[\"prompt\"]}},
     \\{\"name\":\"run_agents\",\"description\":\"Run multiple agents in parallel within a single tool call. Each element of the agents array is a run_agent spec (same fields as run_agent). All agents execute concurrently via Zig threads; results are collected and returned as a JSON array once every agent completes. Use this instead of multiple sequential run_agent calls when the tasks are independent.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"agents\":{\"type\":\"array\",\"description\":\"Array of agent specs to run in parallel\",\"items\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for this agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: auto-resolved)\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"]},\"writable\":{\"type\":\"boolean\"},\"allowed_tools\":{\"type\":\"string\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"]},\"cwd\":{\"type\":\"string\"}},\"required\":[\"prompt\"]}}},\"required\":[\"agents\"]}},
     \\{\"name\":\"review_fix_loop\",\"description\":\"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Override the default review criteria\"},\"max_iterations\":{\"type\":\"integer\",\"description\":\"Maximum review-fix cycles (default 3, max 5)\"}},\"required\":[]}},
     \\{\"name\":\"run_agent\",\"description\":\"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for the agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: claude-sonnet-4-6). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap.\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)\"},\"allowed_tools\":{\"type\":\"string\",\"description\":\"Comma-separated tool allowlist, e.g. \\\"Bash,Read,Edit\\\". Omit to allow all tools.\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow file writes (maps to bypassPermissions when permission_mode is unset)\"},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory override (default: current repo path)\"}},\"required\":[\"prompt\"]}},
-    \\{\"name\":\"run_task\",\"description\":\"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"Task description — what needs to be done\"},\"preset\":{\"type\":\"string\",\"enum\":[\"finder_fixer\",\"reviewer_fixer\",\"explore_report\",\"architect_build\",\"custom\"],\"description\":\"Chain preset (default: auto-select based on task)\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode for all agents in the chain\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Max agents to spawn (default: preset-determined)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Override write access (default: role-determined)\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"}},\"required\":[\"task\"]}}
+    \\{\"name\":\"run_task\",\"description\":\"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"Task description — what needs to be done\"},\"preset\":{\"type\":\"string\",\"enum\":[\"finder_fixer\",\"reviewer_fixer\",\"explore_report\",\"architect_build\",\"custom\"],\"description\":\"Chain preset (default: auto-select based on task)\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode for all agents in the chain\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Max agents to spawn (default: preset-determined)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Override write access (default: role-determined)\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"Maximum total time for the full chain (default 300, max 600)\"}},\"required\":[\"task\"]}}
     \\]}
 ;
 
@@ -2067,7 +2067,87 @@ fn runAgentWithRole(
     timeout_seconds: ?u32,
     out: *std.ArrayList(u8),
 ) void {
-    runChainStep(alloc, role, mode, writable_flag, null, prompt, timeout_seconds, out);
+    const effective_timeout_seconds = timeout_seconds orelse 300;
+    runChainStep(
+        alloc,
+        role,
+        mode,
+        writable_flag,
+        null,
+        prompt,
+        timeoutSecondsToMs(effective_timeout_seconds),
+        effective_timeout_seconds,
+        out,
+    );
+}
+
+fn parseTimeoutSeconds(args: *const std.json.ObjectMap, default_seconds: u32) u32 {
+    if (args.get("timeout_seconds")) |v| {
+        if (v == .integer and v.integer > 0) {
+            return @intCast(@min(v.integer, 600));
+        }
+    }
+    return default_seconds;
+}
+
+fn appendTimedOutJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    timeout_seconds: u32,
+) void {
+    var ts_buf: [16]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{timeout_seconds}) catch "300";
+    out.appendSlice(alloc, "{\"timed_out\":true,\"error\":\"agent execution exceeded timeout\",\"timeout_seconds\":") catch {};
+    out.appendSlice(alloc, ts) catch {};
+    out.appendSlice(alloc, "}") catch {};
+}
+
+fn timeoutSecondsToMs(timeout_seconds: u32) u64 {
+    return @as(u64, timeout_seconds) * std.time.ms_per_s;
+}
+
+fn timeoutMsToReportedSeconds(timeout_ms: u64) u32 {
+    return @intCast(@max(@as(u64, 1), @divFloor(timeout_ms + std.time.ms_per_s - 1, std.time.ms_per_s)));
+}
+
+fn isTimedOutPayload(text: []const u8) bool {
+    return std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\n\r"), "{\"timed_out\"");
+}
+
+fn remainingTimeoutMs(start_ms: i64, total_seconds: u32) ?u64 {
+    const total_ms = @as(i64, total_seconds) * std.time.ms_per_s;
+    const elapsed_ms = @max(@as(i64, 0), std.time.milliTimestamp() - start_ms);
+    if (elapsed_ms >= total_ms) return null;
+    const remaining_ms = total_ms - elapsed_ms;
+    return @intCast(remaining_ms);
+}
+
+fn runChainStepWithBudget(
+    alloc: std.mem.Allocator,
+    role: []const u8,
+    mode: ?[]const u8,
+    writable_override: ?bool,
+    permission_mode: ?[]const u8,
+    prompt: []const u8,
+    start_ms: i64,
+    total_timeout_seconds: u32,
+    step_out: *std.ArrayList(u8),
+) void {
+    const remaining_ms = remainingTimeoutMs(start_ms, total_timeout_seconds) orelse {
+        appendTimedOutJson(alloc, step_out, total_timeout_seconds);
+        return;
+    };
+    runChainStep(
+        alloc,
+        role,
+        mode,
+        writable_override,
+        permission_mode,
+        prompt,
+        remaining_ms,
+        timeoutMsToReportedSeconds(remaining_ms),
+        step_out,
+    );
 }
 
 fn handleRunReviewer(
@@ -2081,14 +2161,7 @@ fn handleRunReviewer(
             "Zig 0.15.x API (ArrayList.empty, append(alloc,v), deinit(alloc)), " ++
             "PPR push rule correctness, and missing test coverage. " ++
             "Lead with concrete findings, include file:line references.";
-    const timeout_seconds: ?u32 = blk: {
-        if (args.get("timeout_seconds")) |v| {
-            if (v == .integer and v.integer > 0) {
-                break :blk @intCast(@min(v.integer, 600));
-            }
-        }
-        break :blk 300;
-    };
+    const timeout_seconds: ?u32 = parseTimeoutSeconds(args, 300);
     runAgentWithRole(alloc, "reviewer", null, false, prompt, timeout_seconds, out);
 }
 
@@ -2101,7 +2174,8 @@ fn handleRunExplorer(
         writeErr(alloc, out, "run_explorer requires a prompt argument");
         return;
     };
-    runAgentWithRole(alloc, "explorer", null, false, prompt, 300, out);
+    const timeout_seconds: ?u32 = parseTimeoutSeconds(args, 300);
+    runAgentWithRole(alloc, "explorer", null, false, prompt, timeout_seconds, out);
 }
 
 fn handleRunZigInfra(
@@ -2237,7 +2311,17 @@ fn handleReviewFixLoop(
         iter_json.appendSlice(alloc, ",\"review\":\"") catch return;
         var review_out: std.ArrayList(u8) = .empty;
         defer review_out.deinit(alloc);
-        runChainStep(alloc, "reviewer", null, false, null, review_prompt, 300, &review_out);
+        runChainStep(
+            alloc,
+            "reviewer",
+            null,
+            false,
+            null,
+            review_prompt,
+            timeoutSecondsToMs(300),
+            300,
+            &review_out,
+        );
 
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
@@ -2280,7 +2364,17 @@ fn handleReviewFixLoop(
 
         var fix_out: std.ArrayList(u8) = .empty;
         defer fix_out.deinit(alloc);
-        runChainStep(alloc, "fixer", null, true, null, fix_prompt, 300, &fix_out);
+        runChainStep(
+            alloc,
+            "fixer",
+            null,
+            true,
+            null,
+            fix_prompt,
+            timeoutSecondsToMs(300),
+            300,
+            &fix_out,
+        );
 
         iter_json.appendSlice(alloc, ",\"fix\":\"") catch return;
         mj.writeEscaped(alloc, &iter_json, fix_out.items);
@@ -2300,7 +2394,6 @@ fn handleReviewFixLoop(
         out_json.appendSlice(alloc, ",\"converged\":false}") catch return;
     }
 }
-
 
 // ── run_agents: batch parallel agent execution ────────────────────────────────
 //
@@ -2381,9 +2474,13 @@ fn handleRunAgents(
             else => {
                 specs[i] = .{
                     .prompt = "",
-                    .model = null, .role = null, .mode = null,
-                    .writable = null, .allowed_tools = null,
-                    .permission_mode = null, .cwd = null,
+                    .model = null,
+                    .role = null,
+                    .mode = null,
+                    .writable = null,
+                    .allowed_tools = null,
+                    .permission_mode = null,
+                    .cwd = null,
                 };
                 threads[i] = null;
                 continue;
@@ -2539,7 +2636,8 @@ fn runChainStep(
     writable_override: ?bool,
     permission_mode: ?[]const u8,
     prompt: []const u8,
-    timeout_seconds: ?u32,
+    timeout_ms: u64,
+    reported_timeout_seconds: u32,
     step_out: *std.ArrayList(u8),
 ) void {
     const rt = @import("runtime.zig");
@@ -2551,26 +2649,37 @@ fn runChainStep(
         .permission_mode = permission_mode,
     };
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
-    defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
 
-    const timeout_ns = @as(u64, timeout_seconds orelse 300) * std.time.ns_per_s;
+    const timeout_ns = timeout_ms * std.time.ns_per_ms;
 
     const Ctx = struct {
         alloc: std.mem.Allocator,
         resolved: rt.ResolvedAgent,
         prompt: []const u8,
-        out: *std.ArrayList(u8),
+        out: std.ArrayList(u8),
         done: std.Thread.ResetEvent,
+        mu: std.Thread.Mutex,
+        completed: bool,
+        cleanup_in_worker: bool,
+        fn cleanup(ctx: *@This()) void {
+            ctx.out.deinit(ctx.alloc);
+            rt.prompts.freeAssembled(ctx.alloc, ctx.resolved.system_prompt);
+            ctx.alloc.destroy(ctx);
+        }
         fn run(ctx: *@This()) void {
-            rt.dispatch.dispatch(ctx.alloc, ctx.resolved, ctx.prompt, ctx.out);
+            rt.dispatch.dispatch(ctx.alloc, ctx.resolved, ctx.prompt, &ctx.out);
+            var cleanup_now = false;
+            ctx.mu.lock();
+            ctx.completed = true;
+            cleanup_now = ctx.cleanup_in_worker;
+            ctx.mu.unlock();
             ctx.done.set();
+            if (cleanup_now) ctx.cleanup();
         }
     };
 
-    // Heap-allocate ctx so the thread can safely outlive this function on timeout.
-    // Without this, a timeout returns and frees the stack frame while the thread
-    // still holds &ctx — a use-after-free.
     const ctx = alloc.create(Ctx) catch {
+        rt.prompts.freeAssembled(alloc, resolved.system_prompt);
         step_out.appendSlice(alloc, "{\"error\":\"OOM: failed to allocate agent context\"}") catch {};
         return;
     };
@@ -2578,11 +2687,15 @@ fn runChainStep(
         .alloc = alloc,
         .resolved = resolved,
         .prompt = prompt,
-        .out = step_out,
+        .out = .empty,
         .done = .{},
+        .mu = .{},
+        .completed = false,
+        .cleanup_in_worker = false,
     };
 
     const thread = std.Thread.spawn(.{}, Ctx.run, .{ctx}) catch {
+        rt.prompts.freeAssembled(alloc, resolved.system_prompt);
         alloc.destroy(ctx);
         step_out.appendSlice(alloc, "{\"error\":\"failed to spawn agent thread\"}") catch {};
         return;
@@ -2599,7 +2712,8 @@ fn runChainStep(
         if (ctx.done.timedWait(wait_ns)) |_| {
             // Agent finished
             thread.join();
-            alloc.destroy(ctx);
+            step_out.appendSlice(alloc, ctx.out.items) catch {};
+            ctx.cleanup();
             return;
         } else |_| {
             remaining_ns -= wait_ns;
@@ -2610,13 +2724,19 @@ fn runChainStep(
         }
     }
 
-    // Timeout — detach thread, return error
-    thread.detach();
-    var ts_buf: [16]u8 = undefined;
-    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{timeout_seconds orelse 300}) catch "300";
-    step_out.appendSlice(alloc, "{\"timed_out\":true,\"error\":\"agent execution exceeded timeout\",\"timeout_seconds\":") catch {};
-    step_out.appendSlice(alloc, ts) catch {};
-    step_out.appendSlice(alloc, "}") catch {};
+    ctx.mu.lock();
+    const completed = ctx.completed;
+    if (!completed) ctx.cleanup_in_worker = true;
+    ctx.mu.unlock();
+
+    if (completed) {
+        thread.join();
+        step_out.appendSlice(alloc, ctx.out.items) catch {};
+        ctx.cleanup();
+    } else {
+        thread.detach();
+        appendTimedOutJson(alloc, step_out, reported_timeout_seconds);
+    }
 }
 
 fn handleRunTask(
@@ -2628,6 +2748,8 @@ fn handleRunTask(
         writeErr(alloc, out, "run_task requires a task argument");
         return;
     };
+    const timeout_seconds = parseTimeoutSeconds(args, 300);
+    const start_ms = std.time.milliTimestamp();
 
     const mode = mj.getStr(args, "mode");
     const writable_override: ?bool = blk: {
@@ -2671,13 +2793,16 @@ fn handleRunTask(
             ) catch task;
             defer if (finder_prompt.ptr != task.ptr) alloc.free(finder_prompt);
 
-            runChainStep(alloc, "finder", mode, false, permission_mode, finder_prompt, 300, &finder_out);
+            runChainStepWithBudget(alloc, "finder", mode, false, permission_mode, finder_prompt, start_ms, timeout_seconds, &finder_out);
 
             out.appendSlice(alloc, "{\"role\":\"finder\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, finder_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
-            if (std.mem.trim(u8, finder_out.items, " \t\n\r").len == 0) {
+            if (isTimedOutPayload(finder_out.items)) {
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: finder timed out\"},") catch return;
+                out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"SKIP\",\"output\":\"Finder timed out before the chain could continue\"}") catch return;
+            } else if (std.mem.trim(u8, finder_out.items, " \t\n\r").len == 0) {
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: finder returned empty output\"}") catch return;
             } else {
                 // Step 2: contract (read-only) — define acceptance criteria before fixing
@@ -2695,7 +2820,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (contract_prompt.ptr != task.ptr) alloc.free(contract_prompt);
 
-                runChainStep(alloc, "reviewer", mode, false, permission_mode, contract_prompt, 120, &contract_out);
+                runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, contract_prompt, start_ms, timeout_seconds, &contract_out);
 
                 out.appendSlice(alloc, "{\"role\":\"contract\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, contract_out.items);
@@ -2707,58 +2832,62 @@ fn handleRunTask(
                     out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: contract returned empty or timed out\"},") catch return;
                     out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"SKIP\",\"output\":\"No contract to verify against\"}") catch return;
                 } else {
-                // Step 3: fixer (writable) — apply changes against the contract
-                var fixer_out: std.ArrayList(u8) = .empty;
-                defer fixer_out.deinit(alloc);
-                const fixer_prompt = std.fmt.allocPrint(
-                    alloc,
-                    "Fix the following task. You MUST satisfy all acceptance criteria in the contract.\n\n" ++
-                        "TASK: {s}\n\nFINDINGS:\n{s}\n\nACCEPTANCE CRITERIA (you must pass ALL):\n{s}",
-                    .{ task, finder_out.items, contract_out.items },
-                ) catch task;
-                defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
+                    // Step 3: fixer (writable) — apply changes against the contract
+                    var fixer_out: std.ArrayList(u8) = .empty;
+                    defer fixer_out.deinit(alloc);
+                    const fixer_prompt = std.fmt.allocPrint(
+                        alloc,
+                        "Fix the following task. You MUST satisfy all acceptance criteria in the contract.\n\n" ++
+                            "TASK: {s}\n\nFINDINGS:\n{s}\n\nACCEPTANCE CRITERIA (you must pass ALL):\n{s}",
+                        .{ task, finder_out.items, contract_out.items },
+                    ) catch task;
+                    defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
+                    runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, &fixer_out);
 
-                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
-                mj.writeEscaped(alloc, out, fixer_out.items);
-                out.appendSlice(alloc, "\"},") catch return;
+                    out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
+                    mj.writeEscaped(alloc, out, fixer_out.items);
+                    out.appendSlice(alloc, "\"},") catch return;
 
-                // Step 4: verify (read-only) — score the fix against the contract
-                var verify_out: std.ArrayList(u8) = .empty;
-                defer verify_out.deinit(alloc);
+                    if (isTimedOutPayload(fixer_out.items)) {
+                        out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"SKIP\",\"output\":\"Fixer timed out before verification\"}") catch return;
+                    } else {
+                        // Step 4: verify (read-only) — score the fix against the contract
+                        var verify_out: std.ArrayList(u8) = .empty;
+                        defer verify_out.deinit(alloc);
 
-                const verify_prompt = std.fmt.allocPrint(
-                    alloc,
-                    "You are verifying a fix against its sprint contract. " ++
-                        "Score each axis 1-10 and PASS or FAIL.\n\n" ++
-                        "GRADING AXES:\n" ++
-                        "  CORRECTNESS (threshold 8): does the fix compile and not break existing tests?\n" ++
-                        "  SAFETY (threshold 9): does the fix resolve the safety issue without introducing new ones?\n" ++
-                        "  COMPLETENESS (threshold 7): does the fix satisfy ALL acceptance criteria?\n" ++
-                        "  QUALITY (threshold 6): is the fix minimal and clean, not over-engineered?\n\n" ++
-                        "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
-                        "PASS or FAIL, then explain what passed/failed and why.\n\n" ++
-                        "TASK: {s}\n\nACCEPTANCE CRITERIA:\n{s}\n\nFIXER OUTPUT:\n{s}",
-                    .{ task, contract_out.items, fixer_out.items },
-                ) catch task;
-                defer if (verify_prompt.ptr != task.ptr) alloc.free(verify_prompt);
+                        const verify_prompt = std.fmt.allocPrint(
+                            alloc,
+                            "You are verifying a fix against its sprint contract. " ++
+                                "Score each axis 1-10 and PASS or FAIL.\n\n" ++
+                                "GRADING AXES:\n" ++
+                                "  CORRECTNESS (threshold 8): does the fix compile and not break existing tests?\n" ++
+                                "  SAFETY (threshold 9): does the fix resolve the safety issue without introducing new ones?\n" ++
+                                "  COMPLETENESS (threshold 7): does the fix satisfy ALL acceptance criteria?\n" ++
+                                "  QUALITY (threshold 6): is the fix minimal and clean, not over-engineered?\n\n" ++
+                                "OUTPUT: SCORES: correctness=N safety=N completeness=N quality=N\n" ++
+                                "PASS or FAIL, then explain what passed/failed and why.\n\n" ++
+                                "TASK: {s}\n\nACCEPTANCE CRITERIA:\n{s}\n\nFIXER OUTPUT:\n{s}",
+                            .{ task, contract_out.items, fixer_out.items },
+                        ) catch task;
+                        defer if (verify_prompt.ptr != task.ptr) alloc.free(verify_prompt);
 
-                runChainStep(alloc, "reviewer", mode, false, permission_mode, verify_prompt, 180, &verify_out);
+                        runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, verify_prompt, start_ms, timeout_seconds, &verify_out);
 
-                // Parse verify verdict
-                const verify_text = verify_out.items;
-                const verify_pass = std.mem.indexOf(u8, verify_text, "\nPASS\n") != null or
-                    std.mem.indexOf(u8, verify_text, "\nPASS\r") != null or
-                    std.mem.startsWith(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS\n") or
-                    std.mem.eql(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS") or
-                    std.mem.indexOf(u8, verify_text, "NO_ISSUES_FOUND") != null;
+                        // Parse verify verdict
+                        const verify_text = verify_out.items;
+                        const verify_pass = std.mem.indexOf(u8, verify_text, "\nPASS\n") != null or
+                            std.mem.indexOf(u8, verify_text, "\nPASS\r") != null or
+                            std.mem.startsWith(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS\n") or
+                            std.mem.eql(u8, std.mem.trim(u8, verify_text, " \t\n\r"), "PASS") or
+                            std.mem.indexOf(u8, verify_text, "NO_ISSUES_FOUND") != null;
 
-                out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"") catch return;
-                out.appendSlice(alloc, if (verify_pass) "PASS" else "FAIL") catch return;
-                out.appendSlice(alloc, "\",\"output\":\"") catch return;
-                mj.writeEscaped(alloc, out, verify_out.items);
-                out.appendSlice(alloc, "\"}") catch return;
+                        out.appendSlice(alloc, "{\"role\":\"verify\",\"verdict\":\"") catch return;
+                        out.appendSlice(alloc, if (verify_pass) "PASS" else "FAIL") catch return;
+                        out.appendSlice(alloc, "\",\"output\":\"") catch return;
+                        mj.writeEscaped(alloc, out, verify_out.items);
+                        out.appendSlice(alloc, "\"}") catch return;
+                    }
                 } // close else (contract not empty)
             }
         },
@@ -2783,7 +2912,7 @@ fn handleRunTask(
             ) catch task;
             defer if (scored_review_prompt.ptr != task.ptr) alloc.free(scored_review_prompt);
 
-            runChainStep(alloc, "reviewer", mode, false, permission_mode, scored_review_prompt, 300, &review_out);
+            runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, scored_review_prompt, start_ms, timeout_seconds, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
@@ -2791,33 +2920,37 @@ fn handleRunTask(
 
             // Check convergence
             const review_text = review_out.items;
-            const is_pass = std.mem.indexOf(u8, review_text, "\nPASS\n") != null or
-                std.mem.indexOf(u8, review_text, "\nPASS\r") != null or
-                std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS\n") or
-                std.mem.eql(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
-            const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
-
-            if (is_pass or no_issues or std.mem.trim(u8, review_text, " \t\n\r").len == 0) {
-                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"No issues to fix — all axes passed\"}") catch return;
+            if (isTimedOutPayload(review_text)) {
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: reviewer timed out\"}") catch return;
             } else {
-                // Step 2: fixer (writable) — fix found issues, must address all FAIL axes
-                var fixer_out: std.ArrayList(u8) = .empty;
-                defer fixer_out.deinit(alloc);
+                const is_pass = std.mem.indexOf(u8, review_text, "\nPASS\n") != null or
+                    std.mem.indexOf(u8, review_text, "\nPASS\r") != null or
+                    std.mem.startsWith(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS\n") or
+                    std.mem.eql(u8, std.mem.trim(u8, review_text, " \t\n\r"), "PASS");
+                const no_issues = std.mem.indexOf(u8, review_text, "NO_ISSUES_FOUND") != null;
 
-                const fixer_prompt = std.fmt.allocPrint(
-                    alloc,
-                    "Fix ALL issues listed below. The reviewer scored axes and FAILed — " ++
-                        "you must address every finding to bring all axes above threshold.\n\n" ++
-                        "REVIEW FINDINGS:\n{s}",
-                    .{review_out.items},
-                ) catch task;
-                defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
+                if (is_pass or no_issues or std.mem.trim(u8, review_text, " \t\n\r").len == 0) {
+                    out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"No issues to fix — all axes passed\"}") catch return;
+                } else {
+                    // Step 2: fixer (writable) — fix found issues, must address all FAIL axes
+                    var fixer_out: std.ArrayList(u8) = .empty;
+                    defer fixer_out.deinit(alloc);
 
-                runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
+                    const fixer_prompt = std.fmt.allocPrint(
+                        alloc,
+                        "Fix ALL issues listed below. The reviewer scored axes and FAILed — " ++
+                            "you must address every finding to bring all axes above threshold.\n\n" ++
+                            "REVIEW FINDINGS:\n{s}",
+                        .{review_out.items},
+                    ) catch task;
+                    defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
-                mj.writeEscaped(alloc, out, fixer_out.items);
-                out.appendSlice(alloc, "\"}") catch return;
+                    runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, &fixer_out);
+
+                    out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
+                    mj.writeEscaped(alloc, out, fixer_out.items);
+                    out.appendSlice(alloc, "\"}") catch return;
+                }
             }
         },
         .explore_report => {
@@ -2825,13 +2958,15 @@ fn handleRunTask(
             var explore_out: std.ArrayList(u8) = .empty;
             defer explore_out.deinit(alloc);
 
-            runChainStep(alloc, "explorer", mode, false, permission_mode, task, 300, &explore_out);
+            runChainStepWithBudget(alloc, "explorer", mode, false, permission_mode, task, start_ms, timeout_seconds, &explore_out);
 
             out.appendSlice(alloc, "{\"role\":\"explorer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, explore_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
-            if (std.mem.trim(u8, explore_out.items, " \t\n\r").len == 0) {
+            if (isTimedOutPayload(explore_out.items)) {
+                out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"Skipped: explorer timed out\"}") catch return;
+            } else if (std.mem.trim(u8, explore_out.items, " \t\n\r").len == 0) {
                 out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"Skipped: explorer returned empty output\"}") catch return;
             } else {
                 // Step 2: synthesizer (read-only) — summarize findings
@@ -2845,7 +2980,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (synth_prompt.ptr != task.ptr) alloc.free(synth_prompt);
 
-                runChainStep(alloc, "synthesizer", mode, false, permission_mode, synth_prompt, 300, &synth_out);
+                runChainStepWithBudget(alloc, "synthesizer", mode, false, permission_mode, synth_prompt, start_ms, timeout_seconds, &synth_out);
 
                 out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, synth_out.items);
@@ -2857,46 +2992,55 @@ fn handleRunTask(
             var arch_out: std.ArrayList(u8) = .empty;
             defer arch_out.deinit(alloc);
 
-            runChainStep(alloc, "architect", "deep", false, permission_mode, task, 300, &arch_out);
+            runChainStepWithBudget(alloc, "architect", "deep", false, permission_mode, task, start_ms, timeout_seconds, &arch_out);
 
             out.appendSlice(alloc, "{\"role\":\"architect\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, arch_out.items);
             out.appendSlice(alloc, "\"},") catch return;
 
-            // Step 2: fixer (writable) — implement the plan
-            var fixer_out: std.ArrayList(u8) = .empty;
-            defer fixer_out.deinit(alloc);
+            if (isTimedOutPayload(arch_out.items)) {
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"Skipped: architect timed out\"},") catch return;
+                out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"Skipped: architect timed out before implementation\"}") catch return;
+            } else {
+                // Step 2: fixer (writable) — implement the plan
+                var fixer_out: std.ArrayList(u8) = .empty;
+                defer fixer_out.deinit(alloc);
 
-            const fixer_prompt = std.fmt.allocPrint(
-                alloc,
-                "Implement the following architectural plan.\n\n" ++
-                    "PLAN:\n{s}",
-                .{arch_out.items},
-            ) catch task;
-            defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
+                const fixer_prompt = std.fmt.allocPrint(
+                    alloc,
+                    "Implement the following architectural plan.\n\n" ++
+                        "PLAN:\n{s}",
+                    .{arch_out.items},
+                ) catch task;
+                defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, 300, &fixer_out);
+                runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, &fixer_out);
 
-            out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
-            mj.writeEscaped(alloc, out, fixer_out.items);
-            out.appendSlice(alloc, "\"},") catch return;
+                out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
+                mj.writeEscaped(alloc, out, fixer_out.items);
+                out.appendSlice(alloc, "\"},") catch return;
 
-            // Step 3: reviewer (read-only) — verify implementation
-            var review_out: std.ArrayList(u8) = .empty;
-            defer review_out.deinit(alloc);
+                if (isTimedOutPayload(fixer_out.items)) {
+                    out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"Skipped: fixer timed out before review\"}") catch return;
+                } else {
+                    // Step 3: reviewer (read-only) — verify implementation
+                    var review_out: std.ArrayList(u8) = .empty;
+                    defer review_out.deinit(alloc);
 
-            runChainStep(alloc, "reviewer", mode, false, permission_mode, task, 300, &review_out);
+                    runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, task, start_ms, timeout_seconds, &review_out);
 
-            out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
-            mj.writeEscaped(alloc, out, review_out.items);
-            out.appendSlice(alloc, "\"}") catch return;
+                    out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
+                    mj.writeEscaped(alloc, out, review_out.items);
+                    out.appendSlice(alloc, "\"}") catch return;
+                }
+            }
         },
         .custom => {
             // Custom: just run as a single agent with the task
             var step_out: std.ArrayList(u8) = .empty;
             defer step_out.deinit(alloc);
 
-            runChainStep(alloc, "fixer", mode, writable_override orelse true, permission_mode, task, 300, &step_out);
+            runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, task, start_ms, timeout_seconds, &step_out);
 
             out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, step_out.items);
@@ -2905,4 +3049,43 @@ fn handleRunTask(
     }
 
     out.appendSlice(alloc, "]}") catch return;
+}
+
+test "tools_list encodes timeout options for explorer and run_task" {
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "run_explorer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "Maximum time for agent execution (default 300, max 600)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "Maximum total time for the full chain (default 300, max 600)") != null);
+}
+
+test "remainingTimeoutMs shrinks and expires cleanly" {
+    const now = std.time.milliTimestamp();
+
+    const almost_three_seconds = remainingTimeoutMs(now - 1001, 4) orelse return error.ExpectedRemainingBudget;
+    const almost_one_second = remainingTimeoutMs(now - 3001, 4) orelse return error.ExpectedRemainingBudget;
+
+    try std.testing.expect(almost_three_seconds <= 2999 and almost_three_seconds >= 2900);
+    try std.testing.expect(almost_one_second <= 999 and almost_one_second >= 900);
+    try std.testing.expectEqual(@as(?u64, null), remainingTimeoutMs(now - 5000, 4));
+}
+
+test "timeoutMsToReportedSeconds rounds up for json output" {
+    try std.testing.expectEqual(@as(u32, 1), timeoutMsToReportedSeconds(1));
+    try std.testing.expectEqual(@as(u32, 1), timeoutMsToReportedSeconds(1000));
+    try std.testing.expectEqual(@as(u32, 2), timeoutMsToReportedSeconds(1001));
+}
+
+test "appendTimedOutJson emits timeout payload" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    appendTimedOutJson(alloc, &out, 42);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"timed_out\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"timeout_seconds\":42") != null);
+}
+
+test "isTimedOutPayload accepts trimmed timeout json" {
+    try std.testing.expect(isTimedOutPayload("  \n{\"timed_out\":true,\"timeout_seconds\":2}"));
+    try std.testing.expect(!isTimedOutPayload("{\"error\":\"not timeout\"}"));
 }
