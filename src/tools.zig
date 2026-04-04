@@ -2279,6 +2279,7 @@ fn runChainStep(
     step_out: *std.ArrayList(u8),
 ) void {
     const rt = @import("runtime.zig");
+    const notify = @import("notify.zig");
     const req: rt.AgentRequest = .{
         .prompt          = prompt,
         .role            = role,
@@ -2288,7 +2289,52 @@ fn runChainStep(
     };
     const resolved = rt.resolve.resolveWithProbe(alloc, req);
     defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
-    rt.dispatch.dispatch(alloc, resolved, prompt, step_out);
+
+    // Run dispatch on a worker thread so we can send heartbeat notifications
+    // on the main thread.  Without heartbeats, external MCP bridges (which
+    // impose their own ~60s timeout) will kill the connection with -32001
+    // even though the agent is still working.
+    const Ctx = struct {
+        a: std.mem.Allocator,
+        resolved: rt.ResolvedAgent,
+        p: []const u8,
+        out: *std.ArrayList(u8),
+        done: std.Thread.ResetEvent = .{},
+
+        fn work(ctx: *@This()) void {
+            rt.dispatch.dispatch(ctx.a, ctx.resolved, ctx.p, ctx.out);
+            ctx.done.set();
+        }
+    };
+
+    const ctx = alloc.create(Ctx) catch {
+        step_out.appendSlice(alloc, "{\"error\":\"OOM allocating agent context\"}") catch {};
+        return;
+    };
+    defer alloc.destroy(ctx);
+    ctx.* = .{ .a = alloc, .resolved = resolved, .p = prompt, .out = step_out };
+
+    const thread = std.Thread.spawn(.{}, Ctx.work, .{ctx}) catch {
+        // Fallback: run synchronously (no heartbeat, but still works)
+        rt.dispatch.dispatch(alloc, resolved, prompt, step_out);
+        return;
+    };
+
+    // Send heartbeat every 15s while the agent is running.
+    // This keeps external MCP bridge connections alive.
+    const heartbeat_ns: u64 = 15 * std.time.ns_per_s;
+    var elapsed_s: u64 = 0;
+    while (true) {
+        if (ctx.done.timedWait(heartbeat_ns)) |_| {
+            break; // agent finished
+        } else |_| {
+            elapsed_s += 15;
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "agent '{s}' running ({d}s elapsed)", .{ role, elapsed_s }) catch "agent running…";
+            notify.send(alloc, msg);
+        }
+    }
+    thread.join();
 }
 
 fn handleRunTask(

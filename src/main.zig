@@ -159,6 +159,7 @@ fn run(alloc: std.mem.Allocator, active_repo: *?[]const u8) void {
             break;
         } orelse break;
         g_use_headers = g_use_headers or message_uses_headers;
+        @import("notify.zig").init(g_use_headers);
         defer alloc.free(line);
 
         const input = std.mem.trim(u8, line, " \t\r\n");
