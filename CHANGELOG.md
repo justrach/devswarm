@@ -2,11 +2,6 @@
 
 All notable changes to CodeDB are documented here.
 
-## [Unreleased]
-
-### Changed
-- `create_issue` / `create_issues_batch` now enforce the issue evidence template implied by `CONTRIBUTING.md` plus the agent issue-discovery standard. `decompose_feature` now returns both the issue-discovery rules and a concrete issue body template for downstream issue creation.
-- `create_issue(parent_issue=...)` is now documented as a body annotation only: it appends `Parent issue: #N` for context and does not create a durable issue dependency. Use `link_issues` for explicit relationships.
 
 ## [0.0.24] — 2026-03-04
 

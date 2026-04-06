@@ -10,18 +10,18 @@
 // Wire format: newline-delimited JSON, `"jsonrpc":"2.0"` header omitted.
 
 const std = @import("std");
-const mj = @import("mcp").json;
+const mj  = @import("mcp").json;
 
 // ── Startup: resolve zig tools directory once ─────────────────────────────────
 //
 // Walks the current process PATH to find zigrep.  Cached after the first
 // call so every subsequent runTurnPolicy call is allocation-free here.
 const ToolsDir = struct {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    var len: usize = 0;
-    var found: bool = false;
-    var checked: bool = false;
-    var mu: std.Thread.Mutex = .{};
+    var buf:     [std.fs.max_path_bytes]u8 = undefined;
+    var len:     usize = 0;
+    var found:   bool  = false;
+    var checked: bool  = false;
+    var mu:      std.Thread.Mutex = .{};
 
     /// Returns the directory that contains zigrep, or null if not found.
     /// Thread-safe; resolves at most once.
@@ -31,17 +31,14 @@ const ToolsDir = struct {
         if (checked) return if (found) buf[0..len] else null;
         checked = true;
         const path_env = std.process.getEnvVarOwned(
-            std.heap.page_allocator,
-            "PATH",
+            std.heap.page_allocator, "PATH",
         ) catch return null;
         defer std.heap.page_allocator.free(path_env);
         var it = std.mem.splitScalar(u8, path_env, ':');
         while (it.next()) |dir| {
             var cbuf: [std.fs.max_path_bytes]u8 = undefined;
             const candidate = std.fmt.bufPrint(
-                &cbuf,
-                "{s}/zigrep",
-                .{dir},
+                &cbuf, "{s}/zigrep", .{dir},
             ) catch continue;
             std.fs.accessAbsolute(candidate, .{}) catch continue;
             const n = @min(dir.len, buf.len);
@@ -83,9 +80,9 @@ pub const SandboxPolicy = enum { read_only, writable };
 /// Run a single agent turn via `codex app-server`.
 /// Blocks until `turn/completed`. Accumulated agent reply is appended to `out`.
 pub fn runTurn(
-    alloc: std.mem.Allocator,
+    alloc:  std.mem.Allocator,
     prompt: []const u8,
-    out: *std.ArrayList(u8),
+    out:    *std.ArrayList(u8),
 ) void {
     runTurnPolicy(alloc, prompt, out, .read_only);
 }
@@ -93,9 +90,9 @@ pub fn runTurn(
 /// Run a single agent turn via `codex app-server` inside a login shell.
 /// Blocks until `turn/completed`. Accumulated agent reply is appended to `out`.
 pub fn runTurnPolicy(
-    alloc: std.mem.Allocator,
+    alloc:  std.mem.Allocator,
     prompt: []const u8,
-    out: *std.ArrayList(u8),
+    out:    *std.ArrayList(u8),
     policy: SandboxPolicy,
 ) void {
     const cwd = std.process.getCwdAlloc(alloc) catch {
@@ -109,13 +106,10 @@ pub fn runTurnPolicy(
     // is still forwarded as-is — HOME is present so codex finds its config.
     var env_map = std.process.getEnvMap(alloc) catch std.process.EnvMap.init(alloc);
     defer env_map.deinit();
-    stripNestedCodexEnv(&env_map);
     if (ToolsDir.get()) |tools_dir| {
         const old_path = env_map.get("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
         const new_path = std.fmt.allocPrint(
-            alloc,
-            "{s}:{s}",
-            .{ tools_dir, old_path },
+            alloc, "{s}:{s}", .{ tools_dir, old_path },
         ) catch null;
         if (new_path) |np| {
             defer alloc.free(np);
@@ -128,10 +122,10 @@ pub fn runTurnPolicy(
     // ── Option 1: direct spawn ────────────────────────────────────────────
     // Spawn `codex app-server` directly.  Fast path — no shell overhead.
     var child = std.process.Child.init(&.{ "codex", "app-server" }, alloc);
-    child.stdin_behavior = .Pipe;
+    child.stdin_behavior  = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Close;
-    child.env_map = &env_map;
+    child.env_map         = &env_map;
 
     const spawned = child.spawn();
     if (spawned) |_| {
@@ -147,17 +141,17 @@ pub fn runTurnPolicy(
     // attach directly.
     const shell = std.process.getEnvVarOwned(alloc, "SHELL") catch
         alloc.dupe(u8, "/bin/zsh") catch {
-        appendErr(alloc, out, "could not spawn codex app-server — is codex on PATH?");
-        return;
-    };
+            appendErr(alloc, out, "could not spawn codex app-server — is codex on PATH?");
+            return;
+        };
     defer alloc.free(shell);
 
     const argv2 = [_][]const u8{ shell, "-lc", "exec codex app-server" };
     var child2 = std.process.Child.init(&argv2, alloc);
-    child2.stdin_behavior = .Pipe;
+    child2.stdin_behavior  = .Pipe;
     child2.stdout_behavior = .Pipe;
     child2.stderr_behavior = .Close;
-    child2.env_map = &env_map;
+    child2.env_map         = &env_map;
     child2.spawn() catch {
         appendErr(alloc, out, "could not spawn codex app-server via login shell — is codex installed?");
         return;
@@ -167,32 +161,23 @@ pub fn runTurnPolicy(
 
 /// Shared turn logic once a child process is spawned.
 fn runTurn_(
-    child: *std.process.Child,
-    alloc: std.mem.Allocator,
-    cwd: []const u8,
+    child:  *std.process.Child,
+    alloc:  std.mem.Allocator,
+    cwd:    []const u8,
     prompt: []const u8,
     policy: SandboxPolicy,
-    out: *std.ArrayList(u8),
+    out:    *std.ArrayList(u8),
 ) void {
     defer _ = child.wait() catch {};
     defer _ = child.kill() catch {};
 
-    const proc_in = child.stdin orelse {
-        appendErr(alloc, out, "no stdin pipe");
-        return;
-    };
-    const proc_out = child.stdout orelse {
-        appendErr(alloc, out, "no stdout pipe");
-        return;
-    };
+    const proc_in  = child.stdin  orelse { appendErr(alloc, out, "no stdin pipe");  return; };
+    const proc_out = child.stdout orelse { appendErr(alloc, out, "no stdout pipe"); return; };
 
     // ── 1. initialize ──────────────────────────────────────────────────────
     writeMsg(proc_in,
         \\{"method":"initialize","id":0,"params":{"clientInfo":{"name":"gitagent","title":"gitagent-mcp","version":"0.1.0"}}}
-    ) catch {
-        appendErr(alloc, out, "write initialize failed");
-        return;
-    };
+    ) catch { appendErr(alloc, out, "write initialize failed"); return; };
 
     if (!drainUntilId(alloc, proc_out, 0)) {
         appendErr(alloc, out, "no response to initialize from codex app-server");
@@ -202,10 +187,7 @@ fn runTurn_(
     // ── 2. initialized notification ────────────────────────────────────────
     writeMsg(proc_in,
         \\{"method":"initialized","params":{}}
-    ) catch {
-        appendErr(alloc, out, "write initialized failed");
-        return;
-    };
+    ) catch { appendErr(alloc, out, "write initialized failed"); return; };
 
     // ── 3. thread/start ────────────────────────────────────────────────────
     {
@@ -213,7 +195,7 @@ fn runTurn_(
         // approvalPolicy:"never" suppresses all approval prompts.
         const policy_json: []const u8 = switch (policy) {
             .read_only => "{\"type\":\"readOnly\"}",
-            .writable => "{\"type\":\"dangerFullAccess\"}",
+            .writable  => "{\"type\":\"dangerFullAccess\"}",
         };
         var msg: std.ArrayList(u8) = .empty;
         defer msg.deinit(alloc);
@@ -225,8 +207,7 @@ fn runTurn_(
         mj.writeEscaped(alloc, &msg, cwd);
         msg.appendSlice(alloc, "\"}}") catch return;
         writeMsgSlice(proc_in, msg.items) catch {
-            appendErr(alloc, out, "write thread/start failed");
-            return;
+            appendErr(alloc, out, "write thread/start failed"); return;
         };
     }
 
@@ -248,8 +229,7 @@ fn runTurn_(
         mj.writeEscaped(alloc, &msg, prompt);
         msg.appendSlice(alloc, "\"}]}}") catch return;
         writeMsgSlice(proc_in, msg.items) catch {
-            appendErr(alloc, out, "write turn/start failed");
-            return;
+            appendErr(alloc, out, "write turn/start failed"); return;
         };
     }
 
@@ -269,8 +249,7 @@ fn runTurn_(
         mj.writeEscaped(alloc, &msg, thread_id);
         msg.appendSlice(alloc, "\"}}") catch return;
         writeMsgSlice(proc_in, msg.items) catch {
-            appendErr(alloc, out, "write thread/compact/start failed");
-            return;
+            appendErr(alloc, out, "write thread/compact/start failed"); return;
         };
     }
 
@@ -291,25 +270,11 @@ fn runTurn_(
         mj.writeEscaped(alloc, &msg, prompt);
         msg.appendSlice(alloc, "\"}]}}") catch return;
         writeMsgSlice(proc_in, msg.items) catch {
-            appendErr(alloc, out, "write retry turn/start failed");
-            return;
+            appendErr(alloc, out, "write retry turn/start failed"); return;
         };
     }
 
     _ = streamTurn(alloc, proc_out, out);
-}
-
-fn stripNestedCodexEnv(env_map: *std.process.EnvMap) void {
-    // Nested Codex app-server calls launched from Codex Desktop inherit session-
-    // specific CODEX_* variables that can wedge child agent startup. Mirror the
-    // CLAUDECODE nested-session guard in agent_sdk.zig.
-    env_map.remove("CODEX_THREAD_ID");
-    env_map.remove("CODEX_INTERNAL_ORIGINATOR_OVERRIDE");
-    env_map.remove("CODEX_CI");
-    env_map.remove("CODEX_SANDBOX");
-    env_map.remove("CODEX_SANDBOX_NETWORK_DISABLED");
-    env_map.remove("CODEX_SHELL");
-    env_map.remove("__CFBundleIdentifier");
 }
 
 // ── Wire helpers ──────────────────────────────────────────────────────────────
@@ -328,36 +293,18 @@ fn readLineAlloc(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
     var buf: [1]u8 = undefined;
     var line: std.ArrayList(u8) = .empty;
     while (true) {
-        const n = file.read(&buf) catch {
-            line.deinit(alloc);
-            return null;
-        };
+        const n = file.read(&buf) catch { line.deinit(alloc); return null; };
         if (n == 0) {
-            if (line.items.len == 0) {
-                line.deinit(alloc);
-                return null;
-            }
-            const owned = line.toOwnedSlice(alloc) catch {
-                line.deinit(alloc);
-                return null;
-            };
+            if (line.items.len == 0) { line.deinit(alloc); return null; }
+            const owned = line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
             return owned;
         }
         if (buf[0] == '\n') {
-            const owned = line.toOwnedSlice(alloc) catch {
-                line.deinit(alloc);
-                return null;
-            };
+            const owned = line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
             return owned;
         }
-        line.append(alloc, buf[0]) catch {
-            line.deinit(alloc);
-            return null;
-        };
-        if (line.items.len > 4 * 1024 * 1024) {
-            line.deinit(alloc);
-            return null;
-        }
+        line.append(alloc, buf[0]) catch { line.deinit(alloc); return null; };
+        if (line.items.len > 4 * 1024 * 1024) { line.deinit(alloc); return null; }
     }
 }
 
@@ -371,10 +318,7 @@ fn drainUntilId(alloc: std.mem.Allocator, rd: anytype, target_id: i64) bool {
         defer p.deinit();
         if (p.value != .object) continue;
         const id_v = p.value.object.get("id") orelse continue;
-        const id: i64 = switch (id_v) {
-            .integer => |n| n,
-            else => continue,
-        };
+        const id: i64 = switch (id_v) { .integer => |n| n, else => continue };
         if (id == target_id) return true;
     }
 }
@@ -388,16 +332,13 @@ fn readThreadId(alloc: std.mem.Allocator, rd: anytype) ?[]u8 {
         if (p.value != .object) continue;
         const obj = &p.value.object;
         const id_v = obj.get("id") orelse continue;
-        const id: i64 = switch (id_v) {
-            .integer => |n| n,
-            else => continue,
-        };
+        const id: i64 = switch (id_v) { .integer => |n| n, else => continue };
         if (id != 1) continue;
-        const result = obj.get("result") orelse continue;
+        const result = obj.get("result")          orelse continue;
         if (result != .object) continue;
         const thread = result.object.get("thread") orelse continue;
         if (thread != .object) continue;
-        const tid = thread.object.get("id") orelse continue;
+        const tid    = thread.object.get("id")     orelse continue;
         if (tid != .string) continue;
         return alloc.dupe(u8, tid.string) catch null;
     }
@@ -429,9 +370,9 @@ fn streamTurn(alloc: std.mem.Allocator, rd: anytype, out: *std.ArrayList(u8)) bo
         if (std.mem.eql(u8, method, "turn/completed")) {
             const params = obj.get("params") orelse return false;
             if (params != .object) return false;
-            const turn = params.object.get("turn") orelse return false;
+            const turn   = params.object.get("turn")   orelse return false;
             if (turn != .object) return false;
-            const status = turn.object.get("status") orelse return false;
+            const status = turn.object.get("status")   orelse return false;
             if (status == .string and std.mem.eql(u8, status.string, "failed")) {
                 if (turn.object.get("error")) |err_v| {
                     if (err_v == .object) {
@@ -488,7 +429,7 @@ test "appserver: readLineAlloc reads up to newline, strips newline" {
     const reader = std.fs.File{ .handle = fds[0] };
 
     try writer.writeAll("hello world\n");
-    writer.close();
+writer.close();
 
     const line = readLineAlloc(alloc, reader) orelse return error.TestExpectedLine;
     defer alloc.free(line);
@@ -516,7 +457,7 @@ test "appserver: readLineAlloc returns partial content on EOF without newline" {
     const reader = std.fs.File{ .handle = fds[0] };
 
     try writer.writeAll("no-newline");
-    writer.close();
+writer.close();
 
     const line = readLineAlloc(alloc, reader) orelse return error.TestExpectedLine;
     defer alloc.free(line);
@@ -535,7 +476,7 @@ test "appserver: drainUntilId finds target id after skipping earlier ids" {
     try writer.writeAll("{\"id\":0,\"result\":{}}\n");
     try writer.writeAll("{\"id\":1,\"result\":{}}\n");
     try writer.writeAll("{\"id\":5,\"result\":{}}\n");
-    writer.close();
+writer.close();
 
     const found = drainUntilId(alloc, reader, 5);
     try std.testing.expect(found);
@@ -551,7 +492,7 @@ test "appserver: drainUntilId returns false on EOF before target id" {
     const reader = std.fs.File{ .handle = fds[0] };
 
     try writer.writeAll("{\"id\":1,\"result\":{}}\n");
-    writer.close();
+writer.close();
 
     const found = drainUntilId(alloc, reader, 99);
     try std.testing.expect(!found);
@@ -569,7 +510,7 @@ test "appserver: readThreadId extracts id from thread/start response" {
     // id=0 should be skipped (readThreadId looks for id=1)
     try writer.writeAll("{\"id\":0,\"result\":{}}\n");
     try writer.writeAll("{\"id\":1,\"result\":{\"thread\":{\"id\":\"thread-xyz\"}}}\n");
-    writer.close();
+writer.close();
 
     const tid = readThreadId(alloc, reader) orelse return error.TestExpectedThreadId;
     defer alloc.free(tid);
@@ -587,7 +528,7 @@ test "appserver: readThreadId returns null when thread.id is missing" {
 
     // id=1 response but no thread.id field
     try writer.writeAll("{\"id\":1,\"result\":{\"other\":\"data\"}}\n");
-    writer.close();
+writer.close();
 
     const tid = readThreadId(alloc, reader);
     try std.testing.expectEqual(@as(?[]u8, null), tid);
@@ -605,7 +546,7 @@ test "appserver: streamTurn accumulates agentMessage deltas and stops at turn/co
     try writer.writeAll("{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Hello, \"}}\n");
     try writer.writeAll("{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"world!\"}}\n");
     try writer.writeAll("{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}\n");
-    writer.close();
+writer.close();
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -624,9 +565,9 @@ test "appserver: streamTurn appends error message on failed turn" {
 
     try writer.writeAll(
         \\{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"message":"agent crashed"}}}}
-    ++ "\n",
+        ++ "\n",
     );
-    writer.close();
+writer.close();
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -644,7 +585,7 @@ test "appserver: streamTurn returns true on ContextWindowExceeded via codexError
 
     try writer.writeAll(
         \\{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"message":"context full","codexErrorInfo":"ContextWindowExceeded"}}}}
-    ++ "\n",
+        ++ "\n",
     );
     writer.close();
 
@@ -666,7 +607,7 @@ test "appserver: streamTurn returns true on context window message substring fal
 
     try writer.writeAll(
         \\{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"message":"Codex ran out of room in the model's context window. Start a new thread."}}}}
-    ++ "\n",
+        ++ "\n",
     );
     writer.close();
 
@@ -687,7 +628,7 @@ test "appserver: streamTurn returns false on non-context-window failure" {
 
     try writer.writeAll(
         \\{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"message":"internal server error","codexErrorInfo":"InternalServerError"}}}}
-    ++ "\n",
+        ++ "\n",
     );
     writer.close();
 
@@ -708,7 +649,7 @@ test "appserver: streamTurn returns false on successful turn with no output" {
 
     try writer.writeAll(
         \\{"method":"turn/completed","params":{"turn":{"status":"completed"}}}
-    ++ "\n",
+        ++ "\n",
     );
     writer.close();
 
@@ -732,7 +673,7 @@ test "appserver: streamTurn skips unknown notifications before turn/completed" {
     try writer.writeAll("{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"result\"}}\n");
     try writer.writeAll(
         \\{"method":"turn/completed","params":{"turn":{"status":"completed"}}}
-    ++ "\n",
+        ++ "\n",
     );
     writer.close();
 
