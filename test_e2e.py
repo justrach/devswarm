@@ -7,6 +7,28 @@ _DIR   = Path(__file__).resolve().parent
 BINARY = str(_DIR / "zig-out" / "bin" / "devswarm")
 REPO   = str(_DIR)
 
+ISSUE_BODY = """## One-sentence problem
+E2E issue template validation path.
+
+## Exact repro
+Run the devswarm MCP e2e issue-management flow.
+
+## Observed result
+The issue-management tools create and update GitHub issues.
+
+## Expected result
+The tools accept a complete evidence-backed issue body.
+
+## Nearby passing checks
+- get_next_task returns structured output
+
+## Acceptance criteria
+- create_issue succeeds with a complete issue template body
+
+## Non-goals
+- validating unrelated runtime behavior
+"""
+
 class MCP:
     def __init__(self):
         env = {**os.environ, "REPO_PATH": REPO}
@@ -90,7 +112,7 @@ def check(name, result, detail="", **expects):
 
 def run():
     s = MCP()
-    alpha = beta = gamma = None
+    alpha = beta = gamma = child = None
     branch_name = None; pr_num = None; orig_branch = "main"
 
     try:
@@ -180,15 +202,30 @@ def run():
         print("\n[2/5] Issue management")
 
         r = s.call("create_issue", title="[TEST] MCP e2e alpha",
-                   body="E2E test.", labels=["type:infra"])
+                   body=ISSUE_BODY, labels=["type:infra"])
         r = check("create_issue", r,
                   detail=f"#{r.get('number')} {r.get('url','')}" if isinstance(r,dict) else "",
                   number=lambda x: x and x > 0)
         if r and "number" in r: alpha = r["number"]
 
+        if alpha:
+            r = s.call("create_issue", title="[TEST] MCP e2e child",
+                       body=ISSUE_BODY, labels=["type:infra"], parent_issue=alpha)
+            r = check("create_issue (parent_issue)", r,
+                      detail=f"#{r.get('number')} parent=#{alpha}" if isinstance(r,dict) else "",
+                      number=lambda x: x and x > 0)
+            child = r["number"] if isinstance(r, dict) and "number" in r else None
+            if child:
+                r = s.call("get_issue", issue_number=child)
+                body = r.get("body", "") if isinstance(r, dict) else ""
+                if f"Parent issue: #{alpha}" in body:
+                    ok("get_issue (parent annotation)", f"child #{child} annotated with parent #{alpha}")
+                else:
+                    fail("get_issue (parent annotation)", f"missing parent annotation in body: {body[:120]!r}")
+
         r = s.call("create_issues_batch", issues=[
-            {"title":"[TEST] MCP e2e batch-beta",  "body":"batch 1","labels":["type:infra"]},
-            {"title":"[TEST] MCP e2e batch-gamma","body":"batch 2","labels":["type:infra"]},
+            {"title":"[TEST] MCP e2e batch-beta",  "body":ISSUE_BODY,"labels":["type:infra"]},
+            {"title":"[TEST] MCP e2e batch-gamma","body":ISSUE_BODY,"labels":["type:infra"]},
         ])
         if isinstance(r, list) and len(r)==2 and all(isinstance(i,dict) and i.get("number",0)>0 for i in r):
             beta=r[0]["number"]; gamma=r[1]["number"]
@@ -217,6 +254,10 @@ def run():
         if gamma:
             r = s.call("close_issue", issue_number=gamma)
             check("close_issue", r, detail=f"#{gamma}", closed=lambda x: x==gamma)
+
+        if child:
+            r = s.call("close_issue", issue_number=child)
+            check("close_issue (child)", r, detail=f"#{child}", closed=lambda x: x==child)
 
         print("\n[3/5] Branch & commit workflow")
 

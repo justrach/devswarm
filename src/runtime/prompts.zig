@@ -18,6 +18,20 @@ const roles = @import("roles.zig");
 const AgentMode = types.AgentMode;
 const ToolTier = cascade.ToolTier;
 
+const ISSUE_FILING_RULES =
+    \\ISSUE FILING:
+    \\  - Do not file a new issue from casual code inspection alone when runtime proof is practical.
+    \\  - Before proposing or filing an agent-discovered issue, prefer evidence-backed discovery:
+    \\    run the code path, re-check stale xfail/xpass/skip tests, compare docs vs runnable behavior,
+    \\    compare neighboring execution paths, and use differential or edge-case testing where relevant.
+    \\  - Only file issues that are narrow, reproducible, and verified on the current codebase state.
+    \\  - A strong issue must include: one concrete repro, observed result, expected result,
+    \\    one or two nearby passing checks, narrow acceptance criteria, and explicit non-goals.
+    \\  - If you cannot reduce the finding to one concrete problem with one reproducible path,
+    \\    gather better evidence instead of filing the issue yet.
+    \\
+;
+
 // ── Agency Preamble ─────────────────────────────────────────────────────────
 // Derived from our internal analysis of production agent behaviors observed
 // across multiple coding agent platforms. Patterns validated against public
@@ -40,6 +54,8 @@ const AGENCY_PREAMBLE =
     \\  - If a task is complex, break it into sub-steps and work through them systematically.
     \\  - Cite file:line for every finding and every change you make.
     \\  - When multiple independent operations are needed, batch them in parallel.
+    \\
+    \\{s}
     \\
     \\CODE QUALITY:
     \\  - Read before editing. Always understand existing code before modifying it.
@@ -136,16 +152,16 @@ const MINIMAL_TOOLS_PREAMBLE =
 fn modeGuidance(mode: AgentMode) []const u8 {
     return switch (mode) {
         .smart => "MODE: balanced — thorough but concise. Search broadly first, then narrow. " ++
-                  "Use parallel searches when exploring multiple angles. " ++
-                  "Batch independent reads and edits together for speed.",
-        .rush  => "MODE: fast — give the quickest useful answer. Minimize search depth. " ++
-                  "Keep responses under 3 lines. One search pass, then act.",
-        .deep  => "MODE: thorough — take your time. Explore all angles exhaustively. " ++
-                  "Read full files, trace call chains, check callers and callees. " ++
-                  "Run multiple search passes with different wording. " ++
-                  "Explain your reasoning. Plan before acting.",
-        .free  => "MODE: budget — minimal resource usage. Short answers, no unnecessary " ++
-                  "exploration. One search, one answer. Fewest tokens possible.",
+            "Use parallel searches when exploring multiple angles. " ++
+            "Batch independent reads and edits together for speed.",
+        .rush => "MODE: fast — give the quickest useful answer. Minimize search depth. " ++
+            "Keep responses under 3 lines. One search pass, then act.",
+        .deep => "MODE: thorough — take your time. Explore all angles exhaustively. " ++
+            "Read full files, trace call chains, check callers and callees. " ++
+            "Run multiple search passes with different wording. " ++
+            "Explain your reasoning. Plan before acting.",
+        .free => "MODE: budget — minimal resource usage. Short answers, no unnecessary " ++
+            "exploration. One search, one answer. Fewest tokens possible.",
     };
 }
 
@@ -153,8 +169,8 @@ fn modeGuidance(mode: AgentMode) []const u8 {
 pub fn toolPreamble(tier: ToolTier) []const u8 {
     return switch (tier) {
         .zig_tools => ZIG_TOOLS_PREAMBLE,
-        .standard  => STANDARD_TOOLS_PREAMBLE,
-        .minimal   => MINIMAL_TOOLS_PREAMBLE,
+        .standard => STANDARD_TOOLS_PREAMBLE,
+        .minimal => MINIMAL_TOOLS_PREAMBLE,
     };
 }
 
@@ -192,11 +208,15 @@ pub fn assemble(
 
     const mode_line = modeGuidance(mode);
     const tool_pre = toolPreamble(tier);
+    const agency_pre = std.fmt.allocPrint(alloc, AGENCY_PREAMBLE, .{ISSUE_FILING_RULES}) catch
+        return alloc.dupe(u8, tool_pre) catch ASSEMBLE_OOM_SENTINEL;
+    defer alloc.free(agency_pre);
 
     // Format: [agency]\n[role]\n[mode]\n\n[tools]\nTask:\n
-    return std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(
+        alloc,
         "{s}\n{s}\n{s}\n\n{s}\nTask:\n",
-        .{ AGENCY_PREAMBLE, role_prompt, mode_line, tool_pre },
+        .{ agency_pre, role_prompt, mode_line, tool_pre },
     ) catch alloc.dupe(u8, tool_pre) catch ASSEMBLE_OOM_SENTINEL;
 }
 
@@ -221,6 +241,7 @@ test "prompts: assemble includes agency, role, mode, and tools" {
     // Agency preamble
     try std.testing.expect(std.mem.indexOf(u8, result, "coding agent") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "CODE QUALITY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ISSUE FILING") != null);
     // Role prompt
     try std.testing.expect(std.mem.indexOf(u8, result, "code finder") != null);
     // Mode guidance
