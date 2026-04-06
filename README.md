@@ -196,6 +196,9 @@ Each agent gets the right model automatically:
 **Issues**
 `create_issue` · `update_issue` · `close_issue` · `get_issue` · `create_issues_batch` · `close_issues_batch` · `link_issues`
 
+Issue-filing note: `create_issue` and `create_issues_batch` now enforce the issue template implied by [`CONTRIBUTING.md`](CONTRIBUTING.md) and the agent issue-discovery standard. Issue bodies must include: one-sentence problem, exact repro, observed result, expected result, nearby passing checks, acceptance criteria, and non-goals.
+`create_issue(parent_issue=...)` is context-only: it appends `Parent issue: #N` to the body. Use `link_issues` for explicit dependency links.
+
 **Git**
 `create_branch` · `get_current_branch` · `commit_with_context` · `push_branch` · `recently_changed` · `git_history_for`
 

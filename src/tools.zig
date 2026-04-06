@@ -21,6 +21,48 @@ const graph_query = @import("graph/query.zig");
 const graph_mod = @import("graph/graph.zig");
 const graph_store = @import("graph/storage.zig");
 
+const ISSUE_DISCOVERY_STANDARD =
+    "For agent-discovered bugs or regressions, do not file from casual inspection alone when runtime proof is practical. " ++
+    "Prefer running the code path, re-checking stale xfail/xpass/skip tests, comparing docs versus runnable behavior, " ++
+    "comparing neighboring execution paths, and using differential or edge-case testing where relevant. " ++
+    "Only file narrow, reproducible issues verified on the current codebase. " ++
+    "Include one concrete repro, observed result, expected result, one or two nearby passing checks, " ++
+    "narrow acceptance criteria, and explicit non-goals.";
+
+const DECOMPOSE_FEATURE_INSTRUCTIONS =
+    "Use create_issues_batch to create the issues. status:backlog is auto-applied by create_issue when available. " ++
+    "For ordering, add one of priority:p0, priority:p1, priority:p2, or priority:p3 as needed. " ++
+    "Return an array of objects with title, body, and labels fields. " ++
+    "This tool is for feature planning. For newly discovered bugs or regressions, do not create issues from casual inspection alone; " ++
+    "first gather runtime-verifiable evidence. Every agent-discovered issue should include: Exact repro, Observed result, Expected result, " ++
+    "Nearby passing checks, Acceptance criteria, and Non-goals. If you cannot reduce the finding to one concrete problem with one reproducible path, gather better evidence before filing.";
+
+const ISSUE_TEMPLATE =
+    "## One-sentence problem\n" ++
+    "<one concrete problem>\n\n" ++
+    "## Exact repro\n" ++
+    "<one concrete command, test, API call, UI flow, or script>\n\n" ++
+    "## Observed result\n" ++
+    "<actual observed failure, output, or mismatch>\n\n" ++
+    "## Expected result\n" ++
+    "<what should happen instead>\n\n" ++
+    "## Nearby passing checks\n" ++
+    "- <one or two nearby passing checks>\n\n" ++
+    "## Acceptance criteria\n" ++
+    "- <narrow, testable fix target>\n\n" ++
+    "## Non-goals\n" ++
+    "- <what this issue is not asking for>\n";
+
+const REQUIRED_ISSUE_SECTIONS = [_][]const u8{
+    "## One-sentence problem",
+    "## Exact repro",
+    "## Observed result",
+    "## Expected result",
+    "## Nearby passing checks",
+    "## Acceptance criteria",
+    "## Non-goals",
+};
+
 // ── Dynamic repo slug ─────────────────────────────────────────────────────────
 // Updated from CWD on startup (notifications/initialized) and on every set_repo.
 // MCP dispatch is single-threaded; mutex is belt-and-suspenders for drainer threads.
@@ -44,6 +86,53 @@ fn repoOrErr(alloc: std.mem.Allocator, out: *std.ArrayList(u8)) ?[]const u8 {
         return null;
     }
     return repo;
+}
+
+fn validateIssueDraft(alloc: std.mem.Allocator, title: []const u8, body: []const u8) ?[]u8 {
+    if (std.mem.trim(u8, title, " \t\n\r").len == 0) {
+        return alloc.dupe(u8, "issue title must not be empty") catch null;
+    }
+    if (std.mem.trim(u8, body, " \t\n\r").len == 0) {
+        return std.fmt.allocPrint(
+            alloc,
+            "issue body is required and must follow the CONTRIBUTING.md / AGENT.md issue template. Missing body.\n\nRequired template:\n{s}",
+            .{ISSUE_TEMPLATE},
+        ) catch null;
+    }
+
+    var missing: std.ArrayList([]const u8) = .empty;
+    defer missing.deinit(alloc);
+    for (REQUIRED_ISSUE_SECTIONS) |section| {
+        if (std.mem.indexOf(u8, body, section) == null) {
+            missing.append(alloc, section) catch {};
+        }
+    }
+
+    if (missing.items.len == 0) return null;
+
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(alloc);
+    for (missing.items, 0..) |section, i| {
+        if (i > 0) joined.appendSlice(alloc, ", ") catch {};
+        joined.appendSlice(alloc, section) catch {};
+    }
+
+    return std.fmt.allocPrint(
+        alloc,
+        "issue body does not satisfy CONTRIBUTING.md / AGENT.md issue requirements. Missing required section(s): {s}.\n\nRequired template:\n{s}",
+        .{ joined.items, ISSUE_TEMPLATE },
+    ) catch null;
+}
+
+fn buildIssueBody(
+    alloc: std.mem.Allocator,
+    raw_body: []const u8,
+    parent_issue: ?i64,
+) ?[]u8 {
+    if (parent_issue) |num| {
+        return std.fmt.allocPrint(alloc, "{s}\n\nParent issue: #{d}", .{ raw_body, num }) catch null;
+    }
+    return alloc.dupe(u8, raw_body) catch null;
 }
 
 fn setCurrentRepo(slug: []const u8) void {
@@ -188,12 +277,12 @@ pub const Tool = enum {
 
 pub const tools_list =
     \\{"tools":[
-    \\{"name":"decompose_feature","description":"Break a natural language feature description into ordered GitHub Issue drafts. Returns a JSON schema and available labels/milestones for the caller to populate. Call this before any new feature work.","inputSchema":{"type":"object","properties":{"feature_description":{"type":"string","description":"Plain English description of the feature to build"}},"required":["feature_description"]}},
+    \\{"name":"decompose_feature","description":"Break a natural language feature description into ordered GitHub Issue drafts. Returns a JSON schema and available labels/milestones for the caller to populate. Call this before any new feature work; it is for feature planning, not speculative bug filing.","inputSchema":{"type":"object","properties":{"feature_description":{"type":"string","description":"Plain English description of the feature to build"}},"required":["feature_description"]}},
     \\{"name":"get_project_state","description":"Return all open issues grouped by status label, all open branches, and all open PRs. Use this to understand current project state before picking up work.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"get_next_task","description":"Return the single highest-priority unblocked issue that has no open branch. Use this to decide what to work on next.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"prioritize_issues","description":"Apply priority labels (priority:p0–p3) to a set of issues based on their dependency order. Sinks (no dependents) get p0; independent issues get p2.","inputSchema":{"type":"object","properties":{"issue_numbers":{"type":"array","items":{"type":"integer"},"description":"Issue numbers to prioritize"}},"required":["issue_numbers"]}},
-    \\{"name":"create_issue","description":"Create a single GitHub issue with title, body, labels, and optional milestone. Automatically applies status:backlog if no status label is provided.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"},"parent_issue":{"type":"integer","description":"Issue number this is a subtask of"}},"required":["title"]}},
-    \\{"name":"create_issues_batch","description":"Create multiple GitHub issues in one call. Issues are fired concurrently in batches of 5 with a 200ms collection window. Use this after decompose_feature to create all issues at once.","inputSchema":{"type":"object","properties":{"issues":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"}},"required":["title"]}}},"required":["issues"]}},
+    \\{"name":"create_issue","description":"Create a single GitHub issue with title, body, labels, and optional milestone. Automatically applies status:backlog if no status label is provided. This tool enforces the issue requirements from CONTRIBUTING.md and AGENT.md: the body must include One-sentence problem, Exact repro, Observed result, Expected result, Nearby passing checks, Acceptance criteria, and Non-goals. If parent_issue is provided, create_issue only appends `Parent issue: #N` to the issue body for context; use link_issues for explicit dependency relationships.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string","description":"Required. Must follow the CONTRIBUTING.md / AGENT.md issue template with the required evidence sections."},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"},"parent_issue":{"type":"integer","description":"Optional parent issue number to append as `Parent issue: #N` in the issue body for context only. This does not create a durable GitHub subtask/dependency relationship; use link_issues for explicit links."}},"required":["title","body"]}},
+    \\{"name":"create_issues_batch","description":"Create multiple GitHub issues in one call. Issues are fired concurrently in batches of 5 with a 200ms collection window. Use this after decompose_feature to create all issues at once. Each issue body must satisfy the same CONTRIBUTING.md / AGENT.md evidence template enforced by create_issue.","inputSchema":{"type":"object","properties":{"issues":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string","description":"Required. Must follow the CONTRIBUTING.md / AGENT.md issue template with the required evidence sections."},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"}},"required":["title","body"]}}},"required":["issues"]}},
     \\{"name":"update_issue","description":"Update an existing issue's title, body, or labels.","inputSchema":{"type":"object","properties":{"issue_number":{"type":"integer"},"title":{"type":"string"},"body":{"type":"string"},"add_labels":{"type":"array","items":{"type":"string"}},"remove_labels":{"type":"array","items":{"type":"string"}}},"required":["issue_number"]}},
     \\{"name":"close_issues_batch","description":"Close multiple issues at once. Each issue is marked status:done. Use this instead of calling close_issue N times.","inputSchema":{"type":"object","properties":{"issue_numbers":{"type":"array","items":{"type":"integer"},"description":"Issue numbers to close"},"pr_number":{"type":"integer","description":"PR number that resolves all these issues (optional)"}},"required":["issue_numbers"]}},
     \\{"name":"close_issue","description":"Close an issue and mark it status:done. Optionally reference the PR that resolved it.","inputSchema":{"type":"object","properties":{"issue_number":{"type":"integer"},"pr_number":{"type":"integer","description":"PR number that resolves this issue"}},"required":["issue_number"]}},
@@ -331,9 +420,13 @@ fn handleDecomposeFeature(
     } else {
         out.appendSlice(alloc, "[]") catch {};
     }
-    out.appendSlice(alloc,
-        \\,"instructions":"Use create_issues_batch to create the issues. status:backlog is auto-applied by create_issue when available. For ordering, add one of priority:p0, priority:p1, priority:p2, or priority:p3 as needed. Return an array of objects with title, body, and labels fields."}
-    ) catch {};
+    out.appendSlice(alloc, ",\"instructions\":\"") catch return;
+    mj.writeEscaped(alloc, out, DECOMPOSE_FEATURE_INSTRUCTIONS);
+    out.appendSlice(alloc, "\",\"issue_discovery_standard\":\"") catch return;
+    mj.writeEscaped(alloc, out, ISSUE_DISCOVERY_STANDARD);
+    out.appendSlice(alloc, "\",\"issue_template\":\"") catch return;
+    mj.writeEscaped(alloc, out, ISSUE_TEMPLATE);
+    out.appendSlice(alloc, "\"}") catch {};
 }
 
 fn handleGetProjectState(
@@ -514,20 +607,26 @@ fn handleCreateIssue(
         writeErr(alloc, out, "missing title");
         return;
     };
-
-    // Build body — optionally append parent issue reference
-    var body_buf: ?[]u8 = null;
-    defer if (body_buf) |b| alloc.free(b);
-    const body: []const u8 = blk: {
-        const raw = mj.getStr(args, "body") orelse "";
-        if (args.get("parent_issue")) |piv| {
-            if (piv == .integer) {
-                body_buf = std.fmt.allocPrint(alloc, "{s}\n\nParent issue: #{d}", .{ raw, piv.integer }) catch null;
-                if (body_buf) |b| break :blk b;
-            }
-        }
-        break :blk raw;
+    const raw_body = mj.getStr(args, "body") orelse {
+        writeErr(alloc, out, "missing body");
+        return;
     };
+    if (validateIssueDraft(alloc, title, raw_body)) |msg| {
+        defer alloc.free(msg);
+        writeErr(alloc, out, msg);
+        return;
+    }
+
+    // Build body — optionally append parent issue reference as plain body context.
+    const parent_issue: ?i64 = if (args.get("parent_issue")) |piv|
+        if (piv == .integer) piv.integer else null
+    else
+        null;
+    const body = buildIssueBody(alloc, raw_body, parent_issue) orelse {
+        writeErr(alloc, out, "failed to allocate issue body");
+        return;
+    };
+    defer alloc.free(body);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
@@ -2067,18 +2166,7 @@ fn runAgentWithRole(
     timeout_seconds: ?u32,
     out: *std.ArrayList(u8),
 ) void {
-    const effective_timeout_seconds = timeout_seconds orelse 300;
-    runChainStep(
-        alloc,
-        role,
-        mode,
-        writable_flag,
-        null,
-        prompt,
-        timeoutSecondsToMs(effective_timeout_seconds),
-        effective_timeout_seconds,
-        out,
-    );
+    runChainStep(alloc, role, mode, writable_flag, null, prompt, timeout_seconds, out);
 }
 
 fn parseTimeoutSeconds(args: *const std.json.ObjectMap, default_seconds: u32) u32 {
@@ -2102,24 +2190,16 @@ fn appendTimedOutJson(
     out.appendSlice(alloc, "}") catch {};
 }
 
-fn timeoutSecondsToMs(timeout_seconds: u32) u64 {
-    return @as(u64, timeout_seconds) * std.time.ms_per_s;
-}
-
-fn timeoutMsToReportedSeconds(timeout_ms: u64) u32 {
-    return @intCast(@max(@as(u64, 1), @divFloor(timeout_ms + std.time.ms_per_s - 1, std.time.ms_per_s)));
-}
-
 fn isTimedOutPayload(text: []const u8) bool {
     return std.mem.startsWith(u8, std.mem.trim(u8, text, " \t\n\r"), "{\"timed_out\"");
 }
 
-fn remainingTimeoutMs(start_ms: i64, total_seconds: u32) ?u64 {
+fn remainingTimeoutSeconds(start_ms: i64, total_seconds: u32) ?u32 {
     const total_ms = @as(i64, total_seconds) * std.time.ms_per_s;
     const elapsed_ms = @max(@as(i64, 0), std.time.milliTimestamp() - start_ms);
     if (elapsed_ms >= total_ms) return null;
     const remaining_ms = total_ms - elapsed_ms;
-    return @intCast(remaining_ms);
+    return @intCast(@max(@as(i64, 1), @divFloor(remaining_ms + std.time.ms_per_s - 1, std.time.ms_per_s)));
 }
 
 fn runChainStepWithBudget(
@@ -2133,21 +2213,11 @@ fn runChainStepWithBudget(
     total_timeout_seconds: u32,
     step_out: *std.ArrayList(u8),
 ) void {
-    const remaining_ms = remainingTimeoutMs(start_ms, total_timeout_seconds) orelse {
+    const remaining = remainingTimeoutSeconds(start_ms, total_timeout_seconds) orelse {
         appendTimedOutJson(alloc, step_out, total_timeout_seconds);
         return;
     };
-    runChainStep(
-        alloc,
-        role,
-        mode,
-        writable_override,
-        permission_mode,
-        prompt,
-        remaining_ms,
-        timeoutMsToReportedSeconds(remaining_ms),
-        step_out,
-    );
+    runChainStep(alloc, role, mode, writable_override, permission_mode, prompt, remaining, step_out);
 }
 
 fn handleRunReviewer(
@@ -2311,17 +2381,7 @@ fn handleReviewFixLoop(
         iter_json.appendSlice(alloc, ",\"review\":\"") catch return;
         var review_out: std.ArrayList(u8) = .empty;
         defer review_out.deinit(alloc);
-        runChainStep(
-            alloc,
-            "reviewer",
-            null,
-            false,
-            null,
-            review_prompt,
-            timeoutSecondsToMs(300),
-            300,
-            &review_out,
-        );
+        runChainStep(alloc, "reviewer", null, false, null, review_prompt, 300, &review_out);
 
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
@@ -2364,17 +2424,7 @@ fn handleReviewFixLoop(
 
         var fix_out: std.ArrayList(u8) = .empty;
         defer fix_out.deinit(alloc);
-        runChainStep(
-            alloc,
-            "fixer",
-            null,
-            true,
-            null,
-            fix_prompt,
-            timeoutSecondsToMs(300),
-            300,
-            &fix_out,
-        );
+        runChainStep(alloc, "fixer", null, true, null, fix_prompt, 300, &fix_out);
 
         iter_json.appendSlice(alloc, ",\"fix\":\"") catch return;
         mj.writeEscaped(alloc, &iter_json, fix_out.items);
@@ -2585,6 +2635,15 @@ fn handleRunAgent(
     defer if (enriched) |e| alloc.free(e);
 
     const final_prompt = enriched orelse prompt;
+    const requested_writable: ?bool = blk: {
+        if (args.get("writable")) |v|
+            if (v == .bool) break :blk v.bool;
+        break :blk null;
+    };
+    const effective_writable: ?bool = if ((requested_writable orelse false) and isExplicitNoEditProbe(final_prompt))
+        false
+    else
+        requested_writable;
 
     // Build AgentRequest from MCP params
     const req: rt.AgentRequest = .{
@@ -2595,11 +2654,7 @@ fn handleRunAgent(
         .allowed_tools = mj.getStr(args, "allowed_tools"),
         .permission_mode = mj.getStr(args, "permission_mode"),
         .cwd = mj.getStr(args, "cwd"),
-        .writable = blk: {
-            if (args.get("writable")) |v|
-                if (v == .bool) break :blk v.bool;
-            break :blk null;
-        },
+        .writable = effective_writable,
     };
 
     // resolve() picks backend + model + tools; dispatch() spawns
@@ -2607,6 +2662,20 @@ fn handleRunAgent(
     defer rt.prompts.freeAssembled(alloc, resolved.system_prompt);
 
     rt.dispatch.dispatch(alloc, resolved, final_prompt, out);
+}
+
+fn isExplicitNoEditProbe(prompt: []const u8) bool {
+    const no_edit =
+        std.mem.indexOf(u8, prompt, "Do not edit files") != null or
+        std.mem.indexOf(u8, prompt, "do not edit files") != null or
+        std.mem.indexOf(u8, prompt, "don't edit files") != null or
+        std.mem.indexOf(u8, prompt, "no file edits") != null;
+    const probe =
+        std.mem.indexOf(u8, prompt, "Reply with exactly") != null or
+        std.mem.indexOf(u8, prompt, "reply with exactly") != null or
+        std.mem.indexOf(u8, prompt, "smoke test") != null or
+        std.mem.indexOf(u8, prompt, "no-op probe") != null;
+    return no_edit and probe;
 }
 
 // ── run_task: smart executor with chain presets (#278) ────────────────────────
@@ -3052,28 +3121,23 @@ fn handleRunTask(
     out.appendSlice(alloc, "]}") catch return;
 }
 
-test "tools_list encodes timeout options for explorer and run_task" {
+test "tools_list encodes evidence-backed issue filing guidance" {
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "This tool enforces the issue requirements from CONTRIBUTING.md and AGENT.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "Each issue body must satisfy the same CONTRIBUTING.md / AGENT.md evidence template enforced by create_issue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "CONTRIBUTING.md and AGENT.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_list, "run_explorer") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_list, "Maximum time for agent execution (default 300, max 600)") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_list, "Maximum total time for the full chain (default 300, max 600)") != null);
 }
 
-test "remainingTimeoutMs shrinks and expires cleanly" {
+test "remainingTimeoutSeconds rounds up and expires cleanly" {
     const now = std.time.milliTimestamp();
 
-    const almost_three_seconds = remainingTimeoutMs(now - 1001, 4) orelse return error.ExpectedRemainingBudget;
-    const almost_one_second = remainingTimeoutMs(now - 3001, 4) orelse return error.ExpectedRemainingBudget;
-
-    // Allow a little execution jitter between sampling `now` and checking the helper.
-    try std.testing.expect(almost_three_seconds <= 2999 and almost_three_seconds >= 2900);
-    try std.testing.expect(almost_one_second <= 999 and almost_one_second >= 900);
-    try std.testing.expectEqual(@as(?u64, null), remainingTimeoutMs(now - 5000, 4));
-}
-
-test "timeoutMsToReportedSeconds rounds up for json output" {
-    try std.testing.expectEqual(@as(u32, 1), timeoutMsToReportedSeconds(1));
-    try std.testing.expectEqual(@as(u32, 1), timeoutMsToReportedSeconds(1000));
-    try std.testing.expectEqual(@as(u32, 2), timeoutMsToReportedSeconds(1001));
+    // Stay comfortably away from millisecond boundaries so the test cannot
+    // flap if a few ms elapse between capturing `now` and evaluating.
+    try std.testing.expectEqual(@as(?u32, 3), remainingTimeoutSeconds(now - 1001, 4));
+    try std.testing.expectEqual(@as(?u32, 1), remainingTimeoutSeconds(now - 3001, 4));
+    try std.testing.expectEqual(@as(?u32, null), remainingTimeoutSeconds(now - 5000, 4));
 }
 
 test "appendTimedOutJson emits timeout payload" {
@@ -3090,4 +3154,64 @@ test "appendTimedOutJson emits timeout payload" {
 test "isTimedOutPayload accepts trimmed timeout json" {
     try std.testing.expect(isTimedOutPayload("  \n{\"timed_out\":true,\"timeout_seconds\":2}"));
     try std.testing.expect(!isTimedOutPayload("{\"error\":\"not timeout\"}"));
+}
+
+test "handleDecomposeFeature includes issue discovery standard" {
+    const alloc = std.testing.allocator;
+    setCurrentRepo("justrach/devswarm");
+
+    var args = std.json.ObjectMap.init(alloc);
+    defer args.deinit();
+    try args.put("feature_description", .{ .string = "add full-text search" });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    handleDecomposeFeature(alloc, &args, &out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"issue_discovery_standard\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"issue_template\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "runtime-verifiable evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Nearby passing checks") != null);
+}
+
+test "validateIssueDraft rejects missing sections" {
+    const alloc = std.testing.allocator;
+    const msg = validateIssueDraft(alloc, "title", "## Exact repro\nonly one section\n") orelse return error.ExpectedValidationError;
+    defer alloc.free(msg);
+
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Missing required section") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "## Observed result") != null);
+}
+
+test "validateIssueDraft accepts complete template" {
+    const alloc = std.testing.allocator;
+    const body =
+        "## One-sentence problem\none problem\n\n" ++
+        "## Exact repro\nrun x\n\n" ++
+        "## Observed result\nfails with y\n\n" ++
+        "## Expected result\nshould do z\n\n" ++
+        "## Nearby passing checks\n- check a\n\n" ++
+        "## Acceptance criteria\n- fix x\n\n" ++
+        "## Non-goals\n- not doing q\n";
+
+    try std.testing.expectEqual(@as(?[]u8, null), validateIssueDraft(alloc, "title", body));
+}
+
+test "buildIssueBody appends parent issue annotation for context only" {
+    const alloc = std.testing.allocator;
+    const body =
+        "## One-sentence problem\none problem\n\n" ++
+        "## Exact repro\nrun x\n\n" ++
+        "## Observed result\nfails with y\n\n" ++
+        "## Expected result\nshould do z\n\n" ++
+        "## Nearby passing checks\n- check a\n\n" ++
+        "## Acceptance criteria\n- fix x\n\n" ++
+        "## Non-goals\n- not doing q\n";
+
+    const with_parent = buildIssueBody(alloc, body, 393) orelse return error.OutOfMemory;
+    defer alloc.free(with_parent);
+
+    try std.testing.expect(std.mem.endsWith(u8, with_parent, "\n\nParent issue: #393"));
+    try std.testing.expect(std.mem.indexOf(u8, with_parent, "## Acceptance criteria") != null);
 }
