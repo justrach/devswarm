@@ -3,7 +3,7 @@
 // Andersen-Chung-Lang push approximation for PPR.
 // Given a query node, computes relevance scores for all reachable nodes.
 //
-// Push rule: if r[u] > ε × W_out(u), push u (W_out = total outgoing edge weight):
+// Push rule: if r[u] > ε × deg(u), push u:
 //   p[u] += α × r[u]
 //   r[v] += (1-α) × r[u] × W(u,v) / W_out(u)  for each out-neighbour v
 //   r[u] = 0
@@ -27,14 +27,7 @@ pub const ScoredNode = struct {
 ///
 /// Returns a map of node_id → PPR score for all nodes with non-zero score.
 /// `alpha` is the teleport probability (typically 0.15).
-/// `epsilon` scales the push threshold with total out-weight W_out(u) (not raw degree).
-fn totalOutWeight(g: *const CodeGraph, u: u64) f32 {
-    const edges = g.outEdges(u);
-    var s: f32 = 0;
-    for (edges) |e| s += e.weight;
-    return s;
-}
-
+/// `epsilon` is the convergence threshold per unit of degree.
 pub fn pprPush(
     g: *const CodeGraph,
     query_node: u64,
@@ -76,8 +69,11 @@ pub fn pprPush(
         while (it.next()) |entry| {
             const u = entry.key_ptr.*;
             const r_u = entry.value_ptr.*;
-            const w_out = totalOutWeight(g, u);
-            const threshold = if (w_out > 0) epsilon * w_out else epsilon;
+            const deg = g.outDegree(u);
+            const threshold = if (deg > 0)
+                epsilon * @as(f32, @floatFromInt(deg))
+            else
+                epsilon;
             if (r_u > threshold) {
                 try to_push.append(alloc, u);
             }
