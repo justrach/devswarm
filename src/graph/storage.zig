@@ -188,20 +188,15 @@ pub fn deserialize(reader: anytype, alloc: std.mem.Allocator) !CodeGraph {
 
 // ── File I/O convenience ────────────────────────────────────────────────────
 
-/// Save a CodeGraph to a file path.
-pub fn saveToFile(g: *const CodeGraph, path: []const u8) !void {
+/// Save a CodeGraph to a file path. `alloc` is used for the serialization buffer.
+pub fn saveToFile(g: *const CodeGraph, path: []const u8, alloc: std.mem.Allocator) !void {
     const file = try std.fs.cwd().createFile(path, .{});
     defer file.close();
-    // Serialize to in-memory buffer, then write all at once
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc_for_save);
-    try serialize(g, buf.writer(alloc_for_save));
+    defer buf.deinit(alloc);
+    try serialize(g, buf.writer(alloc));
     try file.writeAll(buf.items);
 }
-
-/// Temporary allocator for saveToFile — uses page_allocator since we
-/// don't have access to a caller-provided allocator in the current API.
-const alloc_for_save = std.heap.page_allocator;
 
 /// Load a CodeGraph from a file path.
 pub fn loadFromFile(path: []const u8, alloc: std.mem.Allocator) !CodeGraph {
@@ -878,4 +873,31 @@ test "round-trip with empty strings everywhere" {
     try std.testing.expectEqualStrings("", g2.getFile(1).?.path);
     try std.testing.expectEqualStrings("", g2.getCommit(1).?.author);
     try std.testing.expectEqualStrings("", g2.getCommit(1).?.message);
+}
+
+test "saveToFile and loadFromFile round-trip (#405)" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_abs = try tmp.dir.realpath(".", &dir_buf);
+    const path = try std.fs.path.join(alloc, &.{ dir_abs, "cgdb405.bin" });
+    defer alloc.free(path);
+
+    var g = CodeGraph.init(alloc);
+    defer g.deinit();
+    try g.addSymbol(.{ .id = 1, .name = "main", .kind = .function, .file_id = 1, .line = 1, .col = 0, .scope = "" });
+    try g.addFile(.{ .id = 1, .path = "src/x.zig", .language = .zig, .last_modified = 1, .hash = [_]u8{0} ** 32 });
+
+    try saveToFile(&g, path, alloc);
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var g2 = try loadFromFile(path, alloc);
+    defer g2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), g2.symbolCount());
+    try std.testing.expectEqualStrings("main", g2.getSymbol(1).?.name);
+    try std.testing.expectEqualStrings("src/x.zig", g2.getFile(1).?.path);
 }
