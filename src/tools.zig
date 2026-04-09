@@ -2166,7 +2166,9 @@ fn runAgentWithRole(
     timeout_seconds: ?u32,
     out: *std.ArrayList(u8),
 ) void {
-    runChainStep(alloc, role, mode, writable_flag, null, prompt, timeout_seconds, out);
+    const sec: u32 = timeout_seconds orelse 300;
+    const ms: u64 = @as(u64, sec) * std.time.ms_per_s;
+    runChainStep(alloc, role, mode, writable_flag, null, prompt, ms, sec, out);
 }
 
 fn parseTimeoutSeconds(args: *const std.json.ObjectMap, default_seconds: u32) u32 {
@@ -2217,7 +2219,7 @@ fn runChainStepWithBudget(
         appendTimedOutJson(alloc, step_out, total_timeout_seconds);
         return;
     };
-    runChainStep(alloc, role, mode, writable_override, permission_mode, prompt, remaining, step_out);
+    runChainStep(alloc, role, mode, writable_override, permission_mode, prompt, @as(u64, remaining) * std.time.ms_per_s, remaining, step_out);
 }
 
 fn handleRunReviewer(
@@ -2381,7 +2383,7 @@ fn handleReviewFixLoop(
         iter_json.appendSlice(alloc, ",\"review\":\"") catch return;
         var review_out: std.ArrayList(u8) = .empty;
         defer review_out.deinit(alloc);
-        runChainStep(alloc, "reviewer", null, false, null, review_prompt, 300, &review_out);
+        runChainStep(alloc, "reviewer", null, false, null, review_prompt, 300 * std.time.ms_per_s, 300, &review_out);
 
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
@@ -2424,7 +2426,7 @@ fn handleReviewFixLoop(
 
         var fix_out: std.ArrayList(u8) = .empty;
         defer fix_out.deinit(alloc);
-        runChainStep(alloc, "fixer", null, true, null, fix_prompt, 300, &fix_out);
+        runChainStep(alloc, "fixer", null, true, null, fix_prompt, 300 * std.time.ms_per_s, 300, &fix_out);
 
         iter_json.appendSlice(alloc, ",\"fix\":\"") catch return;
         mj.writeEscaped(alloc, &iter_json, fix_out.items);
