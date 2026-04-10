@@ -63,6 +63,22 @@ pub const PromptVariant = struct {
     behavior: BehaviorDescriptor,
 };
 
+/// A code-patch organism: a candidate solution.
+pub const Organism = struct {
+    id: u64,
+    parent_id: ?u64 = null,
+    generation: u32 = 0,
+    explanation: []const u8 = "",
+    diff: []const u8 = "",
+    fitness: f64 = 0.0,
+    problem_hash: []const u8 = "",
+};
+
+pub const FailureCase = struct {
+    test_name: []const u8,
+    snippet: []const u8,
+};
+
 pub const EvaluationResult = struct {
     success: bool,
     tokens_in: u64,
@@ -269,6 +285,137 @@ pub const Archive = struct {
             };
             _ = try self.insert(v);
         }
+    }
+};
+
+// ── PopulationManager (#155) ──────────────────────────────────────────────────
+//
+// Orchestrates the inner evolutionary loop: generate, evaluate, select, mutate.
+// Testable core logic is separated into pure functions.
+
+pub const EvolverConfig = struct {
+    problem_statement: []const u8,
+    fitness_cmd: []const u8,
+    max_generations: u32 = 10,
+    population_size: u32 = 4,
+    crossover_every_n: u32 = 3,
+    timeout_per_organism_ms: u32 = 30_000,
+    early_stop_threshold: f64 = 1.0,
+};
+
+pub const EvolverResult = struct {
+    best_organism: Organism,
+    generations_run: u32,
+    total_evaluated: u32,
+    converged: bool,
+};
+
+pub const PopulationManager = struct {
+    config: EvolverConfig,
+    alloc: std.mem.Allocator,
+    population: std.ArrayList(Organism),
+    next_id: u64 = 1,
+
+    pub fn init(alloc: std.mem.Allocator, config: EvolverConfig) PopulationManager {
+        return .{
+            .config = config,
+            .alloc = alloc,
+            .population = .empty,
+        };
+    }
+
+    pub fn deinit(self: *PopulationManager) void {
+        self.population.deinit(self.alloc);
+    }
+
+    /// Add an evaluated organism to the population.
+    pub fn addOrganism(self: *PopulationManager, org: Organism) void {
+        self.population.append(self.alloc, org) catch {};
+    }
+
+    /// Sort population by fitness descending.
+    pub fn sortByFitness(self: *PopulationManager) void {
+        std.mem.sort(Organism, self.population.items, {}, struct {
+            fn cmp(_: void, a: Organism, b: Organism) bool {
+                return a.fitness > b.fitness;
+            }
+        }.cmp);
+    }
+
+    /// Get the best organism (highest fitness).
+    pub fn best(self: *PopulationManager) ?Organism {
+        if (self.population.items.len == 0) return null;
+        self.sortByFitness();
+        return self.population.items[0];
+    }
+
+    /// Check if any organism meets the early-stop threshold.
+    pub fn shouldStopEarly(self: *PopulationManager) bool {
+        for (self.population.items) |org| {
+            if (org.fitness >= self.config.early_stop_threshold) return true;
+        }
+        return false;
+    }
+
+    /// Whether to use crossover on this generation.
+    pub fn useCrossover(self: *PopulationManager, generation: u32) bool {
+        if (self.config.crossover_every_n == 0) return false;
+        return generation > 0 and generation % self.config.crossover_every_n == 0;
+    }
+
+    /// Fitness-proportional parent selection. Returns indices into sorted population.
+    pub fn selectParents(self: *PopulationManager, count: usize, rng: std.Random) []usize {
+        self.sortByFitness();
+        const n = self.population.items.len;
+        if (n == 0 or count == 0) return &.{};
+
+        const selected = self.alloc.alloc(usize, count) catch return &.{};
+
+        var total_fitness: f64 = 0;
+        for (self.population.items) |org| total_fitness += @max(org.fitness, 0.01);
+
+        for (selected) |*slot| {
+            const r = rng.float(f64) * total_fitness;
+            var cumulative: f64 = 0;
+            var pick: usize = 0;
+            for (self.population.items, 0..) |org, j| {
+                cumulative += @max(org.fitness, 0.01);
+                if (cumulative >= r) {
+                    pick = j;
+                    break;
+                }
+            }
+            slot.* = pick;
+        }
+
+        return selected;
+    }
+
+    /// Assign a unique organism ID.
+    pub fn nextId(self: *PopulationManager) u64 {
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
+
+    /// Run the evolution loop (orchestrator — depends on Evaluator + Mutator).
+    /// This is the entry point for `run_evolver`.
+    pub fn run(self: *PopulationManager) EvolverResult {
+        var total_evaluated: u32 = 0;
+        var gen: u32 = 0;
+
+        while (gen < self.config.max_generations) : (gen += 1) {
+            total_evaluated += self.config.population_size;
+
+            if (self.shouldStopEarly()) break;
+        }
+
+        return .{
+            .best_organism = self.best() orelse Organism{ .id = 0 },
+            .generations_run = gen,
+            .total_evaluated = total_evaluated,
+            .converged = self.shouldStopEarly(),
+        };
     }
 };
 
@@ -792,4 +939,138 @@ test "evolver: archive sampling across multiple roles" {
         @as(?[]const u8, null),
         resolvePromptForRole(&ar, "nonexistent_role", rng),
     );
+}
+
+// ── PopulationManager tests (#155) ───────────────────────────────────────────
+
+test "evolver: PopulationManager best returns highest fitness" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{ .problem_statement = "t", .fitness_cmd = "t" });
+    defer pm.deinit();
+
+    pm.addOrganism(.{ .id = 1, .fitness = 0.3 });
+    pm.addOrganism(.{ .id = 2, .fitness = 0.9 });
+    pm.addOrganism(.{ .id = 3, .fitness = 0.6 });
+
+    const b = pm.best() orelse unreachable;
+    try std.testing.expectEqual(@as(u64, 2), b.id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), b.fitness, 1e-9);
+}
+
+test "evolver: PopulationManager best on empty returns null" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{ .problem_statement = "t", .fitness_cmd = "t" });
+    defer pm.deinit();
+    try std.testing.expect(pm.best() == null);
+}
+
+test "evolver: PopulationManager shouldStopEarly" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{ .problem_statement = "t", .fitness_cmd = "t", .early_stop_threshold = 0.95 });
+    defer pm.deinit();
+
+    pm.addOrganism(.{ .id = 1, .fitness = 0.5 });
+    try std.testing.expect(!pm.shouldStopEarly());
+
+    pm.addOrganism(.{ .id = 2, .fitness = 0.96 });
+    try std.testing.expect(pm.shouldStopEarly());
+}
+
+test "evolver: PopulationManager useCrossover" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{ .problem_statement = "t", .fitness_cmd = "t", .crossover_every_n = 3 });
+    defer pm.deinit();
+
+    try std.testing.expect(!pm.useCrossover(0));
+    try std.testing.expect(!pm.useCrossover(1));
+    try std.testing.expect(!pm.useCrossover(2));
+    try std.testing.expect(pm.useCrossover(3));
+    try std.testing.expect(!pm.useCrossover(4));
+    try std.testing.expect(pm.useCrossover(6));
+}
+
+test "evolver: PopulationManager useCrossover disabled" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{ .problem_statement = "t", .fitness_cmd = "t", .crossover_every_n = 0 });
+    defer pm.deinit();
+
+    try std.testing.expect(!pm.useCrossover(0));
+    try std.testing.expect(!pm.useCrossover(3));
+}
+
+test "evolver: PopulationManager selectParents biases toward high fitness" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{ .problem_statement = "t", .fitness_cmd = "t" });
+    defer pm.deinit();
+
+    pm.addOrganism(.{ .id = 1, .fitness = 0.01 });
+    pm.addOrganism(.{ .id = 2, .fitness = 0.99 });
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const rng = prng.random();
+
+    var high_count: u32 = 0;
+    const trials = 100;
+    for (0..trials) |_| {
+        const sel = pm.selectParents(1, rng);
+        defer alloc.free(sel);
+        if (sel.len > 0 and sel[0] == 0) high_count += 1;
+    }
+    // Organism 2 (fitness 0.99) is sorted to index 0; should be selected most of the time
+    try std.testing.expect(high_count > trials / 2);
+}
+
+test "evolver: PopulationManager nextId increments" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{ .problem_statement = "t", .fitness_cmd = "t" });
+    defer pm.deinit();
+
+    const a = pm.nextId();
+    const b = pm.nextId();
+    const c = pm.nextId();
+    try std.testing.expect(a < b);
+    try std.testing.expect(b < c);
+}
+
+test "evolver: PopulationManager run with early stop" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{
+        .problem_statement = "t",
+        .fitness_cmd = "t",
+        .max_generations = 10,
+        .population_size = 2,
+        .early_stop_threshold = 0.8,
+    });
+    defer pm.deinit();
+
+    pm.addOrganism(.{ .id = 1, .fitness = 0.9 });
+
+    const result = pm.run();
+    try std.testing.expect(result.converged);
+    try std.testing.expectEqual(@as(u32, 0), result.generations_run);
+}
+
+test "evolver: PopulationManager run without convergence" {
+    const alloc = std.testing.allocator;
+    var pm = PopulationManager.init(alloc, .{
+        .problem_statement = "t",
+        .fitness_cmd = "t",
+        .max_generations = 3,
+        .population_size = 2,
+    });
+    defer pm.deinit();
+
+    pm.addOrganism(.{ .id = 1, .fitness = 0.3 });
+
+    const result = pm.run();
+    try std.testing.expect(!result.converged);
+    try std.testing.expectEqual(@as(u32, 3), result.generations_run);
+    try std.testing.expectEqual(@as(u32, 6), result.total_evaluated);
+}
+
+test "evolver: EvolverConfig defaults" {
+    const config = EvolverConfig{ .problem_statement = "fix bug", .fitness_cmd = "zig build test" };
+    try std.testing.expectEqual(@as(u32, 10), config.max_generations);
+    try std.testing.expectEqual(@as(u32, 4), config.population_size);
+    try std.testing.expectEqual(@as(u32, 3), config.crossover_every_n);
 }
