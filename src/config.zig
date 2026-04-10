@@ -93,7 +93,7 @@ fn parse(alloc: std.mem.Allocator, text: []const u8) !Config {
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key   = std.mem.trim(u8, line[0..eq],    " \t");
         const raw_v = std.mem.trim(u8, line[eq + 1..], " \t");
-        const val   = stripQuotes(raw_v);
+        const val   = stripQuotes(stripInlineComment(raw_v));
 
         try applyKV(alloc, &cfg, section, key, val);
     }
@@ -162,6 +162,27 @@ fn stripQuotes(s: []const u8) []const u8 {
     return s;
 }
 
+/// Strip inline `# comment` from a raw value.
+/// Quoted strings are returned up through the closing quote (comment after
+/// the closing quote is discarded). Unquoted values are trimmed at the first
+/// `#` that is preceded by whitespace.
+fn stripInlineComment(s: []const u8) []const u8 {
+    if (s.len == 0) return s;
+    if (s[0] == '"' or s[0] == '\'') {
+        const quote = s[0];
+        if (std.mem.indexOfScalar(u8, s[1..], quote)) |close| {
+            return s[0 .. close + 2];
+        }
+        return s;
+    }
+    for (s, 0..) |c, i| {
+        if (c == '#' and i > 0 and (s[i - 1] == ' ' or s[i - 1] == '\t')) {
+            return std.mem.trimRight(u8, s[0..i], " \t");
+        }
+    }
+    return s;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "config: parse primary and claude_default" {
@@ -214,6 +235,44 @@ test "config: comments and blank lines are skipped" {
     defer cfg.deinit(alloc);
 
     try std.testing.expectEqualStrings("auto", cfg.primary.?);
+}
+
+test "config: inline comments are stripped from unquoted values" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[provider]
+        \\primary = claude # use claude as default
+        \\claude_default = opus  # fast model
+    ;
+    var cfg = try parse(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqualStrings("claude", cfg.primary.?);
+    try std.testing.expectEqualStrings("opus", cfg.claude_default.?);
+}
+
+test "config: inline comments are NOT stripped inside quoted values" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[provider]
+        \\primary = "claude # not a comment"
+    ;
+    var cfg = try parse(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqualStrings("claude # not a comment", cfg.primary.?);
+}
+
+test "config: hash without preceding space is not a comment" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[provider]
+        \\primary = color#abc
+    ;
+    var cfg = try parse(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqualStrings("color#abc", cfg.primary.?);
 }
 
 test "config: loadDefault handles presence or absence of config file" {
