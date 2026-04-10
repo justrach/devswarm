@@ -24,6 +24,8 @@ pub const CodeGraph = struct {
     out_edges: std.AutoHashMap(u64, std.ArrayList(Edge)),
     in_edges: std.AutoHashMap(u64, std.ArrayList(Edge)),
     arena: std.heap.ArenaAllocator,
+    file_path_index: std.StringHashMap(u32),
+    symbols_by_file: std.AutoHashMap(u32, std.ArrayList(u64)),
 
     pub fn init(backing: std.mem.Allocator) CodeGraph {
         return .{
@@ -33,26 +35,28 @@ pub const CodeGraph = struct {
             .out_edges = std.AutoHashMap(u64, std.ArrayList(Edge)).init(backing),
             .in_edges = std.AutoHashMap(u64, std.ArrayList(Edge)).init(backing),
             .arena = std.heap.ArenaAllocator.init(backing),
+            .file_path_index = std.StringHashMap(u32).init(backing),
+            .symbols_by_file = std.AutoHashMap(u32, std.ArrayList(u64)).init(backing),
         };
     }
 
     pub fn deinit(self: *CodeGraph) void {
-        // Free all edge ArrayLists
         var out_it = self.out_edges.valueIterator();
         while (out_it.next()) |list| list.deinit(self.out_edges.allocator);
         var in_it = self.in_edges.valueIterator();
         while (in_it.next()) |list| list.deinit(self.in_edges.allocator);
+        var sbf_it = self.symbols_by_file.valueIterator();
+        while (sbf_it.next()) |list| list.deinit(self.symbols_by_file.allocator);
 
         self.out_edges.deinit();
         self.in_edges.deinit();
         self.symbols.deinit();
         self.files.deinit();
         self.commits.deinit();
+        self.file_path_index.deinit();
+        self.symbols_by_file.deinit();
         self.arena.deinit();
     }
-
-    // ── Mutations ───────────────────────────────────────────────────────
-
     pub fn addSymbol(self: *CodeGraph, sym: Symbol) !void {
         const alloc = self.arena.allocator();
         const name = try alloc.dupe(u8, sym.name);
@@ -66,6 +70,10 @@ pub const CodeGraph = struct {
             .col = sym.col,
             .scope = scope,
         });
+
+        const gop = try self.symbols_by_file.getOrPut(sym.file_id);
+        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u64).empty;
+        try gop.value_ptr.append(self.symbols_by_file.allocator, sym.id);
     }
 
     pub fn addFile(self: *CodeGraph, file: File) !void {
@@ -78,6 +86,7 @@ pub const CodeGraph = struct {
             .last_modified = file.last_modified,
             .hash = file.hash,
         });
+        try self.file_path_index.put(path, file.id);
     }
 
     pub fn addCommit(self: *CodeGraph, commit: Commit) !void {
@@ -115,6 +124,32 @@ pub const CodeGraph = struct {
         in.value_ptr.appendAssumeCapacity(edge);
     }
 
+    pub fn findFileByPath(self: *const CodeGraph, path: []const u8) ?u32 {
+        return self.file_path_index.get(path);
+    }
+
+    pub fn symbolsInFile(self: *const CodeGraph, file_id: u32) []const u64 {
+        const list = self.symbols_by_file.get(file_id) orelse return &.{};
+        return list.items;
+    }
+
+    pub fn rebuildIndexes(self: *CodeGraph) !void {
+        self.file_path_index.clearAndFree();
+        self.symbols_by_file.clearAndFree();
+
+        var fit = self.files.iterator();
+        while (fit.next()) |entry| {
+            try self.file_path_index.put(entry.value_ptr.path, entry.key_ptr.*);
+        }
+
+        var sit = self.symbols.iterator();
+        while (sit.next()) |entry| {
+            const sym = entry.value_ptr.*;
+            const gop = try self.symbols_by_file.getOrPut(sym.file_id);
+            if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u64).empty;
+            try gop.value_ptr.append(self.symbols_by_file.allocator, sym.id);
+        }
+    }
     // ── Queries ─────────────────────────────────────────────────────────
 
     pub fn getSymbol(self: *const CodeGraph, id: u64) ?Symbol {
