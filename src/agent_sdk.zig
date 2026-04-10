@@ -13,9 +13,6 @@
 //   {"type":"result","subtype":"success","result":"<final text>",...}
 
 const std = @import("std");
-const mj  = @import("mcp").json;
-
-/// Options for a Claude agent run via `claude -p`.
 /// Options for a Claude agent run via `claude -p`.
 pub const AgentOptions = struct {
     /// Comma-separated tool allowlist, e.g. "Bash,Read,Edit".
@@ -56,12 +53,6 @@ pub fn runAgent(
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Attempts to run the turn via `claude -p`. Returns false when claude is
-/// unavailable so the caller can fall back to codex_appserver.
-/// Attempts to run the turn via `claude -p`. Returns false when claude is
-/// unavailable so the caller can fall back to codex_appserver.
-/// Attempts to run the turn via `claude -p`. Returns false when claude is
-/// unavailable so the caller can fall back to codex_appserver.
 /// Attempts to run the turn via `claude -p`. Returns false when claude is
 /// unavailable so the caller can fall back to codex_appserver.
 pub fn tryClaudeAgent(
@@ -168,9 +159,6 @@ pub fn tryClaudeAgent(
     return true;
 }
 
-/// Reads NDJSON from `claude -p --output-format stream-json`.
-/// Extracts the agent's final text from the `{"type":"result"}` event.
-/// Falls back to accumulated assistant-message text if no result event arrives.
 /// Reads NDJSON from `claude -p --output-format stream-json`.
 /// Extracts the agent's final text from the `{"type":"result"}` event.
 /// Falls back to accumulated assistant-message text if no result event arrives.
