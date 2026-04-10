@@ -1805,8 +1805,29 @@ fn handleRecentlyChanged(
 
 const GRAPH_PATH = ".codegraph/graph.bin";
 
-fn loadGraph(alloc: std.mem.Allocator) ?graph_mod.CodeGraph {
-    return graph_store.loadFromFile(GRAPH_PATH, alloc) catch return null;
+var graph_cache: ?graph_mod.CodeGraph = null;
+var graph_cache_mtime: i128 = 0;
+
+fn getFileMtime(path: []const u8) i128 {
+    const file = std.fs.cwd().openFile(path, .{}) catch return 0;
+    defer file.close();
+    const stat = file.stat() catch return 0;
+    return stat.mtime;
+}
+
+fn loadGraph(alloc: std.mem.Allocator) ?*graph_mod.CodeGraph {
+    const mtime = getFileMtime(GRAPH_PATH);
+    if (graph_cache != null and mtime != 0 and mtime == graph_cache_mtime) {
+        return &graph_cache.?;
+    }
+    if (graph_cache) |*old| {
+        old.deinit();
+        graph_cache = null;
+    }
+    const g = graph_store.loadFromFile(GRAPH_PATH, alloc) catch return null;
+    graph_cache = g;
+    graph_cache_mtime = mtime;
+    return &graph_cache.?;
 }
 
 fn handleSymbolAt(
@@ -1824,13 +1845,12 @@ fn handleSymbolAt(
     };
     const line: u32 = @intCast(@max(line_val, 0));
 
-    var g = loadGraph(alloc) orelse {
+    const g = loadGraph(alloc) orelse {
         writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
         return;
     };
-    defer g.deinit();
 
-    const results = graph_query.symbolAt(&g, file, line, alloc) catch {
+    const results = graph_query.symbolAt(g, file, line, alloc) catch {
         writeErr(alloc, out, "query failed");
         return;
     };
@@ -1855,13 +1875,12 @@ fn handleFindCallers(
     };
     const id: u64 = @intCast(@max(sym_id, 0));
 
-    var g = loadGraph(alloc) orelse {
+    const g = loadGraph(alloc) orelse {
         writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
         return;
     };
-    defer g.deinit();
 
-    const results = graph_query.findCallers(&g, id, alloc) catch {
+    const results = graph_query.findCallers(g, id, alloc) catch {
         writeErr(alloc, out, "query failed");
         return;
     };
@@ -1886,13 +1905,12 @@ fn handleFindCallees(
     };
     const id: u64 = @intCast(@max(sym_id, 0));
 
-    var g = loadGraph(alloc) orelse {
+    const g = loadGraph(alloc) orelse {
         writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
         return;
     };
-    defer g.deinit();
 
-    const results = graph_query.findCallees(&g, id, alloc) catch {
+    const results = graph_query.findCallees(g, id, alloc) catch {
         writeErr(alloc, out, "query failed");
         return;
     };
@@ -1920,13 +1938,12 @@ fn handleFindDependents(
     const max_results_val = mj.getInt(args, "max_results");
     const max_results: usize = if (max_results_val) |v| @intCast(@max(v, 1)) else 10;
 
-    var g = loadGraph(alloc) orelse {
+    const g = loadGraph(alloc) orelse {
         writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
         return;
     };
-    defer g.deinit();
 
-    const results = graph_query.findDependents(&g, id, max_results, alloc) catch {
+    const results = graph_query.findDependents(g, id, max_results, alloc) catch {
         writeErr(alloc, out, "query failed");
         return;
     };
