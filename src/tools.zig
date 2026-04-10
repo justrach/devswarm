@@ -254,6 +254,8 @@ pub const Tool = enum {
     find_dependents,
     // Repository management
     set_repo,
+    // Graph ingestion
+    ingest_repo,
     // Agents — invoke Codex subagents as MCP tool calls
     run_reviewer,
     run_explorer,
@@ -307,6 +309,7 @@ pub const tools_list =
     \\{"name":"find_callees","description":"Find all symbols that the given symbol calls/references. Returns callee name, location, edge kind, and weight. Requires a CodeGraph DB file at .codegraph/graph.bin.","inputSchema":{"type":"object","properties":{"symbol_id":{"type":"integer","description":"Symbol ID to find callees of"}},"required":["symbol_id"]}},
     \\{"name":"find_dependents","description":"Find all symbols that transitively depend on the given symbol, ranked by Personalized PageRank score. Use this to understand the full blast radius of changing a symbol. Requires a CodeGraph DB file at .codegraph/graph.bin.","inputSchema":{"type":"object","properties":{"symbol_id":{"type":"integer","description":"Symbol ID to find dependents of"},"max_results":{"type":"integer","description":"Maximum number of results to return (default 10)"}},"required":["symbol_id"]}},
     \\{"name":"set_repo","description":"Switch the active repository path. All subsequent tool calls will operate against this repo. Invalidates the session cache.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the git repository root"}},"required":["path"]}},
+    \\{"name":"ingest_repo","description":"Walk all source files in the current repo, extract symbols and import edges, and write the CodeGraph to .codegraph/graph.bin. This makes graph query tools (symbol_at, find_callers, find_callees, find_dependents) operational. Re-running re-ingests from scratch.","inputSchema":{"type":"object","properties":{"extensions":{"type":"string","description":"Comma-separated file extensions to ingest (default: .ts,.tsx,.js,.jsx,.zig,.py)"}},"required":[]}},
     \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":[]}},
     \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
@@ -370,6 +373,7 @@ pub fn dispatch(
         .find_dependents => handleFindDependents(alloc, args, out),
         // Repository management
         .set_repo => handleSetRepo(alloc, args, out),
+        .ingest_repo => handleIngestRepo(alloc, args, out),
         // Agents
         .run_reviewer => handleRunReviewer(alloc, args, out),
         .run_explorer => handleRunExplorer(alloc, args, out),
@@ -2291,6 +2295,102 @@ fn handleSetRepo(
         out.appendSlice(alloc, "(not detected)") catch {};
     }
     out.appendSlice(alloc, "\"}") catch return;
+}
+
+fn handleIngestRepo(
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+) void {
+    const ingest = @import("graph/ingest.zig");
+
+    const default_exts = ".ts,.tsx,.js,.jsx,.zig,.py";
+    const ext_str = mj.getStr(args, "extensions") orelse default_exts;
+
+    var extensions: std.ArrayList([]const u8) = .empty;
+    defer extensions.deinit(alloc);
+    var ext_it = std.mem.splitScalar(u8, ext_str, ',');
+    while (ext_it.next()) |ext| {
+        const trimmed = std.mem.trim(u8, ext, " \t");
+        if (trimmed.len > 0) extensions.append(alloc, trimmed) catch {};
+    }
+
+    var graph = graph_mod.CodeGraph.init(alloc);
+    var ing = ingest.Ingester.init(&graph, alloc);
+
+    var file_count: u32 = 0;
+    var sym_count: usize = 0;
+
+    walkAndIngest(alloc, ".", extensions.items, &ing, &file_count) catch |err| {
+        var msg: [256]u8 = undefined;
+        const s = std.fmt.bufPrint(&msg, "walk failed: {}", .{err}) catch "walk failed";
+        writeErr(alloc, out, s);
+        graph.deinit();
+        return;
+    };
+
+    sym_count = graph.symbolCount();
+
+    std.fs.cwd().makePath(".codegraph") catch |err| {
+        var msg: [256]u8 = undefined;
+        const s = std.fmt.bufPrint(&msg, "mkdir .codegraph failed: {}", .{err}) catch "mkdir failed";
+        writeErr(alloc, out, s);
+        graph.deinit();
+        return;
+    };
+
+    graph_store.saveToFile(&graph, GRAPH_PATH) catch |err| {
+        var msg: [256]u8 = undefined;
+        const s = std.fmt.bufPrint(&msg, "saveToFile failed: {}", .{err}) catch "save failed";
+        writeErr(alloc, out, s);
+        graph.deinit();
+        return;
+    };
+    graph.deinit();
+
+    var buf: [256]u8 = undefined;
+    const resp = std.fmt.bufPrint(&buf,
+        "{{\"ok\":true,\"files_ingested\":{d},\"symbols_extracted\":{d},\"graph_path\":\"{s}\"}}",
+        .{ file_count, sym_count, GRAPH_PATH },
+    ) catch "{\"ok\":true}";
+    out.appendSlice(alloc, resp) catch {};
+}
+
+fn walkAndIngest(
+    alloc: std.mem.Allocator,
+    root: []const u8,
+    extensions: []const []const u8,
+    ing: *@import("graph/ingest.zig").Ingester,
+    file_count: *u32,
+) !void {
+    var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
+    defer dir.close();
+
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const path = entry.path;
+
+        if (std.mem.indexOf(u8, path, "node_modules/") != null) continue;
+        if (std.mem.indexOf(u8, path, ".zig-cache/") != null) continue;
+        if (std.mem.indexOf(u8, path, "zig-out/") != null) continue;
+        if (std.mem.startsWith(u8, path, ".")) continue;
+
+        var matched = false;
+        for (extensions) |ext| {
+            if (std.mem.endsWith(u8, path, ext)) { matched = true; break; }
+        }
+        if (!matched) continue;
+
+        const content = dir.readFileAlloc(alloc, path, 10 * 1024 * 1024) catch continue;
+        defer alloc.free(content);
+
+        if (ing.ingestSource(path, content) catch null) |_| {
+            file_count.* += 1;
+        }
+    }
 }
 
 fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
