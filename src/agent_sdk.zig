@@ -686,6 +686,83 @@ test "integration: agent_sdk model param is forwarded" {
     }
 }
 
+test "agent_sdk: parseClaudeLine extracts usage from result event" {
+    const alloc = std.testing.allocator;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
+
+    const line =
+        \\{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":100,"cache_creation_input_tokens":50,"cache_read_input_tokens":25,"output_tokens":200},"session_id":"s1"}
+    ;
+    parseClaudeLine(alloc, line, &out, &accumulated, &found, &ti, &to);
+
+    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(u64, 175), ti);
+    try std.testing.expectEqual(@as(u64, 200), to);
+}
+
+test "agent_sdk: parseClaudeLine accumulates usage from assistant events" {
+    const alloc = std.testing.allocator;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
+
+    parseClaudeLine(alloc,
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"a"}],"usage":{"input_tokens":10,"output_tokens":5}},"session_id":"s1"}
+    , &out, &accumulated, &found, &ti, &to);
+    parseClaudeLine(alloc,
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"b"}],"usage":{"input_tokens":20,"output_tokens":8}},"session_id":"s1"}
+    , &out, &accumulated, &found, &ti, &to);
+
+    try std.testing.expectEqual(@as(u64, 30), ti);
+    try std.testing.expectEqual(@as(u64, 13), to);
+}
+
+test "agent_sdk: AgentOptions defaults" {
+    const opts = AgentOptions{};
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.allowed_tools);
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.permission_mode);
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.cwd);
+    try std.testing.expect(!opts.writable);
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.model);
+}
+
+test "agent_sdk: parseClaudeLine result usage replaces assistant accumulation" {
+    const alloc = std.testing.allocator;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(alloc);
+    var found = false;
+    var ti: u64 = 0;
+    var to: u64 = 0;
+
+    // Assistant event accumulates usage
+    parseClaudeLine(alloc,
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"x"}],"usage":{"input_tokens":999,"output_tokens":888}},"session_id":"s1"}
+    , &out, &accumulated, &found, &ti, &to);
+    try std.testing.expectEqual(@as(u64, 999), ti);
+
+    // Result event replaces input with authoritative number
+    parseClaudeLine(alloc,
+        \\{"type":"result","subtype":"success","result":"final","usage":{"input_tokens":50,"output_tokens":30},"session_id":"s1"}
+    , &out, &accumulated, &found, &ti, &to);
+    try std.testing.expectEqual(@as(u64, 50), ti);
+    try std.testing.expectEqual(@as(u64, 30), to);
+}
+
 test "agent_sdk: stripCodexEnv removes CODEX_* vars but preserves unrelated env" {
     const alloc = std.testing.allocator;
     var env = std.process.EnvMap.init(alloc);
