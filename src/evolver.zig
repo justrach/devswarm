@@ -63,6 +63,23 @@ pub const PromptVariant = struct {
     behavior: BehaviorDescriptor,
 };
 
+/// A code-patch organism: a candidate solution to a coding problem.
+pub const Organism = struct {
+    id: u64,
+    parent_id: ?u64 = null,
+    parent_ids: ?[]const u64 = null,
+    generation: u32 = 0,
+    explanation: []const u8 = "",
+    diff: []const u8 = "",
+    fitness: f64 = 0.0,
+    problem_hash: []const u8 = "",
+};
+
+pub const FailureCase = struct {
+    test_name: []const u8,
+    snippet: []const u8,
+};
+
 pub const EvaluationResult = struct {
     success: bool,
     tokens_in: u64,
@@ -269,6 +286,141 @@ pub const Archive = struct {
             };
             _ = try self.insert(v);
         }
+    }
+};
+
+// ── CrossoverMutator (#154) ───────────────────────────────────────────────────
+//
+// Multi-parent synthesis: builds a prompt showing top-K parent organisms,
+// asks the LLM to combine their best insights into a single improved patch.
+
+/// Build a crossover prompt from multiple parent organisms.
+pub fn buildCrossoverPrompt(
+    alloc: std.mem.Allocator,
+    problem: []const u8,
+    parents: []const Organism,
+    history: []const u8,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(alloc);
+
+    try w.writeAll("Problem:\n");
+    try w.writeAll(if (problem.len > 1000) problem[0..1000] else problem);
+    try w.writeAll("\n\nTop-performing solutions so far:\n");
+
+    for (parents, 0..) |p, i| {
+        var idx_buf: [64]u8 = undefined;
+        const idx_s = std.fmt.bufPrint(&idx_buf, "\n  [Parent {d} — fitness {:.3}]\n", .{ i + 1, p.fitness }) catch "\n  [Parent]\n";
+        try w.writeAll(idx_s);
+        try w.writeAll("  Explanation: ");
+        try w.writeAll(if (p.explanation.len > 400) p.explanation[0..400] else p.explanation);
+        try w.writeAll("\n  Diff:\n");
+        try w.writeAll(if (p.diff.len > 2000) p.diff[0..2000] else p.diff);
+        try w.writeAll("\n");
+    }
+
+    if (history.len > 0) {
+        try w.writeAll("\nPast attempts:\n");
+        try w.writeAll(if (history.len > 2000) history[0..2000] else history);
+        try w.writeAll("\n");
+    }
+
+    try w.writeAll(
+        \\
+        \\Synthesize the best insights from all solutions into a single improved patch.
+        \\Explain what you're combining and why.
+        \\
+        \\Respond with EXACTLY this format:
+        \\
+        \\EXPLANATION:
+        \\<your explanation here>
+        \\
+        \\DIFF:
+        \\```diff
+        \\<your unified diff here>
+        \\```
+    );
+
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Parse LLM response to extract explanation and diff sections.
+pub fn parseMutationResponse(response: []const u8) ?struct { explanation: []const u8, diff: []const u8 } {
+    const expl_start = std.mem.indexOf(u8, response, "EXPLANATION:") orelse return null;
+    const expl_body_start = expl_start + "EXPLANATION:".len;
+
+    const diff_marker = std.mem.indexOf(u8, response[expl_body_start..], "DIFF:") orelse return null;
+    const explanation = std.mem.trim(u8, response[expl_body_start .. expl_body_start + diff_marker], " \t\r\n");
+
+    const diff_section_start = expl_body_start + diff_marker + "DIFF:".len;
+    const diff_content = std.mem.trim(u8, response[diff_section_start..], " \t\r\n");
+
+    const stripped = blk: {
+        if (std.mem.startsWith(u8, diff_content, "```diff")) {
+            const inner_start = std.mem.indexOf(u8, diff_content, "\n") orelse break :blk diff_content;
+            if (std.mem.lastIndexOf(u8, diff_content, "```")) |end| {
+                if (end > inner_start) {
+                    break :blk std.mem.trim(u8, diff_content[inner_start + 1 .. end], " \t\r\n");
+                }
+            }
+            break :blk std.mem.trim(u8, diff_content[inner_start + 1 ..], " \t\r\n");
+        }
+        if (std.mem.startsWith(u8, diff_content, "```")) {
+            const inner_start = std.mem.indexOf(u8, diff_content, "\n") orelse break :blk diff_content;
+            if (std.mem.lastIndexOf(u8, diff_content, "```")) |end| {
+                if (end > inner_start) {
+                    break :blk std.mem.trim(u8, diff_content[inner_start + 1 .. end], " \t\r\n");
+                }
+            }
+        }
+        break :blk diff_content;
+    };
+
+    if (stripped.len == 0) return null;
+    return .{ .explanation = explanation, .diff = stripped };
+}
+
+pub const CrossoverMutator = struct {
+    k: u32,
+    model: []const u8,
+    alloc: std.mem.Allocator,
+    next_id: u64 = 2000,
+
+    pub fn init(alloc: std.mem.Allocator, model: []const u8, k: u32) CrossoverMutator {
+        return .{ .k = k, .model = model, .alloc = alloc };
+    }
+
+    /// Create a child organism by combining the top-K parents.
+    /// In production this calls the LLM; prompt and parsing are testable separately.
+    pub fn crossover(
+        self: *CrossoverMutator,
+        parents: []const Organism,
+        history: []const u8,
+        problem: []const u8,
+    ) !Organism {
+        const count = @min(parents.len, @as(usize, self.k));
+        if (count == 0) return error.NoParents;
+
+        const prompt = try buildCrossoverPrompt(self.alloc, problem, parents[0..count], history);
+        defer self.alloc.free(prompt);
+
+        // Placeholder: in production, this calls the LLM.
+        const id = self.next_id;
+        self.next_id += 1;
+
+        var parent_ids = try self.alloc.alloc(u64, count);
+        for (parents[0..count], 0..) |p, i| parent_ids[i] = p.id;
+
+        return Organism{
+            .id = id,
+            .parent_id = parents[0].id,
+            .parent_ids = parent_ids,
+            .generation = parents[0].generation + 1,
+            .explanation = "crossover pending LLM integration",
+            .diff = "",
+            .fitness = 0.0,
+            .problem_hash = parents[0].problem_hash,
+        };
     }
 };
 
@@ -792,4 +944,91 @@ test "evolver: archive sampling across multiple roles" {
         @as(?[]const u8, null),
         resolvePromptForRole(&ar, "nonexistent_role", rng),
     );
+}
+
+// ── CrossoverMutator tests (#154) ────────────────────────────────────────────
+
+test "evolver: buildCrossoverPrompt includes all parents" {
+    const alloc = std.testing.allocator;
+    const parents = [_]Organism{
+        .{ .id = 1, .fitness = 0.7, .explanation = "Added null check", .diff = "--- a/x\n+++ b/x\n+check", .problem_hash = "h" },
+        .{ .id = 2, .fitness = 0.6, .explanation = "Changed return type", .diff = "--- a/y\n+++ b/y\n+ret", .problem_hash = "h" },
+        .{ .id = 3, .fitness = 0.5, .explanation = "Refactored loop", .diff = "--- a/z\n+++ b/z\n+loop", .problem_hash = "h" },
+    };
+    const prompt = try buildCrossoverPrompt(alloc, "Fix timeout bug", &parents, "");
+    defer alloc.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Parent 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Parent 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Parent 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "null check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Changed return") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Refactored loop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Synthesize") != null);
+}
+
+test "evolver: buildCrossoverPrompt with history" {
+    const alloc = std.testing.allocator;
+    const parents = [_]Organism{
+        .{ .id = 1, .fitness = 0.8, .problem_hash = "h" },
+    };
+    const prompt = try buildCrossoverPrompt(alloc, "problem", &parents, "prev attempt failed");
+    defer alloc.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "prev attempt") != null);
+}
+
+test "evolver: parseMutationResponse valid" {
+    const response =
+        \\EXPLANATION:
+        \\Combined null check with return type fix.
+        \\
+        \\DIFF:
+        \\```diff
+        \\--- a/src/auth.zig
+        \\+++ b/src/auth.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\```
+    ;
+    const parsed = parseMutationResponse(response) orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, parsed.explanation, "Combined") != null);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.diff, "--- a/src/auth.zig"));
+}
+
+test "evolver: parseMutationResponse returns null on garbage" {
+    try std.testing.expect(parseMutationResponse("no structure here") == null);
+}
+
+test "evolver: CrossoverMutator.crossover creates child from parents" {
+    const alloc = std.testing.allocator;
+    var cm = CrossoverMutator.init(alloc, "claude-test", 3);
+    const parents = [_]Organism{
+        .{ .id = 10, .fitness = 0.9, .generation = 2, .problem_hash = "ph" },
+        .{ .id = 20, .fitness = 0.7, .generation = 2, .problem_hash = "ph" },
+    };
+    const child = try cm.crossover(&parents, "", "fix it");
+    defer alloc.free(child.parent_ids.?);
+
+    try std.testing.expectEqual(@as(u64, 10), child.parent_id.?);
+    try std.testing.expectEqual(@as(u32, 3), child.generation);
+    try std.testing.expectEqual(@as(usize, 2), child.parent_ids.?.len);
+    try std.testing.expectEqual(@as(u64, 10), child.parent_ids.?[0]);
+    try std.testing.expectEqual(@as(u64, 20), child.parent_ids.?[1]);
+}
+
+test "evolver: CrossoverMutator.crossover caps at k parents" {
+    const alloc = std.testing.allocator;
+    var cm = CrossoverMutator.init(alloc, "test", 2);
+    const parents = [_]Organism{
+        .{ .id = 1, .fitness = 0.9, .generation = 1, .problem_hash = "x" },
+        .{ .id = 2, .fitness = 0.8, .generation = 1, .problem_hash = "x" },
+        .{ .id = 3, .fitness = 0.7, .generation = 1, .problem_hash = "x" },
+    };
+    const child = try cm.crossover(&parents, "", "problem");
+    defer alloc.free(child.parent_ids.?);
+
+    // k=2 so only first 2 parents should be used
+    try std.testing.expectEqual(@as(usize, 2), child.parent_ids.?.len);
 }
