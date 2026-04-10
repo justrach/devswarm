@@ -188,20 +188,15 @@ pub fn deserialize(reader: anytype, alloc: std.mem.Allocator) !CodeGraph {
 
 // ── File I/O convenience ────────────────────────────────────────────────────
 
-/// Save a CodeGraph to a file path.
-pub fn saveToFile(g: *const CodeGraph, path: []const u8) !void {
+/// Save a CodeGraph to a file path. `alloc` is used for the serialization buffer.
+pub fn saveToFile(g: *const CodeGraph, path: []const u8, alloc: std.mem.Allocator) !void {
     const file = try std.fs.cwd().createFile(path, .{});
     defer file.close();
-    // Serialize to in-memory buffer, then write all at once
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc_for_save);
-    try serialize(g, buf.writer(alloc_for_save));
+    defer buf.deinit(alloc);
+    try serialize(g, buf.writer(alloc));
     try file.writeAll(buf.items);
 }
-
-/// Temporary allocator for saveToFile — uses page_allocator since we
-/// don't have access to a caller-provided allocator in the current API.
-const alloc_for_save = std.heap.page_allocator;
 
 /// Load a CodeGraph from a file path.
 pub fn loadFromFile(path: []const u8, alloc: std.mem.Allocator) !CodeGraph {
@@ -878,4 +873,26 @@ test "round-trip with empty strings everywhere" {
     try std.testing.expectEqualStrings("", g2.getFile(1).?.path);
     try std.testing.expectEqualStrings("", g2.getCommit(1).?.author);
     try std.testing.expectEqualStrings("", g2.getCommit(1).?.message);
+}
+
+test "saveToFile and loadFromFile round-trip (#405)" {
+    const alloc = std.testing.allocator;
+    var g = CodeGraph.init(alloc);
+    defer g.deinit();
+
+    try g.addSymbol(.{ .id = 1, .name = "foo", .kind = .function, .file_id = 1, .line = 5, .col = 0, .scope = "mod" });
+    try g.addFile(.{ .id = 1, .path = "a.zig", .language = .zig, .last_modified = 100, .hash = [_]u8{0xAB} ** 32 });
+    try g.addEdge(.{ .src = 1, .dst = 1, .kind = .calls, .weight = 3.0 });
+
+    const tmp = "test_save_load_405.bin";
+    try saveToFile(&g, tmp, alloc);
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    var g2 = try loadFromFile(tmp, alloc);
+    defer g2.deinit();
+
+    try std.testing.expectEqual(g.symbolCount(), g2.symbolCount());
+    try std.testing.expectEqual(g.files.count(), g2.files.count());
+    try std.testing.expectEqual(g.edgeCount(), g2.edgeCount());
+    try std.testing.expectEqualStrings("foo", g2.getSymbol(1).?.name);
 }
