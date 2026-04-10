@@ -268,6 +268,8 @@ pub const Tool = enum {
     run_agent,
     // Smart executor — picks strategy, roles, and models automatically
     run_task,
+    // Evolutionary code improvement
+    run_evolver,
 };
 
 // ── Step 2: Tool schemas ──────────────────────────────────────────────────────
@@ -315,6 +317,7 @@ pub const tools_list =
     \\{\"name\":\"review_fix_loop\",\"description\":\"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Override the default review criteria\"},\"max_iterations\":{\"type\":\"integer\",\"description\":\"Maximum review-fix cycles (default 3, max 5)\"}},\"required\":[]}},
     \\{\"name\":\"run_agent\",\"description\":\"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for the agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: claude-sonnet-4-6). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap.\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)\"},\"allowed_tools\":{\"type\":\"string\",\"description\":\"Comma-separated tool allowlist, e.g. \\\"Bash,Read,Edit\\\". Omit to allow all tools.\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow file writes (maps to bypassPermissions when permission_mode is unset)\"},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory override (default: current repo path)\"}},\"required\":[\"prompt\"]}},
     \\{\"name\":\"run_task\",\"description\":\"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"Task description — what needs to be done\"},\"preset\":{\"type\":\"string\",\"enum\":[\"finder_fixer\",\"reviewer_fixer\",\"explore_report\",\"architect_build\",\"custom\"],\"description\":\"Chain preset (default: auto-select based on task)\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode for all agents in the chain\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Max agents to spawn (default: preset-determined)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Override write access (default: role-determined)\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"Maximum total time for the full chain (default 300, max 600)\"}},\"required\":[\"task\"]}}
+    \\,{\"name\":\"run_evolver\",\"description\":\"Start an evolutionary run to find a code fix. Generates candidate patches, evaluates fitness via fitness_cmd, and iterates across generations using LLM mutation + crossover. Returns the best solution found.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"problem_statement\":{\"type\":\"string\",\"description\":\"Describe the bug or desired behavior\"},\"fitness_cmd\":{\"type\":\"string\",\"description\":\"Shell command to evaluate fitness (e.g. zig build test, pytest)\"},\"max_generations\":{\"type\":\"integer\",\"description\":\"Max evolution generations (default: 5)\"},\"population_size\":{\"type\":\"integer\",\"description\":\"Organisms per generation (default: 4)\"}},\"required\":[\"problem_statement\",\"fitness_cmd\"]}}
     \\]}
 ;
 
@@ -384,6 +387,8 @@ pub fn dispatch(
         .run_agent => handleRunAgent(alloc, args, out),
         // Smart executor
         .run_task => handleRunTask(alloc, args, out),
+        // Evolutionary code improvement
+        .run_evolver => handleRunEvolver(alloc, args, out),
     }
 }
 
@@ -2291,6 +2296,56 @@ fn handleSetRepo(
         out.appendSlice(alloc, "(not detected)") catch {};
     }
     out.appendSlice(alloc, "\"}") catch return;
+}
+
+fn handleRunEvolver(
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+) void {
+    const evolver = @import("evolver.zig");
+
+    const problem = mj.getStr(args, "problem_statement") orelse {
+        writeErr(alloc, out, "run_evolver requires 'problem_statement'");
+        return;
+    };
+    const fitness_cmd = mj.getStr(args, "fitness_cmd") orelse {
+        writeErr(alloc, out, "run_evolver requires 'fitness_cmd'");
+        return;
+    };
+
+    const max_gen: u32 = if (mj.getInt(args, "max_generations")) |v|
+        @intCast(@min(@max(v, 1), 20))
+    else
+        5;
+    const pop_size: u32 = if (mj.getInt(args, "population_size")) |v|
+        @intCast(@min(@max(v, 1), 16))
+    else
+        4;
+
+    var pm = evolver.PopulationManager.init(alloc, .{
+        .problem_statement = problem,
+        .fitness_cmd = fitness_cmd,
+        .max_generations = max_gen,
+        .population_size = pop_size,
+    });
+    defer pm.deinit();
+
+    const result = pm.run();
+
+    out.appendSlice(alloc, "{\"best_diff\":\"") catch return;
+    mj.writeEscaped(alloc, out, result.best_organism.diff);
+    out.appendSlice(alloc, "\",\"explanation\":\"") catch return;
+    mj.writeEscaped(alloc, out, result.best_organism.explanation);
+
+    var buf: [256]u8 = undefined;
+    const meta = std.fmt.bufPrint(&buf, "\",\"best_fitness\":{:.4},\"generations_run\":{d},\"population_evaluated\":{d},\"converged\":{s}}}", .{
+        result.best_organism.fitness,
+        result.generations_run,
+        result.total_evaluated,
+        if (result.converged) "true" else "false",
+    }) catch "\"}";
+    out.appendSlice(alloc, meta) catch {};
 }
 
 fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
