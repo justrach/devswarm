@@ -17,112 +17,19 @@ const gh = @import("gh.zig");
 const cache = @import("cache.zig");
 const state = @import("state.zig");
 const search = @import("search.zig");
-const graph_query = @import("graph/query.zig");
-const graph_mod = @import("graph/graph.zig");
-const graph_store = @import("graph/storage.zig");
+const repo_mod = @import("repo.zig");
+const graph_tools = @import("graph_tools.zig");
 
-// ── Dynamic repo slug ─────────────────────────────────────────────────────────
-// Updated from CWD on startup (notifications/initialized) and on every set_repo.
-// MCP dispatch is single-threaded; mutex is belt-and-suspenders for drainer threads.
-var g_repo_mu: std.Thread.Mutex = .{};
-var g_repo_buf: [512]u8 = undefined;
-var g_repo_len: usize = 0;
+pub const currentRepo = repo_mod.currentRepo;
+pub const detectAndUpdateRepo = repo_mod.detectAndUpdateRepo;
 
-/// Returns the current GitHub repo slug (owner/repo), or "" if not detected.
-pub fn currentRepo() []const u8 {
-    g_repo_mu.lock();
-    defer g_repo_mu.unlock();
-    return if (g_repo_len == 0) "" else g_repo_buf[0..g_repo_len];
-}
-
-/// Returns the current repo slug, or writes an error and returns null.
-/// Use this in tool handlers instead of currentRepo() directly.
 fn repoOrErr(alloc: std.mem.Allocator, out: *std.ArrayList(u8)) ?[]const u8 {
-    const repo = currentRepo();
-    if (repo.len == 0) {
+    const slug = repo_mod.currentRepo();
+    if (slug.len == 0) {
         writeErr(alloc, out, "no repository detected — call set_repo with the repo path, or set REPO_PATH env var");
         return null;
     }
-    return repo;
-}
-
-fn setCurrentRepo(slug: []const u8) void {
-    if (slug.len == 0 or slug.len > g_repo_buf.len) return;
-    g_repo_mu.lock();
-    defer g_repo_mu.unlock();
-    @memcpy(g_repo_buf[0..slug.len], slug);
-    g_repo_len = slug.len;
-}
-
-/// Detect the GitHub repo slug from the CWD and update the global.
-/// Tries `gh repo view` first, then falls back to parsing `git remote get-url origin`.
-/// Call after any chdir to keep --repo in sync with the active repository.
-pub fn detectAndUpdateRepo(alloc: std.mem.Allocator) void {
-    // Try gh CLI first (most reliable — handles forks, renames, etc.)
-    const result = gh.run(alloc, &.{ "gh", "repo", "view", "--json", "nameWithOwner" }) catch {
-        detectViaGitRemote(alloc);
-        return;
-    };
-    defer result.deinit(alloc);
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, result.stdout, .{}) catch {
-        detectViaGitRemote(alloc);
-        return;
-    };
-    defer parsed.deinit();
-    if (parsed.value == .object) {
-        if (parsed.value.object.get("nameWithOwner")) |v| {
-            if (v == .string) {
-                setCurrentRepo(v.string);
-                return;
-            }
-        }
-    }
-    // gh succeeded but returned unexpected JSON — fall back to git remote
-    detectViaGitRemote(alloc);
-}
-
-/// Fallback detection: parse owner/repo from `git remote get-url origin`.
-fn detectViaGitRemote(alloc: std.mem.Allocator) void {
-    var child = std.process.Child.init(
-        &.{ "git", "remote", "get-url", "origin" },
-        alloc,
-    );
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Close;
-    child.stdin_behavior = .Close;
-
-    if (child.spawn()) |_| {
-        const stdout = child.stdout orelse return;
-        var buf: [4096]u8 = undefined;
-        const n = stdout.read(&buf) catch return;
-        _ = child.wait() catch {};
-        const url = std.mem.trim(u8, buf[0..n], " \t\r\n");
-        if (parseGitHubSlug(url)) |slug| {
-            setCurrentRepo(slug);
-        }
-    } else |_| {}
-}
-
-/// Extract "owner/repo" from a GitHub remote URL.
-/// Handles https://github.com/owner/repo.git, git@github.com:owner/repo.git,
-/// and ssh://git@github.com/owner/repo.git.
-fn parseGitHubSlug(url: []const u8) ?[]const u8 {
-    const markers = [_][]const u8{ "github.com/", "github.com:" };
-    for (markers) |marker| {
-        if (std.mem.indexOf(u8, url, marker)) |idx| {
-            var slug = url[idx + marker.len ..];
-            if (std.mem.endsWith(u8, slug, ".git")) {
-                slug = slug[0 .. slug.len - 4];
-            }
-            // Must contain exactly one slash (owner/repo)
-            if (std.mem.indexOf(u8, slug, "/") != null and
-                std.mem.lastIndexOf(u8, slug, "/") == std.mem.indexOf(u8, slug, "/"))
-            {
-                return slug;
-            }
-        }
-    }
-    return null;
+    return slug;
 }
 
 // ── Step 1: Tool enum ─────────────────────────────────────────────────────────
@@ -275,10 +182,10 @@ pub fn dispatch(
         .git_history_for => handleGitHistoryFor(alloc, args, out),
         .recently_changed => handleRecentlyChanged(alloc, args, out),
         // Graph queries
-        .symbol_at => handleSymbolAt(alloc, args, out),
-        .find_callers => handleFindCallers(alloc, args, out),
-        .find_callees => handleFindCallees(alloc, args, out),
-        .find_dependents => handleFindDependents(alloc, args, out),
+        .symbol_at => graph_tools.handleSymbolAt(alloc, args, out),
+        .find_callers => graph_tools.handleFindCallers(alloc, args, out),
+        .find_callees => graph_tools.handleFindCallees(alloc, args, out),
+        .find_dependents => graph_tools.handleFindDependents(alloc, args, out),
         // Repository management
         .set_repo => handleSetRepo(alloc, args, out),
         // Agents
@@ -1801,195 +1708,7 @@ fn handleRecentlyChanged(
     out.appendSlice(alloc, "]}") catch {};
 }
 
-// ── Graph query handlers ──────────────────────────────────────────────────────
-
-const GRAPH_PATH = ".codegraph/graph.bin";
-
-fn loadGraph(alloc: std.mem.Allocator) ?graph_mod.CodeGraph {
-    return graph_store.loadFromFile(GRAPH_PATH, alloc) catch return null;
-}
-
-fn handleSymbolAt(
-    alloc: std.mem.Allocator,
-    args: *const std.json.ObjectMap,
-    out: *std.ArrayList(u8),
-) void {
-    const file = mj.getStr(args, "file") orelse {
-        writeErr(alloc, out, "missing required parameter: file");
-        return;
-    };
-    const line_val = mj.getInt(args, "line") orelse {
-        writeErr(alloc, out, "missing required parameter: line");
-        return;
-    };
-    const line: u32 = @intCast(@max(line_val, 0));
-
-    var g = loadGraph(alloc) orelse {
-        writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
-        return;
-    };
-    defer g.deinit();
-
-    const results = graph_query.symbolAt(&g, file, line, alloc) catch {
-        writeErr(alloc, out, "query failed");
-        return;
-    };
-    defer alloc.free(results);
-
-    out.appendSlice(alloc, "{\"symbols\":[") catch return;
-    for (results, 0..) |r, i| {
-        if (i > 0) out.appendSlice(alloc, ",") catch {};
-        writeSymbolResultJson(alloc, out, r);
-    }
-    out.appendSlice(alloc, "]}") catch {};
-}
-
-fn handleFindCallers(
-    alloc: std.mem.Allocator,
-    args: *const std.json.ObjectMap,
-    out: *std.ArrayList(u8),
-) void {
-    const sym_id = mj.getInt(args, "symbol_id") orelse {
-        writeErr(alloc, out, "missing required parameter: symbol_id");
-        return;
-    };
-    const id: u64 = @intCast(@max(sym_id, 0));
-
-    var g = loadGraph(alloc) orelse {
-        writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
-        return;
-    };
-    defer g.deinit();
-
-    const results = graph_query.findCallers(&g, id, alloc) catch {
-        writeErr(alloc, out, "query failed");
-        return;
-    };
-    defer alloc.free(results);
-
-    out.appendSlice(alloc, "{\"callers\":[") catch return;
-    for (results, 0..) |r, i| {
-        if (i > 0) out.appendSlice(alloc, ",") catch {};
-        writeCallerResultJson(alloc, out, r);
-    }
-    out.appendSlice(alloc, "]}") catch {};
-}
-
-fn handleFindCallees(
-    alloc: std.mem.Allocator,
-    args: *const std.json.ObjectMap,
-    out: *std.ArrayList(u8),
-) void {
-    const sym_id = mj.getInt(args, "symbol_id") orelse {
-        writeErr(alloc, out, "missing required parameter: symbol_id");
-        return;
-    };
-    const id: u64 = @intCast(@max(sym_id, 0));
-
-    var g = loadGraph(alloc) orelse {
-        writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
-        return;
-    };
-    defer g.deinit();
-
-    const results = graph_query.findCallees(&g, id, alloc) catch {
-        writeErr(alloc, out, "query failed");
-        return;
-    };
-    defer alloc.free(results);
-
-    out.appendSlice(alloc, "{\"callees\":[") catch return;
-    for (results, 0..) |r, i| {
-        if (i > 0) out.appendSlice(alloc, ",") catch {};
-        writeCallerResultJson(alloc, out, r);
-    }
-    out.appendSlice(alloc, "]}") catch {};
-}
-
-fn handleFindDependents(
-    alloc: std.mem.Allocator,
-    args: *const std.json.ObjectMap,
-    out: *std.ArrayList(u8),
-) void {
-    const sym_id = mj.getInt(args, "symbol_id") orelse {
-        writeErr(alloc, out, "missing required parameter: symbol_id");
-        return;
-    };
-    const id: u64 = @intCast(@max(sym_id, 0));
-
-    const max_results_val = mj.getInt(args, "max_results");
-    const max_results: usize = if (max_results_val) |v| @intCast(@max(v, 1)) else 10;
-
-    var g = loadGraph(alloc) orelse {
-        writeErr(alloc, out, "no CodeGraph found at " ++ GRAPH_PATH ++ " — run ingestion first");
-        return;
-    };
-    defer g.deinit();
-
-    const results = graph_query.findDependents(&g, id, max_results, alloc) catch {
-        writeErr(alloc, out, "query failed");
-        return;
-    };
-    defer alloc.free(results);
-
-    out.appendSlice(alloc, "{\"dependents\":[") catch return;
-    for (results, 0..) |r, i| {
-        if (i > 0) out.appendSlice(alloc, ",") catch {};
-        out.appendSlice(alloc, "{\"id\":") catch {};
-        var id_buf: [20]u8 = undefined;
-        const id_s = std.fmt.bufPrint(&id_buf, "{d}", .{r.id}) catch continue;
-        out.appendSlice(alloc, id_s) catch {};
-
-        // Try to resolve symbol name
-        if (g.getSymbol(r.id)) |sym| {
-            out.appendSlice(alloc, ",\"name\":\"") catch {};
-            mj.writeEscaped(alloc, out, sym.name);
-            out.appendSlice(alloc, "\"") catch {};
-        }
-
-        out.appendSlice(alloc, ",\"score\":") catch {};
-        var score_buf: [32]u8 = undefined;
-        const score_s = std.fmt.bufPrint(&score_buf, "{d:.6}", .{r.score}) catch continue;
-        out.appendSlice(alloc, score_s) catch {};
-        out.appendSlice(alloc, "}") catch {};
-    }
-    out.appendSlice(alloc, "]}") catch {};
-}
-
-fn writeSymbolResultJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8), r: graph_query.SymbolResult) void {
-    out.appendSlice(alloc, "{\"id\":") catch return;
-    var buf: [20]u8 = undefined;
-    const id_s = std.fmt.bufPrint(&buf, "{d}", .{r.id}) catch return;
-    out.appendSlice(alloc, id_s) catch return;
-    out.appendSlice(alloc, ",\"name\":\"") catch return;
-    mj.writeEscaped(alloc, out, r.name);
-    out.appendSlice(alloc, "\",\"kind\":\"") catch return;
-    out.appendSlice(alloc, @tagName(r.kind)) catch return;
-    out.appendSlice(alloc, "\",\"file\":\"") catch return;
-    mj.writeEscaped(alloc, out, r.file_path);
-    out.appendSlice(alloc, "\",\"line\":") catch return;
-    const line_s = std.fmt.bufPrint(&buf, "{d}", .{r.line}) catch return;
-    out.appendSlice(alloc, line_s) catch return;
-    out.appendSlice(alloc, ",\"col\":") catch return;
-    const col_s = std.fmt.bufPrint(&buf, "{d}", .{r.col}) catch return;
-    out.appendSlice(alloc, col_s) catch return;
-    out.appendSlice(alloc, ",\"scope\":\"") catch return;
-    mj.writeEscaped(alloc, out, r.scope);
-    out.appendSlice(alloc, "\"}") catch return;
-}
-
-fn writeCallerResultJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8), r: graph_query.CallerResult) void {
-    writeSymbolResultJson(alloc, out, r.symbol);
-    // Patch: replace trailing } with edge info + }
-    _ = out.pop();
-    out.appendSlice(alloc, ",\"edge_kind\":\"") catch return;
-    out.appendSlice(alloc, @tagName(r.edge_kind)) catch return;
-    out.appendSlice(alloc, "\",\"weight\":") catch return;
-    var buf: [32]u8 = undefined;
-    const w_s = std.fmt.bufPrint(&buf, "{d:.4}", .{r.weight}) catch return;
-    out.appendSlice(alloc, w_s) catch return;
-    out.appendSlice(alloc, "}") catch return;
-}
+// ── Graph query handlers (delegated to graph_tools.zig) ────────────────────────
 
 const Symbol = struct {
     name: []const u8,
