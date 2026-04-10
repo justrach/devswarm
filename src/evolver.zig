@@ -272,6 +272,215 @@ pub const Archive = struct {
     }
 };
 
+// ── Evaluator ─────────────────────────────────────────────────────────────────
+//
+// Runs a fitness command (e.g. `zig build test`) and parses the output to
+// compute a test_score and extract failure cases.
+
+pub const FailureCase = struct {
+    test_name: []const u8,
+    failure_type: []const u8,
+    output: []const u8,
+};
+
+pub const TestEvalResult = struct {
+    test_score: f64,
+    passed: u32,
+    failed: u32,
+    total: u32,
+    failures: []FailureCase,
+    wall_ms: u64,
+    timed_out: bool,
+};
+
+pub const Evaluator = struct {
+    fitness_cmd: []const u8,
+    timeout_ms: u32,
+    alloc: std.mem.Allocator,
+
+    pub fn init(alloc: std.mem.Allocator, fitness_cmd: []const u8, timeout_ms: u32) Evaluator {
+        return .{
+            .fitness_cmd = fitness_cmd,
+            .timeout_ms = timeout_ms,
+            .alloc = alloc,
+        };
+    }
+
+    /// Run the fitness command and parse its output.
+    pub fn evaluate(self: *Evaluator) !TestEvalResult {
+        const start = std.time.milliTimestamp();
+        const result = try runCommand(self.alloc, self.fitness_cmd, self.timeout_ms);
+        const elapsed: u64 = @intCast(std.time.milliTimestamp() - start);
+
+        const combined = blk: {
+            var buf: std.ArrayList(u8) = .empty;
+            buf.appendSlice(self.alloc, result.stdout) catch {};
+            buf.appendSlice(self.alloc, result.stderr) catch {};
+            break :blk buf;
+        };
+        defer combined.deinit(self.alloc);
+        defer self.alloc.free(result.stdout);
+        defer self.alloc.free(result.stderr);
+
+        var eval = parseTestOutput(self.alloc, combined.items);
+        eval.wall_ms = elapsed;
+        eval.timed_out = result.timed_out;
+        return eval;
+    }
+};
+
+const CmdResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    exit_code: u8,
+    timed_out: bool,
+};
+
+fn runCommand(alloc: std.mem.Allocator, cmd: []const u8, timeout_ms: u32) !CmdResult {
+    _ = timeout_ms;
+    const argv = [_][]const u8{ "/bin/sh", "-c", cmd };
+    var child = std.process.Child.init(&argv, alloc);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.stdin_behavior = .Close;
+
+    child.spawn() catch return CmdResult{
+        .stdout = try alloc.alloc(u8, 0),
+        .stderr = try alloc.dupe(u8, "spawn failed"),
+        .exit_code = 127,
+        .timed_out = false,
+    };
+
+    const stdout_file = child.stdout orelse return error.SpawnFailed;
+    const stderr_file = child.stderr orelse return error.SpawnFailed;
+
+    const stdout = stdout_file.readToEndAlloc(alloc, 4 * 1024 * 1024) catch try alloc.alloc(u8, 0);
+    const stderr = stderr_file.readToEndAlloc(alloc, 4 * 1024 * 1024) catch try alloc.alloc(u8, 0);
+
+    const term = child.wait() catch return CmdResult{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = 1,
+        .timed_out = false,
+    };
+
+    const exit_code: u8 = switch (term) {
+        .Exited => |c| c,
+        else => 1,
+    };
+
+    return CmdResult{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = exit_code,
+        .timed_out = false,
+    };
+}
+
+/// Parse test runner output to extract pass/fail counts and failure details.
+/// Supports zig test, pytest, go test, and jest output formats.
+pub fn parseTestOutput(alloc: std.mem.Allocator, output: []const u8) TestEvalResult {
+    var passed: u32 = 0;
+    var failed: u32 = 0;
+    var failures: std.ArrayList(FailureCase) = .empty;
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Zig test: "All 83 tests passed." or "109 passed; 0 skipped; 1 failed."
+        if (std.mem.indexOf(u8, trimmed, " tests passed") != null) {
+            if (parseIntBefore(trimmed, " tests passed")) |n| { passed = n; }
+        } else if (std.mem.indexOf(u8, trimmed, " passed;") != null) {
+            if (parseLeadingInt(trimmed)) |n| { passed = n; }
+            if (std.mem.indexOf(u8, trimmed, " failed.")) |_| {
+                if (parseIntBefore(trimmed, " failed.")) |n| { failed = n; }
+            }
+        }
+        // Zig test failure: "test.name...FAIL"
+        else if (std.mem.endsWith(u8, trimmed, "...FAIL") or
+            std.mem.indexOf(u8, trimmed, "...FAIL (") != null)
+        {
+            const name_end = std.mem.indexOf(u8, trimmed, "...FAIL") orelse continue;
+            // Find test name after the test number prefix "N/M "
+            const name_start = if (std.mem.indexOf(u8, trimmed[0..name_end], " ")) |s| s + 1 else 0;
+            failures.append(alloc, .{
+                .test_name = trimmed[name_start..name_end],
+                .failure_type = "test_fail",
+                .output = trimmed,
+            }) catch {};
+        }
+        // Pytest: "5 passed, 2 failed" or "FAILED test_name"
+        else if (std.mem.indexOf(u8, trimmed, " passed") != null and std.mem.indexOf(u8, trimmed, " failed") != null) {
+            if (parseIntBefore(trimmed, " passed")) |n| { passed = n; }
+            if (parseIntBefore(trimmed, " failed")) |n| { failed = n; }
+        } else if (std.mem.startsWith(u8, trimmed, "FAILED ")) {
+            failures.append(alloc, .{
+                .test_name = trimmed[7..],
+                .failure_type = "test_fail",
+                .output = trimmed,
+            }) catch {};
+        }
+        // Go test: "ok" or "FAIL" lines
+        else if (std.mem.startsWith(u8, trimmed, "ok  \t") or std.mem.startsWith(u8, trimmed, "ok \t")) {
+            passed += 1;
+        } else if (std.mem.startsWith(u8, trimmed, "FAIL\t")) {
+            failed += 1;
+            failures.append(alloc, .{
+                .test_name = trimmed[5..],
+                .failure_type = "test_fail",
+                .output = trimmed,
+            }) catch {};
+        }
+        // Compilation error detection
+        else if (std.mem.indexOf(u8, trimmed, "error:") != null or
+            std.mem.indexOf(u8, trimmed, "error[") != null)
+        {
+            if (failures.items.len < 10) {
+                failures.append(alloc, .{
+                    .test_name = "(compile)",
+                    .failure_type = "compile_error",
+                    .output = trimmed,
+                }) catch {};
+            }
+        }
+    }
+
+    const total = passed + failed;
+    const test_score: f64 = if (total > 0) @as(f64, @floatFromInt(passed)) / @as(f64, @floatFromInt(total)) else 0.0;
+
+    const owned_failures = alloc.alloc(FailureCase, failures.items.len) catch
+        @as([]FailureCase, &.{});
+    for (owned_failures, 0..) |*slot, i| slot.* = failures.items[i];
+    failures.deinit(alloc);
+
+    return .{
+        .test_score = test_score,
+        .passed = passed,
+        .failed = failed,
+        .total = total,
+        .failures = owned_failures,
+        .wall_ms = 0,
+        .timed_out = false,
+    };
+}
+
+fn parseLeadingInt(s: []const u8) ?u32 {
+    var end: usize = 0;
+    while (end < s.len and s[end] >= '0' and s[end] <= '9') end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, s[0..end], 10) catch null;
+}
+
+fn parseIntBefore(s: []const u8, marker: []const u8) ?u32 {
+    const idx = std.mem.indexOf(u8, s, marker) orelse return null;
+    if (idx == 0) return null;
+    var start = idx;
+    while (start > 0 and s[start - 1] >= '0' and s[start - 1] <= '9') start -= 1;
+    if (start == idx) return null;
+    return std.fmt.parseInt(u32, s[start..idx], 10) catch null;
+}
+
 // ── Core functions ─────────────────────────────────────────────────────────────
 
 /// Compute fitness ∈ [0, 1] from a worker's execution metrics.
@@ -792,4 +1001,83 @@ test "evolver: archive sampling across multiple roles" {
         @as(?[]const u8, null),
         resolvePromptForRole(&ar, "nonexistent_role", rng),
     );
+}
+
+// ── Evaluator / parseTestOutput tests ─────────────────────────────────────────
+
+test "evolver: parseTestOutput zig all passed" {
+    const alloc = std.testing.allocator;
+    const output = "1/83 graph.test.init...OK\n83/83 types.test.all...OK\nAll 83 tests passed.\n";
+    const result = parseTestOutput(alloc, output);
+    defer alloc.free(result.failures);
+    try std.testing.expectEqual(@as(u32, 83), result.passed);
+    try std.testing.expectEqual(@as(u32, 0), result.failed);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.test_score, 1e-9);
+}
+
+test "evolver: parseTestOutput zig mixed pass/fail" {
+    const alloc = std.testing.allocator;
+    const output = "1/5 test.a...OK\n2/5 test.b...FAIL (TestUnexpectedResult)\n109 passed; 0 skipped; 1 failed.\n";
+    const result = parseTestOutput(alloc, output);
+    defer alloc.free(result.failures);
+    try std.testing.expectEqual(@as(u32, 109), result.passed);
+    try std.testing.expectEqual(@as(u32, 1), result.failed);
+    try std.testing.expect(result.test_score > 0.99);
+    try std.testing.expect(result.test_score < 1.0);
+    try std.testing.expect(result.failures.len >= 1);
+}
+
+test "evolver: parseTestOutput pytest format" {
+    const alloc = std.testing.allocator;
+    const output = "FAILED tests/test_auth.py::test_login\n====== 5 passed, 2 failed ======\n";
+    const result = parseTestOutput(alloc, output);
+    defer alloc.free(result.failures);
+    try std.testing.expectEqual(@as(u32, 5), result.passed);
+    try std.testing.expectEqual(@as(u32, 2), result.failed);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0 / 7.0), result.test_score, 1e-6);
+    try std.testing.expect(result.failures.len >= 1);
+}
+
+test "evolver: parseTestOutput compile error" {
+    const alloc = std.testing.allocator;
+    const output = "src/main.zig:42:5: error: expected expression\n";
+    const result = parseTestOutput(alloc, output);
+    defer alloc.free(result.failures);
+    try std.testing.expectEqual(@as(u32, 0), result.passed);
+    try std.testing.expectEqual(@as(u32, 0), result.failed);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.test_score, 1e-9);
+    try std.testing.expect(result.failures.len >= 1);
+    try std.testing.expectEqualStrings("compile_error", result.failures[0].failure_type);
+}
+
+test "evolver: parseTestOutput empty output" {
+    const alloc = std.testing.allocator;
+    const result = parseTestOutput(alloc, "");
+    defer alloc.free(result.failures);
+    try std.testing.expectEqual(@as(u32, 0), result.total);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.test_score, 1e-9);
+}
+
+test "evolver: parseTestOutput go test format" {
+    const alloc = std.testing.allocator;
+    const output = "ok \tgithub.com/x/y\t0.5s\nFAIL\tgithub.com/x/z\t1.2s\nok \tgithub.com/x/w\t0.1s\n";
+    const result = parseTestOutput(alloc, output);
+    defer alloc.free(result.failures);
+    try std.testing.expectEqual(@as(u32, 2), result.passed);
+    try std.testing.expectEqual(@as(u32, 1), result.failed);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0 / 3.0), result.test_score, 1e-6);
+}
+
+test "evolver: parseLeadingInt" {
+    try std.testing.expectEqual(@as(?u32, 42), parseLeadingInt("42 tests passed"));
+    try std.testing.expectEqual(@as(?u32, 0), parseLeadingInt("0 passed"));
+    try std.testing.expectEqual(@as(?u32, null), parseLeadingInt("no numbers"));
+    try std.testing.expectEqual(@as(?u32, null), parseLeadingInt(""));
+}
+
+test "evolver: parseIntBefore" {
+    try std.testing.expectEqual(@as(?u32, 5), parseIntBefore("5 passed", " passed"));
+    try std.testing.expectEqual(@as(?u32, 12), parseIntBefore("12 failed.", " failed."));
+    try std.testing.expectEqual(@as(?u32, null), parseIntBefore("passed", " passed"));
+    try std.testing.expectEqual(@as(?u32, null), parseIntBefore("no match", "missing"));
 }
