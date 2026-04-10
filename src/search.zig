@@ -312,14 +312,14 @@ test "extractIdentifierFromContext: leading whitespace" {
 
 test "searchRefs: empty symbol returns empty" {
     const alloc = std.testing.allocator;
-    const refs = try searchRefs(alloc, .rg, "", null);
+    var refs = try searchRefs(alloc, .rg, "", null);
     defer refs.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), refs.items.len);
 }
 
 test "searchRefs: none tool returns empty" {
     const alloc = std.testing.allocator;
-    const refs = try searchRefs(alloc, .none, "handleFoo", null);
+    var refs = try searchRefs(alloc, .none, "handleFoo", null);
     defer refs.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), refs.items.len);
 }
