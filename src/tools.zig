@@ -95,7 +95,7 @@ fn validateIssueDraft(alloc: std.mem.Allocator, title: []const u8, body: []const
     if (std.mem.trim(u8, body, " \t\n\r").len == 0) {
         return std.fmt.allocPrint(
             alloc,
-            "issue body is required and must follow the CONTRIBUTING.md / AGENT.md issue template. Missing body.\n\nRequired template:\n{s}",
+            "issue body is required and must follow the CONTRIBUTING.md / AGENTS.md issue template. Missing body.\n\nRequired template:\n{s}",
             .{ISSUE_TEMPLATE},
         ) catch null;
     }
@@ -119,7 +119,7 @@ fn validateIssueDraft(alloc: std.mem.Allocator, title: []const u8, body: []const
 
     return std.fmt.allocPrint(
         alloc,
-        "issue body does not satisfy CONTRIBUTING.md / AGENT.md issue requirements. Missing required section(s): {s}.\n\nRequired template:\n{s}",
+        "issue body does not satisfy CONTRIBUTING.md / AGENTS.md issue requirements. Missing required section(s): {s}.\n\nRequired template:\n{s}",
         .{ joined.items, ISSUE_TEMPLATE },
     ) catch null;
 }
@@ -281,8 +281,8 @@ pub const tools_list =
     \\{"name":"get_project_state","description":"Return all open issues grouped by status label, all open branches, and all open PRs. Use this to understand current project state before picking up work.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"get_next_task","description":"Return the single highest-priority unblocked issue that has no open branch. Use this to decide what to work on next.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"prioritize_issues","description":"Apply priority labels (priority:p0–p3) to a set of issues based on their dependency order. Sinks (no dependents) get p0; independent issues get p2.","inputSchema":{"type":"object","properties":{"issue_numbers":{"type":"array","items":{"type":"integer"},"description":"Issue numbers to prioritize"}},"required":["issue_numbers"]}},
-    \\{"name":"create_issue","description":"Create a single GitHub issue with title, body, labels, and optional milestone. Automatically applies status:backlog if no status label is provided. This tool enforces the issue requirements from CONTRIBUTING.md and AGENT.md: the body must include One-sentence problem, Exact repro, Observed result, Expected result, Nearby passing checks, Acceptance criteria, and Non-goals. If parent_issue is provided, create_issue only appends `Parent issue: #N` to the issue body for context; use link_issues for explicit dependency relationships.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string","description":"Required. Must follow the CONTRIBUTING.md / AGENT.md issue template with the required evidence sections."},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"},"parent_issue":{"type":"integer","description":"Optional parent issue number to append as `Parent issue: #N` in the issue body for context only. This does not create a durable GitHub subtask/dependency relationship; use link_issues for explicit links."}},"required":["title","body"]}},
-    \\{"name":"create_issues_batch","description":"Create multiple GitHub issues in one call. Issues are fired concurrently in batches of 5 with a 200ms collection window. Use this after decompose_feature to create all issues at once. Each issue body must satisfy the same CONTRIBUTING.md / AGENT.md evidence template enforced by create_issue.","inputSchema":{"type":"object","properties":{"issues":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string","description":"Required. Must follow the CONTRIBUTING.md / AGENT.md issue template with the required evidence sections."},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"}},"required":["title","body"]}}},"required":["issues"]}},
+    \\{"name":"create_issue","description":"Create a single GitHub issue with title, body, labels, and optional milestone. Automatically applies status:backlog if no status label is provided. This tool enforces the issue requirements from CONTRIBUTING.md and AGENTS.md: the body must include One-sentence problem, Exact repro, Observed result, Expected result, Nearby passing checks, Acceptance criteria, and Non-goals. If parent_issue is provided, create_issue only appends `Parent issue: #N` to the issue body for context; use link_issues for explicit dependency relationships.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string","description":"Required. Must follow the CONTRIBUTING.md / AGENTS.md issue template with the required evidence sections."},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"},"parent_issue":{"type":"integer","description":"Optional parent issue number to append as `Parent issue: #N` in the issue body for context only. This does not create a durable GitHub subtask/dependency relationship; use link_issues for explicit links."}},"required":["title","body"]}},
+    \\{"name":"create_issues_batch","description":"Create multiple GitHub issues in one call. Issues are fired concurrently in batches of 5 with a 200ms collection window. Use this after decompose_feature to create all issues at once. Each issue body must satisfy the same CONTRIBUTING.md / AGENTS.md evidence template enforced by create_issue.","inputSchema":{"type":"object","properties":{"issues":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string","description":"Required. Must follow the CONTRIBUTING.md / AGENTS.md issue template with the required evidence sections."},"labels":{"type":"array","items":{"type":"string"}},"milestone":{"type":"string"}},"required":["title","body"]}}},"required":["issues"]}},
     \\{"name":"update_issue","description":"Update an existing issue's title, body, or labels.","inputSchema":{"type":"object","properties":{"issue_number":{"type":"integer"},"title":{"type":"string"},"body":{"type":"string"},"add_labels":{"type":"array","items":{"type":"string"}},"remove_labels":{"type":"array","items":{"type":"string"}}},"required":["issue_number"]}},
     \\{"name":"close_issues_batch","description":"Close multiple issues at once. Each issue is marked status:done. Use this instead of calling close_issue N times.","inputSchema":{"type":"object","properties":{"issue_numbers":{"type":"array","items":{"type":"integer"},"description":"Issue numbers to close"},"pr_number":{"type":"integer","description":"PR number that resolves all these issues (optional)"}},"required":["issue_numbers"]}},
     \\{"name":"close_issue","description":"Close an issue and mark it status:done. Optionally reference the PR that resolved it.","inputSchema":{"type":"object","properties":{"issue_number":{"type":"integer"},"pr_number":{"type":"integer","description":"PR number that resolves this issue"}},"required":["issue_number"]}},
@@ -3122,9 +3122,9 @@ fn handleRunTask(
 }
 
 test "tools_list encodes evidence-backed issue filing guidance" {
-    try std.testing.expect(std.mem.indexOf(u8, tools_list, "This tool enforces the issue requirements from CONTRIBUTING.md and AGENT.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_list, "Each issue body must satisfy the same CONTRIBUTING.md / AGENT.md evidence template enforced by create_issue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_list, "CONTRIBUTING.md and AGENT.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "This tool enforces the issue requirements from CONTRIBUTING.md and AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "Each issue body must satisfy the same CONTRIBUTING.md / AGENTS.md evidence template enforced by create_issue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "CONTRIBUTING.md and AGENTS.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_list, "run_explorer") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_list, "Maximum time for agent execution (default 300, max 600)") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_list, "Maximum total time for the full chain (default 300, max 600)") != null);
