@@ -268,6 +268,8 @@ pub const Tool = enum {
     run_agent,
     // Smart executor — picks strategy, roles, and models automatically
     run_task,
+    // Evolver — archive of successful mutation strategies
+    get_evolution_archive,
 };
 
 // ── Step 2: Tool schemas ──────────────────────────────────────────────────────
@@ -315,6 +317,7 @@ pub const tools_list =
     \\{\"name\":\"review_fix_loop\",\"description\":\"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Override the default review criteria\"},\"max_iterations\":{\"type\":\"integer\",\"description\":\"Maximum review-fix cycles (default 3, max 5)\"}},\"required\":[]}},
     \\{\"name\":\"run_agent\",\"description\":\"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for the agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: claude-sonnet-4-6). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap.\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)\"},\"allowed_tools\":{\"type\":\"string\",\"description\":\"Comma-separated tool allowlist, e.g. \\\"Bash,Read,Edit\\\". Omit to allow all tools.\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow file writes (maps to bypassPermissions when permission_mode is unset)\"},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory override (default: current repo path)\"}},\"required\":[\"prompt\"]}},
     \\{\"name\":\"run_task\",\"description\":\"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"Task description — what needs to be done\"},\"preset\":{\"type\":\"string\",\"enum\":[\"finder_fixer\",\"reviewer_fixer\",\"explore_report\",\"architect_build\",\"custom\"],\"description\":\"Chain preset (default: auto-select based on task)\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode for all agents in the chain\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Max agents to spawn (default: preset-determined)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Override write access (default: role-determined)\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"Maximum total time for the full chain (default 300, max 600)\"}},\"required\":[\"task\"]}}
+    \\,{\"name\":\"get_evolution_archive\",\"description\":\"View the archive of successful mutation strategies from past evolver runs. Returns entries grouped by role with fitness scores, prompt variants, and behavior descriptors. Reads from .devswarm/archive.json.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"role\":{\"type\":\"string\",\"description\":\"Filter to a specific role (optional, returns all roles if omitted)\"}},\"required\":[]}}
     \\]}
 ;
 
@@ -384,6 +387,8 @@ pub fn dispatch(
         .run_agent => handleRunAgent(alloc, args, out),
         // Smart executor
         .run_task => handleRunTask(alloc, args, out),
+        // Evolver archive
+        .get_evolution_archive => handleGetEvolutionArchive(alloc, args, out),
     }
 }
 
@@ -2291,6 +2296,60 @@ fn handleSetRepo(
         out.appendSlice(alloc, "(not detected)") catch {};
     }
     out.appendSlice(alloc, "\"}") catch return;
+}
+
+fn handleGetEvolutionArchive(
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+) void {
+    const evolver = @import("evolver.zig");
+    const archive_path = ".devswarm/archive.json";
+    const role_filter = mj.getStr(args, "role");
+
+    var archive = evolver.Archive.init(alloc);
+    defer archive.deinit();
+
+    archive.load(archive_path) catch |err| {
+        if (err == error.FileNotFound) {
+            out.appendSlice(alloc, "{\"entries\":[],\"message\":\"No archive file found. Run the evolver to populate it.\"}") catch {};
+            return;
+        }
+        var msg: [256]u8 = undefined;
+        const s = std.fmt.bufPrint(&msg, "archive load failed: {}", .{err}) catch "load failed";
+        writeErr(alloc, out, s);
+        return;
+    };
+
+    out.appendSlice(alloc, "{\"entries\":[") catch return;
+    var first = true;
+    var it = archive.grids.iterator();
+    while (it.next()) |entry| {
+        const role = entry.key_ptr.*;
+        if (role_filter) |rf| {
+            if (!std.mem.eql(u8, role, rf)) continue;
+        }
+        for (entry.value_ptr.cells) |row| {
+            for (row) |maybe| {
+                if (maybe) |v| {
+                    if (!first) out.append(alloc, ',') catch {};
+                    first = false;
+                    out.appendSlice(alloc, "{\"role\":\"") catch return;
+                    mj.writeEscaped(alloc, out, v.role);
+                    out.appendSlice(alloc, "\",\"prompt\":\"") catch return;
+                    mj.writeEscaped(alloc, out, v.prompt);
+                    var fit_buf: [32]u8 = undefined;
+                    const fit_s = std.fmt.bufPrint(&fit_buf, "\",\"fitness\":{d:.4}", .{v.fitness}) catch "\",\"fitness\":0";
+                    out.appendSlice(alloc, fit_s) catch return;
+                    var gen_buf: [32]u8 = undefined;
+                    const gen_s = std.fmt.bufPrint(&gen_buf, ",\"generation\":{d}", .{v.generation}) catch ",\"generation\":0";
+                    out.appendSlice(alloc, gen_s) catch return;
+                    out.appendSlice(alloc, "}") catch return;
+                }
+            }
+        }
+    }
+    out.appendSlice(alloc, "]}") catch {};
 }
 
 fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
