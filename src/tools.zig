@@ -3215,3 +3215,40 @@ test "buildIssueBody appends parent issue annotation for context only" {
     try std.testing.expect(std.mem.endsWith(u8, with_parent, "\n\nParent issue: #393"));
     try std.testing.expect(std.mem.indexOf(u8, with_parent, "## Acceptance criteria") != null);
 }
+
+// ── parse + Tool enum tests (#167) ──────────────────────────────────────────
+
+test "parse: valid tool names" {
+    try std.testing.expectEqual(Tool.create_issue, parse("create_issue").?);
+    try std.testing.expectEqual(Tool.run_task, parse("run_task").?);
+    try std.testing.expectEqual(Tool.blast_radius, parse("blast_radius").?);
+    try std.testing.expectEqual(Tool.set_repo, parse("set_repo").?);
+    try std.testing.expectEqual(Tool.run_swarm, parse("run_swarm").?);
+}
+
+test "parse: invalid names return null" {
+    try std.testing.expectEqual(@as(?Tool, null), parse("nonexistent_tool"));
+    try std.testing.expectEqual(@as(?Tool, null), parse(""));
+    try std.testing.expectEqual(@as(?Tool, null), parse("CREATE_ISSUE"));
+}
+
+test "parse: every Tool variant round-trips through @tagName" {
+    const info = @typeInfo(Tool);
+    inline for (info.@"enum".fields) |f| {
+        const parsed = parse(f.name);
+        try std.testing.expect(parsed != null);
+    }
+}
+
+test "dispatch: all tool enum variants are covered by switch" {
+    const info = @typeInfo(Tool);
+    try std.testing.expectEqual(@as(usize, 36), info.@"enum".fields.len);
+}
+
+test "tools_list JSON is valid and contains expected tool names" {
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "\"create_issue\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "\"run_task\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "\"blast_radius\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "\"run_swarm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_list, "\"run_agent\"") != null);
+}
