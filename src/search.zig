@@ -5,15 +5,15 @@
 // and uses it to find symbol references across the codebase.
 
 const std = @import("std");
-const gh  = @import("gh.zig");
+const gh = @import("gh.zig");
 
 // ── Search tool detection ─────────────────────────────────────────────────────
 
 pub const SearchTool = enum { zigrep, rg, grep, none };
 
-var g_mu:    std.Thread.Mutex = .{};
-var g_probed: bool            = false;
-var g_tool:  SearchTool       = .none;
+var g_mu: std.Thread.Mutex = .{};
+var g_probed: bool = false;
+var g_tool: SearchTool = .none;
 
 /// Detect which search tool is available. Cached after first call.
 pub fn probe(alloc: std.mem.Allocator) SearchTool {
@@ -23,8 +23,8 @@ pub fn probe(alloc: std.mem.Allocator) SearchTool {
 
     const candidates = [_][]const []const u8{
         &.{ "zigrep", "--version" },
-        &.{ "rg",     "--version" },
-        &.{ "grep",   "--version" },
+        &.{ "rg", "--version" },
+        &.{ "grep", "--version" },
     };
     const tools = [_]SearchTool{ .zigrep, .rg, .grep };
 
@@ -43,9 +43,9 @@ pub fn probe(alloc: std.mem.Allocator) SearchTool {
 pub fn toolName(tool: SearchTool) []const u8 {
     return switch (tool) {
         .zigrep => "zigrep",
-        .rg     => "rg",
-        .grep   => "grep",
-        .none   => "none",
+        .rg => "rg",
+        .grep => "grep",
+        .none => "none",
     };
 }
 
@@ -63,9 +63,9 @@ pub fn searchRefs(
 
     const argv: []const []const u8 = switch (tool) {
         .zigrep => &.{ "zigrep", "-l", "-w", symbol, "." },
-        .rg     => &.{ "rg", "-l", "-F", "-w", symbol, "." },
-        .grep   => &.{ "grep", "-rlFw", symbol, "." },
-        .none   => return results,
+        .rg => &.{ "rg", "-l", "-F", "-w", symbol, "." },
+        .grep => &.{ "grep", "-rlFw", symbol, "." },
+        .none => return results,
     };
 
     const r = gh.runWithOutput(alloc, argv) catch |err| {
@@ -207,9 +207,9 @@ pub fn extractSymbolsFromContent(
 
 test "toolName returns correct strings" {
     try std.testing.expectEqualStrings("zigrep", toolName(.zigrep));
-    try std.testing.expectEqualStrings("rg",     toolName(.rg));
-    try std.testing.expectEqualStrings("grep",   toolName(.grep));
-    try std.testing.expectEqualStrings("none",   toolName(.none));
+    try std.testing.expectEqualStrings("rg", toolName(.rg));
+    try std.testing.expectEqualStrings("grep", toolName(.grep));
+    try std.testing.expectEqualStrings("none", toolName(.none));
 }
 
 test "extractFilePath: standard diff header" {
@@ -312,14 +312,14 @@ test "extractIdentifierFromContext: leading whitespace" {
 
 test "searchRefs: empty symbol returns empty" {
     const alloc = std.testing.allocator;
-    const refs = try searchRefs(alloc, .rg, "", null);
+    var refs = try searchRefs(alloc, .rg, "", null);
     defer refs.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), refs.items.len);
 }
 
 test "searchRefs: none tool returns empty" {
     const alloc = std.testing.allocator;
-    const refs = try searchRefs(alloc, .none, "handleFoo", null);
+    var refs = try searchRefs(alloc, .none, "handleFoo", null);
     defer refs.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), refs.items.len);
 }

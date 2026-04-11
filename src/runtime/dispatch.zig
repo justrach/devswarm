@@ -23,7 +23,7 @@ pub fn dispatch(
 ) void {
     switch (resolved.backend) {
         .claude => spawnClaude(alloc, resolved, prompt, out),
-        .codex  => spawnCodex(alloc, resolved, prompt, out),
+        .codex => spawnCodex(alloc, resolved, prompt, out),
     }
 }
 
@@ -42,18 +42,21 @@ fn spawnClaude(
         (if (resolved.writable) "bypassPermissions" else "default");
 
     const opts: sdk.AgentOptions = .{
-        .model            = resolved.model,
-        .writable         = resolved.writable,
-        .allowed_tools    = resolved.allowed_tools,
-        .permission_mode  = perm_mode,
+        .model = resolved.model,
+        .writable = resolved.writable,
+        .allowed_tools = resolved.allowed_tools,
+        .permission_mode = perm_mode,
         .reasoning_effort = resolved.reasoning_effort,
-        .cwd              = resolved.cwd,
+        .cwd = resolved.cwd,
     };
 
-    const full_prompt = if (resolved.system_prompt.len > 0)
-        std.fmt.allocPrint(alloc, "{s}{s}", .{ resolved.system_prompt, prompt }) catch prompt
-    else
-        prompt;
+    const full_prompt = full_prompt: {
+        if (resolved.system_prompt.len == 0) break :full_prompt prompt;
+        break :full_prompt std.fmt.allocPrint(alloc, "{s}{s}", .{ resolved.system_prompt, prompt }) catch {
+            std.log.warn("dispatch: OOM concatenating system prompt — running with user prompt only", .{});
+            break :full_prompt prompt;
+        };
+    };
     defer if (full_prompt.ptr != prompt.ptr) alloc.free(full_prompt);
 
     if (sdk.tryClaudeAgent(alloc, full_prompt, opts, out)) return;
@@ -75,10 +78,13 @@ fn spawnCodex(
     const policy: cas.SandboxPolicy = if (resolved.writable) .writable else .read_only;
 
     // Prepend system prompt to the user's prompt
-    const full_prompt = if (resolved.system_prompt.len > 0)
-        std.fmt.allocPrint(alloc, "{s}{s}", .{ resolved.system_prompt, prompt }) catch prompt
-    else
-        prompt;
+    const full_prompt = full_prompt: {
+        if (resolved.system_prompt.len == 0) break :full_prompt prompt;
+        break :full_prompt std.fmt.allocPrint(alloc, "{s}{s}", .{ resolved.system_prompt, prompt }) catch {
+            std.log.warn("dispatch: OOM concatenating system prompt — running with user prompt only", .{});
+            break :full_prompt prompt;
+        };
+    };
     defer if (full_prompt.ptr != prompt.ptr) alloc.free(full_prompt);
 
     cas.runTurnPolicy(alloc, full_prompt, out, policy);
