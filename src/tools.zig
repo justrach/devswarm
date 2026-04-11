@@ -218,11 +218,11 @@ pub const tools_list =
     \\{"name":"run_reviewer","description":"Invoke the Codex reviewer subagent on the current branch. Checks errdefer gaps, RwLock ordering, Zig 0.15.x API misuse, and missing test coverage. Returns the agent's full findings.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default review prompt"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":[]}},
     \\{"name":"run_explorer","description":"Invoke the Codex explorer subagent to trace execution paths through the codebase. Read-only — maps affected code paths and gathers evidence without proposing fixes.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"What to explore, e.g. 'trace how get_next_task flows through gh.zig'"},"timeout_seconds":{"type":"integer","description":"Maximum time for agent execution (default 300, max 600)"}},"required":["prompt"]}},
     \\{"name":"run_zig_infra","description":"Invoke the Codex zig_infra subagent to review build.zig module graph, named @import wiring, and test step coverage.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Override the default build wiring check prompt"}},"required":[]}},
-    \\{\"name\":\"run_swarm\",\"description\":\"Spawn a self-organizing swarm of parallel sub-agents to tackle a task. Provider-agnostic: resolves the best backend (Claude/Codex) based on the model/mode you specify. An orchestrator decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The high-level task for the swarm to solve\"},\"title\":{\"type\":\"string\",\"description\":\"Short human-readable label shown during execution\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Maximum parallel sub-agents (default 5, hard cap 100)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow agents to edit files and run shell commands (default false = read-only analysis)\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID for all swarm agents (default: auto-resolved per role). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap parallel work.\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode applied to workers and synthesis agent (default: smart). Orchestrator uses rush unless overridden.\"},\"telemetry_out\":{\"type\":\"string\",\"description\":\"Optional file path to write telemetry JSON (cost, tokens, wall time, parallelism)\"}},\"required\":[\"prompt\"]}},
+    \\{\"name\":\"run_swarm\",\"description\":\"Spawn a self-organizing swarm of parallel sub-agents to tackle a task. Provider-agnostic: resolves the best backend (Claude/Codex) based on the model/mode you specify. An orchestrator decomposes the task into sub-tasks, up to max_agents run concurrently via Zig threads, and a synthesis agent combines their outputs. Set writable=true to allow agents to edit files (for bug fixes, refactors). Best for broad research, multi-file analysis, multi-angle reviews, or parallel bug fixing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The high-level task for the swarm to solve\"},\"title\":{\"type\":\"string\",\"description\":\"Short human-readable label shown during execution\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Maximum parallel sub-agents (default 5, hard cap 100)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow agents to edit files and run shell commands (default false = read-only analysis)\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID for all swarm agents (default: auto-resolved per role). Use \\\\\\\"opus\\\\\\\" for hardest tasks, \\\\\\\"haiku\\\\\\\" for fast/cheap parallel work.\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode applied to workers and synthesis agent (default: smart). Orchestrator uses rush unless overridden.\"},\"per_agent_model\":{\"type\":\"object\",\"description\":\"Per-role model overrides as a JSON object mapping role names to model aliases/IDs. Example: {\\\\\"finder\\\\\":\\\\\"haiku\\\\\",\\\\\"fixer\\\\\":\\\\\"opus\\\\\"}. Takes precedence over the top-level model param.\"},\"telemetry_out\":{\"type\":\"string\",\"description\":\"Optional file path to write telemetry JSON (cost, tokens, wall time, parallelism)\"}},\"required\":[\"prompt\"]}},
     \\{\"name\":\"run_agents\",\"description\":\"Run multiple agents in parallel within a single tool call. Each element of the agents array is a run_agent spec (same fields as run_agent). All agents execute concurrently via Zig threads; results are collected and returned as a JSON array once every agent completes. Use this instead of multiple sequential run_agent calls when the tasks are independent.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"agents\":{\"type\":\"array\",\"description\":\"Array of agent specs to run in parallel\",\"items\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for this agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: auto-resolved)\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"]},\"writable\":{\"type\":\"boolean\"},\"allowed_tools\":{\"type\":\"string\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"]},\"cwd\":{\"type\":\"string\"}},\"required\":[\"prompt\"]}}},\"required\":[\"agents\"]}},
     \\{\"name\":\"review_fix_loop\",\"description\":\"Iterative review-fix-review loop. Runs a read-only reviewer to find issues, then a writable agent to fix them, then re-reviews. Repeats until the reviewer reports no remaining issues or max_iterations is reached. Returns a JSON object with iteration history and convergence status.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"Override the default review criteria\"},\"max_iterations\":{\"type\":\"integer\",\"description\":\"Maximum review-fix cycles (default 3, max 5)\"}},\"required\":[]}},
     \\{\"name\":\"run_agent\",\"description\":\"Run a single agent turn. Provider-agnostic: resolves the best backend (Claude/Codex) based on mode, role, and available providers. The primitive layer — use run_task for smart multi-step execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task or question for the agent\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID (default: claude-sonnet-4-6). Use \\\"opus\\\" for hardest tasks, \\\"haiku\\\" for fast/cheap.\"},\"role\":{\"type\":\"string\",\"description\":\"Agent role: finder, reviewer, fixer, explorer, architect, orchestrator, synthesizer, monitor\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode: smart (Sonnet), rush (Haiku), deep (Opus), free (Haiku)\"},\"allowed_tools\":{\"type\":\"string\",\"description\":\"Comma-separated tool allowlist, e.g. \\\"Bash,Read,Edit\\\". Omit to allow all tools.\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Allow file writes (maps to bypassPermissions when permission_mode is unset)\"},\"cwd\":{\"type\":\"string\",\"description\":\"Working directory override (default: current repo path)\"}},\"required\":[\"prompt\"]}},
-    \\{\"name\":\"run_task\",\"description\":\"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"Task description — what needs to be done\"},\"preset\":{\"type\":\"string\",\"enum\":[\"finder_fixer\",\"reviewer_fixer\",\"explore_report\",\"architect_build\",\"custom\"],\"description\":\"Chain preset (default: auto-select based on task)\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode for all agents in the chain\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Max agents to spawn (default: preset-determined)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Override write access (default: role-determined)\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"Maximum total time for the full chain (default 300, max 600)\"}},\"required\":[\"task\"]}}
+    \\{\"name\":\"run_task\",\"description\":\"Smart executor: analyzes a task, picks the right strategy and agents, runs them with appropriate roles and models. Use this instead of run_agent for multi-step tasks. Supports chain presets (finder_fixer, reviewer_fixer, explore_report, architect_build) or auto-selection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"Task description — what needs to be done\"},\"preset\":{\"type\":\"string\",\"enum\":[\"finder_fixer\",\"reviewer_fixer\",\"explore_report\",\"architect_build\",\"custom\"],\"description\":\"Chain preset (default: auto-select based on task)\"},\"mode\":{\"type\":\"string\",\"enum\":[\"smart\",\"rush\",\"deep\",\"free\"],\"description\":\"Agent mode for all agents in the chain\"},\"max_agents\":{\"type\":\"integer\",\"description\":\"Max agents to spawn (default: preset-determined)\"},\"writable\":{\"type\":\"boolean\",\"description\":\"Override write access (default: role-determined)\"},\"permission_mode\":{\"type\":\"string\",\"enum\":[\"default\",\"acceptEdits\",\"bypassPermissions\"],\"description\":\"Permission mode for file and shell operations\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"Maximum total time for the full chain (default 300, max 600)\"},\"model\":{\"type\":\"string\",\"description\":\"Model alias or full ID for all chain agents (default: auto-resolved per role). Use \\\\\"opus\\\\\" for hardest tasks, \\\\\"haiku\\\\\" for fast/cheap.\"}},\"required\":[\"task\"]}}
     \\]}
 ;
 
@@ -1887,7 +1887,7 @@ fn runAgentWithRole(
     out: *std.ArrayList(u8),
 ) void {
     const ts: u32 = timeout_seconds orelse 300;
-    runChainStep(alloc, role, mode, writable_flag, null, prompt, @as(u64, ts) * 1000, ts, out);
+    runChainStep(alloc, role, mode, writable_flag, null, prompt, @as(u64, ts) * 1000, ts, null, out);
 }
 
 fn parseTimeoutSeconds(args: *const std.json.ObjectMap, default_seconds: u32) u32 {
@@ -1932,13 +1932,14 @@ fn runChainStepWithBudget(
     prompt: []const u8,
     start_ms: i64,
     total_timeout_seconds: u32,
+    model: ?[]const u8,
     step_out: *std.ArrayList(u8),
 ) void {
     const remaining = remainingTimeoutSeconds(start_ms, total_timeout_seconds) orelse {
         appendTimedOutJson(alloc, step_out, total_timeout_seconds);
         return;
     };
-    runChainStep(alloc, role, mode, writable_override, permission_mode, prompt, @as(u64, remaining) * 1000, remaining, step_out);
+    runChainStep(alloc, role, mode, writable_override, permission_mode, prompt, @as(u64, remaining) * 1000, remaining, model, step_out);
 }
 
 fn handleRunReviewer(
@@ -2036,7 +2037,13 @@ fn handleRunSwarm(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
     const telemetry_out: ?[]const u8 = mj.getStr(args, "telemetry_out");
     const model: ?[]const u8 = mj.getStr(args, "model");
     const mode: ?[]const u8 = mj.getStr(args, "mode");
-    swarm.runSwarm(alloc, prompt, title, max_agents, out, writable, telemetry_out, model, mode);
+    const per_agent_model: ?*const std.json.ObjectMap = blk: {
+        if (args.get("per_agent_model")) |v| {
+            if (v == .object) break :blk &v.object;
+        }
+        break :blk null;
+    };
+    swarm.runSwarm(alloc, prompt, title, max_agents, out, writable, telemetry_out, model, mode, per_agent_model);
 }
 
 fn handleReviewFixLoop(
@@ -2102,7 +2109,7 @@ fn handleReviewFixLoop(
         iter_json.appendSlice(alloc, ",\"review\":\"") catch return;
         var review_out: std.ArrayList(u8) = .empty;
         defer review_out.deinit(alloc);
-        runChainStep(alloc, "reviewer", null, false, null, review_prompt, @as(u64, 300) * 1000, 300, &review_out);
+        runChainStep(alloc, "reviewer", null, false, null, review_prompt, @as(u64, 300) * 1000, 300, null, &review_out);
 
         mj.writeEscaped(alloc, &iter_json, review_out.items);
         iter_json.appendSlice(alloc, "\"") catch return;
@@ -2145,7 +2152,7 @@ fn handleReviewFixLoop(
 
         var fix_out: std.ArrayList(u8) = .empty;
         defer fix_out.deinit(alloc);
-        runChainStep(alloc, "fixer", null, true, null, fix_prompt, @as(u64, 300) * 1000, 300, &fix_out);
+        runChainStep(alloc, "fixer", null, true, null, fix_prompt, @as(u64, 300) * 1000, 300, null, &fix_out);
 
         iter_json.appendSlice(alloc, ",\"fix\":\"") catch return;
         mj.writeEscaped(alloc, &iter_json, fix_out.items);
@@ -2428,6 +2435,7 @@ fn runChainStep(
     prompt: []const u8,
     timeout_ms: u64,
     reported_timeout_seconds: u32,
+    model: ?[]const u8,
     step_out: *std.ArrayList(u8),
 ) void {
     const rt = @import("runtime.zig");
@@ -2435,6 +2443,7 @@ fn runChainStep(
         .prompt = prompt,
         .role = role,
         .mode = mode,
+        .model = model,
         .writable = writable_override,
         .permission_mode = permission_mode,
     };
@@ -2543,6 +2552,7 @@ fn handleRunTask(
     const start_ms = std.time.milliTimestamp();
 
     const mode = mj.getStr(args, "mode");
+    const model = mj.getStr(args, "model");
     const writable_override: ?bool = blk: {
         if (args.get("writable")) |v|
             if (v == .bool) break :blk v.bool;
@@ -2584,7 +2594,7 @@ fn handleRunTask(
             ) catch task;
             defer if (finder_prompt.ptr != task.ptr) alloc.free(finder_prompt);
 
-            runChainStepWithBudget(alloc, "finder", mode, false, permission_mode, finder_prompt, start_ms, timeout_seconds, &finder_out);
+            runChainStepWithBudget(alloc, "finder", mode, false, permission_mode, finder_prompt, start_ms, timeout_seconds, model, &finder_out);
 
             out.appendSlice(alloc, "{\"role\":\"finder\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, finder_out.items);
@@ -2611,7 +2621,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (contract_prompt.ptr != task.ptr) alloc.free(contract_prompt);
 
-                runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, contract_prompt, start_ms, timeout_seconds, &contract_out);
+                runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, contract_prompt, start_ms, timeout_seconds, model, &contract_out);
 
                 out.appendSlice(alloc, "{\"role\":\"contract\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, contract_out.items);
@@ -2634,7 +2644,7 @@ fn handleRunTask(
                     ) catch task;
                     defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                    runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, &fixer_out);
+                    runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, model, &fixer_out);
 
                     out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                     mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2663,7 +2673,7 @@ fn handleRunTask(
                         ) catch task;
                         defer if (verify_prompt.ptr != task.ptr) alloc.free(verify_prompt);
 
-                        runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, verify_prompt, start_ms, timeout_seconds, &verify_out);
+                        runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, verify_prompt, start_ms, timeout_seconds, model, &verify_out);
 
                         // Parse verify verdict
                         const verify_text = verify_out.items;
@@ -2703,7 +2713,7 @@ fn handleRunTask(
             ) catch task;
             defer if (scored_review_prompt.ptr != task.ptr) alloc.free(scored_review_prompt);
 
-            runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, scored_review_prompt, start_ms, timeout_seconds, &review_out);
+            runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, scored_review_prompt, start_ms, timeout_seconds, model, &review_out);
 
             out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, review_out.items);
@@ -2736,7 +2746,7 @@ fn handleRunTask(
                     ) catch task;
                     defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                    runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, &fixer_out);
+                    runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, model, &fixer_out);
 
                     out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                     mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2749,7 +2759,7 @@ fn handleRunTask(
             var explore_out: std.ArrayList(u8) = .empty;
             defer explore_out.deinit(alloc);
 
-            runChainStepWithBudget(alloc, "explorer", mode, false, permission_mode, task, start_ms, timeout_seconds, &explore_out);
+            runChainStepWithBudget(alloc, "explorer", mode, false, permission_mode, task, start_ms, timeout_seconds, model, &explore_out);
 
             out.appendSlice(alloc, "{\"role\":\"explorer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, explore_out.items);
@@ -2771,7 +2781,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (synth_prompt.ptr != task.ptr) alloc.free(synth_prompt);
 
-                runChainStepWithBudget(alloc, "synthesizer", mode, false, permission_mode, synth_prompt, start_ms, timeout_seconds, &synth_out);
+                runChainStepWithBudget(alloc, "synthesizer", mode, false, permission_mode, synth_prompt, start_ms, timeout_seconds, model, &synth_out);
 
                 out.appendSlice(alloc, "{\"role\":\"synthesizer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, synth_out.items);
@@ -2783,7 +2793,7 @@ fn handleRunTask(
             var arch_out: std.ArrayList(u8) = .empty;
             defer arch_out.deinit(alloc);
 
-            runChainStepWithBudget(alloc, "architect", "deep", false, permission_mode, task, start_ms, timeout_seconds, &arch_out);
+            runChainStepWithBudget(alloc, "architect", "deep", false, permission_mode, task, start_ms, timeout_seconds, model, &arch_out);
 
             out.appendSlice(alloc, "{\"role\":\"architect\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, arch_out.items);
@@ -2805,7 +2815,7 @@ fn handleRunTask(
                 ) catch task;
                 defer if (fixer_prompt.ptr != task.ptr) alloc.free(fixer_prompt);
 
-                runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, &fixer_out);
+                runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, fixer_prompt, start_ms, timeout_seconds, model, &fixer_out);
 
                 out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
                 mj.writeEscaped(alloc, out, fixer_out.items);
@@ -2818,7 +2828,7 @@ fn handleRunTask(
                     var review_out: std.ArrayList(u8) = .empty;
                     defer review_out.deinit(alloc);
 
-                    runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, task, start_ms, timeout_seconds, &review_out);
+                    runChainStepWithBudget(alloc, "reviewer", mode, false, permission_mode, task, start_ms, timeout_seconds, model, &review_out);
 
                     out.appendSlice(alloc, "{\"role\":\"reviewer\",\"output\":\"") catch return;
                     mj.writeEscaped(alloc, out, review_out.items);
@@ -2831,7 +2841,7 @@ fn handleRunTask(
             var step_out: std.ArrayList(u8) = .empty;
             defer step_out.deinit(alloc);
 
-            runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, task, start_ms, timeout_seconds, &step_out);
+            runChainStepWithBudget(alloc, "fixer", mode, writable_override orelse true, permission_mode, task, start_ms, timeout_seconds, model, &step_out);
 
             out.appendSlice(alloc, "{\"role\":\"fixer\",\"output\":\"") catch return;
             mj.writeEscaped(alloc, out, step_out.items);

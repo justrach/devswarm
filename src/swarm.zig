@@ -61,8 +61,8 @@ const WorkerArgs = struct {
     worker: *Worker,
     writable: bool,
     metrics: *telemetry.WorkerMetrics,
-    model: ?[]const u8 = null, // explicit model override (null = auto-resolve)
-    mode: ?[]const u8 = null,  // explicit mode override (null = "smart")
+    model: ?[]const u8 = null,
+    mode: ?[]const u8 = null,
 };
 
 fn workerFn(args: *WorkerArgs) void {
@@ -160,6 +160,7 @@ pub fn runSwarm(
     telemetry_out: ?[]const u8,
     model: ?[]const u8,
     mode: ?[]const u8,
+    per_agent_model: ?*const std.json.ObjectMap,
 ) void {
     const cap: usize = @min(max_agents, HARD_MAX);
 
@@ -312,13 +313,21 @@ pub fn runSwarm(
             .string => |s| s,
             else => "agent",
         };
+        const worker_model: ?[]const u8 = blk: {
+            if (per_agent_model) |pam| {
+                if (pam.get(role_str)) |v| {
+                    if (v == .string) break :blk v.string;
+                }
+            }
+            break :blk model;
+        };
         worker_metrics[count] = telemetry.WorkerMetrics.init(@intCast(count), role_str, "claude-sonnet-4-6");
         workers[count] = .{
             .id = @intCast(count),
             .role = role_str,
             .prompt = base,
         };
-        worker_args[count] = .{ .worker = &workers[count], .writable = writable, .metrics = &worker_metrics[count], .model = model, .mode = mode };
+        worker_args[count] = .{ .worker = &workers[count], .writable = writable, .metrics = &worker_metrics[count], .model = worker_model, .mode = mode };
         threads[count] = std.Thread.spawn(.{}, workerFn, .{&worker_args[count]}) catch null;
         count += 1;
     }
