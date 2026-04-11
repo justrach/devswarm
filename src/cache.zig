@@ -1,8 +1,3 @@
-// gitagent-mcp — Session cache
-//
-// Prefetches labels and milestones once per MCP session and keeps them available
-// to all handlers for quicker, deterministic behavior.
-
 const std = @import("std");
 const gh = @import("gh.zig");
 
@@ -36,288 +31,302 @@ pub const Milestone = struct {
     state: []const u8,
 };
 
-var g_mu: std.Thread.Mutex = .{};
-var g_ready: bool = false;
-var g_has_data: bool = false;
-var g_labels: std.ArrayList(Label) = .empty;
-var g_milestones: std.ArrayList(Milestone) = .empty;
-var g_alloc: std.mem.Allocator = undefined;
+pub const CacheState = struct {
+    mu: std.Thread.Mutex = .{},
+    ready: bool = false,
+    has_data: bool = false,
+    labels: std.ArrayList(Label) = .empty,
+    milestones: std.ArrayList(Milestone) = .empty,
+    alloc: std.mem.Allocator = undefined,
 
-fn clearCachedData() void {
-    for (g_labels.items) |lbl| {
-        g_alloc.free(lbl.name);
-        g_alloc.free(lbl.color);
-        g_alloc.free(lbl.description);
+    pub fn init() CacheState {
+        return .{};
     }
-    g_labels.clearAndFree(g_alloc);
 
-    for (g_milestones.items) |ms| {
-        g_alloc.free(ms.title);
-        g_alloc.free(ms.state);
+    pub fn deinit(self: *CacheState) void {
+        self.clearCachedData();
     }
-    g_milestones.clearAndFree(g_alloc);
-}
 
-fn labelExists(name: []const u8) bool {
-    for (g_labels.items) |lbl| {
-        if (std.mem.eql(u8, lbl.name, name)) return true;
+    fn clearCachedData(self: *CacheState) void {
+        for (self.labels.items) |lbl| {
+            self.alloc.free(lbl.name);
+            self.alloc.free(lbl.color);
+            self.alloc.free(lbl.description);
+        }
+        self.labels.clearAndFree(self.alloc);
+
+        for (self.milestones.items) |ms| {
+            self.alloc.free(ms.title);
+            self.alloc.free(ms.state);
+        }
+        self.milestones.clearAndFree(self.alloc);
     }
-    return false;
-}
 
-fn milestoneExists(title: []const u8) bool {
-    for (g_milestones.items) |ms| {
-        if (std.mem.eql(u8, ms.title, title)) return true;
+    fn labelExists(self: *const CacheState, name: []const u8) bool {
+        for (self.labels.items) |lbl| {
+            if (std.mem.eql(u8, lbl.name, name)) return true;
+        }
+        return false;
     }
-    return false;
-}
 
-fn createMissingLabels(alloc: std.mem.Allocator) void {
-    for (default_labels) |label| {
-        if (labelExists(label.name)) continue;
+    fn milestoneExists(self: *const CacheState, title: []const u8) bool {
+        for (self.milestones.items) |ms| {
+            if (std.mem.eql(u8, ms.title, title)) return true;
+        }
+        return false;
+    }
 
-        const create_r = gh.run(alloc, &.{
-            "gh", "label", "create", label.name,
-            "--color", label.color,
-            "--description", label.description,
+    fn createMissingLabels(self: *CacheState, alloc: std.mem.Allocator) void {
+        for (default_labels) |label| {
+            if (self.labelExists(label.name)) continue;
+
+            const create_r = gh.run(alloc, &.{
+                "gh", "label", "create", label.name,
+                "--color", label.color,
+                "--description", label.description,
+            }) catch null;
+            if (create_r == null) continue;
+
+            defer create_r.?.deinit(alloc);
+            self.appendLabel(alloc, label.name, label.color, label.description) catch continue;
+        }
+    }
+
+    fn appendLabel(self: *CacheState, alloc: std.mem.Allocator, name: []const u8, color: []const u8, description: []const u8) !void {
+        const name_owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(name_owned);
+
+        const color_owned = try alloc.dupe(u8, color);
+        errdefer alloc.free(color_owned);
+
+        const desc_owned = try alloc.dupe(u8, description);
+        errdefer alloc.free(desc_owned);
+
+        try self.labels.append(alloc, .{
+            .name = name_owned,
+            .color = color_owned,
+            .description = desc_owned,
+        });
+    }
+
+    fn appendMilestone(self: *CacheState, alloc: std.mem.Allocator, number: u32, title: []const u8, state: []const u8) !void {
+        const title_owned = try alloc.dupe(u8, title);
+        errdefer alloc.free(title_owned);
+
+        const state_owned = try alloc.dupe(u8, state);
+        errdefer alloc.free(state_owned);
+
+        try self.milestones.append(alloc, .{
+            .number = number,
+            .title = title_owned,
+            .state = state_owned,
+        });
+    }
+
+    pub fn prefetch(self: *CacheState, alloc: std.mem.Allocator) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (self.ready) return;
+        self.alloc = alloc;
+
+        var labels_ok = false;
+        const labels_r = gh.run(alloc, &.{
+            "gh", "label", "list",
+            "--json", "name,color,description",
+            "--limit", "100",
         }) catch null;
-        if (create_r == null) continue;
+        if (labels_r) |r| {
+            defer r.deinit(alloc);
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, r.stdout, .{}) catch null;
+            if (parsed) |p| {
+                defer p.deinit();
+                if (p.value == .array) {
+                    for (p.value.array.items) |item| {
+                        if (item != .object) continue;
 
-        defer create_r.?.deinit(alloc);
-        appendLabel(alloc, label.name, label.color, label.description);
+                        const name = if (item.object.get("name")) |v| if (v == .string) v.string else continue else continue;
+                        const color = if (item.object.get("color")) |v| if (v == .string) v.string else "" else "";
+                        const desc = if (item.object.get("description")) |v| if (v == .string) v.string else "" else "";
+                        self.appendLabel(alloc, name, color, desc) catch continue;
+                    }
+                }
+            }
+
+            self.createMissingLabels(alloc);
+            labels_ok = true;
+        }
+
+        var milestones_ok = false;
+        const milestones_r = gh.run(alloc, &.{
+            "gh", "milestone", "list",
+            "--json", "number,title,state",
+            "--state", "all",
+        }) catch null;
+        if (milestones_r) |r| {
+            defer r.deinit(alloc);
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, r.stdout, .{}) catch null;
+            if (parsed) |p| {
+                defer p.deinit();
+                if (p.value == .array) {
+                    for (p.value.array.items) |item| {
+                        if (item != .object) continue;
+
+                        const number: u32 = blk: {
+                            const val = item.object.get("number") orelse continue;
+                            break :blk switch (val) {
+                                .integer => |i| if (i <= 0) continue else @as(u32, @intCast(i)),
+                                else => continue,
+                            };
+                        };
+                        const title = blk: {
+                            const val = item.object.get("title") orelse continue;
+                            break :blk switch (val) {
+                                .string => val.string,
+                                else => continue,
+                            };
+                        };
+                        const state = blk: {
+                            const val = item.object.get("state") orelse continue;
+                            break :blk switch (val) {
+                                .string => val.string,
+                                else => "",
+                            };
+                        };
+
+                        if (self.milestoneExists(title)) continue;
+                        self.appendMilestone(alloc, number, title, state) catch continue;
+                    }
+                }
+            }
+            milestones_ok = true;
+        }
+
+        if (!labels_ok or !milestones_ok) {
+            self.clearCachedData();
+            self.ready = false;
+            self.has_data = false;
+            return;
+        }
+
+        self.ready = true;
+        self.has_data = true;
     }
-}
 
-fn appendLabel(alloc: std.mem.Allocator, name: []const u8, color: []const u8, description: []const u8) void {
-    const name_owned = alloc.dupe(u8, name) catch return;
-    errdefer alloc.free(name_owned);
+    pub fn getLabel(self: *CacheState, name: []const u8) ?Label {
+        self.mu.lock();
+        defer self.mu.unlock();
 
-    const color_owned = alloc.dupe(u8, color) catch return;
-    errdefer alloc.free(color_owned);
+        if (!self.ready) return null;
+        for (self.labels.items) |lbl| {
+            if (std.mem.eql(u8, lbl.name, name)) return lbl;
+        }
+        return null;
+    }
 
-    const desc_owned = alloc.dupe(u8, description) catch return;
-    errdefer alloc.free(desc_owned);
+    pub fn getMilestone(self: *CacheState, title: []const u8) ?Milestone {
+        self.mu.lock();
+        defer self.mu.unlock();
 
-    g_labels.append(alloc, .{
-        .name = name_owned,
-        .color = color_owned,
-        .description = desc_owned,
-    }) catch {
-        alloc.free(name_owned);
-        alloc.free(color_owned);
-        alloc.free(desc_owned);
-    };
-}
+        if (!self.ready) return null;
+        for (self.milestones.items) |ms| {
+            if (std.mem.eql(u8, ms.title, title)) return ms;
+        }
+        return null;
+    }
 
-fn appendMilestone(alloc: std.mem.Allocator, number: u32, title: []const u8, state: []const u8) void {
-    const title_owned = alloc.dupe(u8, title) catch return;
-    errdefer alloc.free(title_owned);
+    pub fn isReady(self: *const CacheState) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.ready;
+    }
 
-    const state_owned = alloc.dupe(u8, state) catch return;
-    errdefer alloc.free(state_owned);
+    pub fn invalidate(self: *CacheState) void {
+        self.mu.lock();
+        defer self.mu.unlock();
 
-    g_milestones.append(alloc, .{
-        .number = number,
-        .title = title_owned,
-        .state = state_owned,
-    }) catch {
-        alloc.free(title_owned);
-        alloc.free(state_owned);
-    };
-}
+        self.ready = false;
+        if (!self.has_data) return;
 
-/// Called once on notifications/initialized. Fetches labels + milestones.
-/// Subsequent calls are no-ops (guarded by g_ready).
+        self.clearCachedData();
+
+        self.has_data = false;
+    }
+};
+
+var g_state: CacheState = .{};
+
 pub fn prefetch(alloc: std.mem.Allocator) void {
-    g_mu.lock();
-    defer g_mu.unlock();
-
-    if (g_ready) return;
-    g_alloc = alloc;
-
-    var labels_ok = false;
-    const labels_r = gh.run(alloc, &.{
-        "gh", "label", "list",
-        "--json", "name,color,description",
-        "--limit", "100",
-    }) catch null;
-    if (labels_r) |r| {
-        defer r.deinit(alloc);
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, r.stdout, .{}) catch null;
-        if (parsed) |p| {
-            defer p.deinit();
-            if (p.value == .array) {
-                for (p.value.array.items) |item| {
-                    if (item != .object) continue;
-
-                    const name = if (item.object.get("name")) |v| if (v == .string) v.string else continue else continue;
-                    const color = if (item.object.get("color")) |v| if (v == .string) v.string else "" else "";
-                    const desc = if (item.object.get("description")) |v| if (v == .string) v.string else "" else "";
-                    appendLabel(alloc, name, color, desc);
-                }
-            }
-        }
-
-        createMissingLabels(alloc);
-        labels_ok = true;
-    }
-
-    var milestones_ok = false;
-    const milestones_r = gh.run(alloc, &.{
-        "gh", "milestone", "list",
-        "--json", "number,title,state",
-        "--state", "all",
-    }) catch null;
-    if (milestones_r) |r| {
-        defer r.deinit(alloc);
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, r.stdout, .{}) catch null;
-        if (parsed) |p| {
-            defer p.deinit();
-            if (p.value == .array) {
-                for (p.value.array.items) |item| {
-                    if (item != .object) continue;
-
-                    const number: u32 = blk: {
-                        const val = item.object.get("number") orelse continue;
-                        break :blk switch (val) {
-                            .integer => |i| if (i <= 0) continue else @as(u32, @intCast(i)),
-                            else => continue,
-                        };
-                    };
-                    const title = blk: {
-                        const val = item.object.get("title") orelse continue;
-                        break :blk switch (val) {
-                            .string => val.string,
-                            else => continue,
-                        };
-                    };
-                    const state = blk: {
-                        const val = item.object.get("state") orelse continue;
-                        break :blk switch (val) {
-                            .string => val.string,
-                            else => "",
-                        };
-                    };
-
-                    if (milestoneExists(title)) continue;
-                    appendMilestone(alloc, number, title, state);
-                }
-            }
-        }
-        milestones_ok = true;
-    }
-
-    if (!labels_ok or !milestones_ok) {
-        clearCachedData();
-        g_ready = false;
-        g_has_data = false;
-        return;
-    }
-
-    g_ready = true;
-    g_has_data = true;
+    g_state.prefetch(alloc);
 }
 
-/// Look up a label by name. Returns null if not in cache or cache not ready.
 pub fn getLabel(name: []const u8) ?Label {
-    g_mu.lock();
-    defer g_mu.unlock();
-
-    if (!g_ready) return null;
-    for (g_labels.items) |lbl| {
-        if (std.mem.eql(u8, lbl.name, name)) return lbl;
-    }
-    return null;
+    return g_state.getLabel(name);
 }
 
-/// Look up a milestone by title. Returns null if not found.
 pub fn getMilestone(title: []const u8) ?Milestone {
-    g_mu.lock();
-    defer g_mu.unlock();
-
-    if (!g_ready) return null;
-    for (g_milestones.items) |ms| {
-        if (std.mem.eql(u8, ms.title, title)) return ms;
-    }
-    return null;
+    return g_state.getMilestone(title);
 }
 
-/// Whether the cache has been populated.
 pub fn isReady() bool {
-    g_mu.lock();
-    defer g_mu.unlock();
-    return g_ready;
+    return g_state.isReady();
 }
 
-/// Force a refresh (e.g. after creating a new label).
 pub fn invalidate() void {
-    g_mu.lock();
-    defer g_mu.unlock();
+    g_state.invalidate();
+}
 
-    g_ready = false;
-    if (!g_has_data) return;
-
-    clearCachedData();
-
-    g_has_data = false;
+pub fn getState() *CacheState {
+    return &g_state;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "cache: isReady returns false initially, getLabel/getMilestone return null" {
-    g_alloc = std.testing.allocator;
-    g_ready = false;
-    g_has_data = false;
-    g_labels = .empty;
-    g_milestones = .empty;
+    var cs: CacheState = .{};
+    defer cs.deinit();
 
-    try std.testing.expect(!isReady());
-    try std.testing.expectEqual(@as(?Label, null), getLabel("status:backlog"));
-    try std.testing.expectEqual(@as(?Milestone, null), getMilestone("v1.0"));
+    try std.testing.expect(!cs.isReady());
+    try std.testing.expectEqual(@as(?Label, null), cs.getLabel("status:backlog"));
+    try std.testing.expectEqual(@as(?Milestone, null), cs.getMilestone("v1.0"));
 }
 
 test "cache: invalidate on clean state is safe and idempotent" {
-    g_alloc = std.testing.allocator;
-    g_ready = false;
-    g_has_data = false;
-    g_labels = .empty;
-    g_milestones = .empty;
+    var cs: CacheState = .{};
+    defer cs.deinit();
 
-    invalidate(); // must not crash or leak
-    invalidate();
-    try std.testing.expect(!isReady());
+    cs.invalidate();
+    cs.invalidate();
+    try std.testing.expect(!cs.isReady());
 }
 
 test "cache: getLabel returns entry after direct state injection" {
-    g_alloc = std.testing.allocator;
-    g_ready = false;
-    g_has_data = false;
-    g_labels = .empty;
-    g_milestones = .empty;
-    defer invalidate();
+    var cs: CacheState = .{
+        .alloc = std.testing.allocator,
+    };
+    defer cs.invalidate();
 
-    try appendLabel("status:backlog", "f6f8fa", "not started");
-    g_ready = true;
-    g_has_data = true;
+    try cs.appendLabel(std.testing.allocator, "status:backlog", "f6f8fa", "not started");
+    cs.ready = true;
+    cs.has_data = true;
 
-    const lbl = getLabel("status:backlog") orelse return error.LabelNotFound;
+    const lbl = cs.getLabel("status:backlog") orelse return error.LabelNotFound;
     try std.testing.expectEqualStrings("status:backlog", lbl.name);
     try std.testing.expectEqualStrings("f6f8fa", lbl.color);
 }
 
 test "cache: invalidate clears injected labels" {
-    g_alloc = std.testing.allocator;
-    g_ready = false;
-    g_has_data = false;
-    g_labels = .empty;
-    g_milestones = .empty;
+    var cs: CacheState = .{
+        .alloc = std.testing.allocator,
+    };
+    defer cs.deinit();
 
-    try appendLabel("status:done", "0e8a16", "complete");
-    g_ready = true;
-    g_has_data = true;
+    try cs.appendLabel(std.testing.allocator, "status:done", "0e8a16", "complete");
+    cs.ready = true;
+    cs.has_data = true;
 
-    invalidate();
+    cs.invalidate();
 
-    try std.testing.expect(!isReady());
-    try std.testing.expectEqual(@as(?Label, null), getLabel("status:done"));
+    try std.testing.expect(!cs.isReady());
+    try std.testing.expectEqual(@as(?Label, null), cs.getLabel("status:done"));
 }

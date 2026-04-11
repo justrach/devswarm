@@ -207,11 +207,12 @@ const alloc_for_save = std.heap.page_allocator;
 pub fn loadFromFile(path: []const u8, alloc: std.mem.Allocator) !CodeGraph {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
-    // Read entire file into memory, then deserialize
-    const contents = try file.readToEndAlloc(alloc, 256 * 1024 * 1024); // 256MB max
+    const contents = try file.readToEndAlloc(alloc, 256 * 1024 * 1024);
     defer alloc.free(contents);
     var stream = std.io.fixedBufferStream(contents);
-    return deserialize(stream.reader(), alloc);
+    var g = try deserialize(stream.reader(), alloc);
+    try g.rebuildIndexes();
+    return g;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
