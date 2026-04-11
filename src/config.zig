@@ -12,32 +12,32 @@ const std = @import("std");
 
 /// Per-role overrides from [agents.<role>] sections.
 pub const RoleConfig = struct {
-    model:     ?[]const u8 = null,  // model override (haiku | sonnet | opus | full ID)
-    backend:   ?[]const u8 = null,  // backend override (claude | codex | amp)
-    sandbox:   ?[]const u8 = null,  // sandbox hint (read-only | write)
-    max_turns: ?u32        = null,
+    model: ?[]const u8 = null, // model override (haiku | sonnet | opus | full ID)
+    backend: ?[]const u8 = null, // backend override (claude | codex | amp)
+    sandbox: ?[]const u8 = null, // sandbox hint (read-only | write)
+    max_turns: ?u32 = null,
 };
 
 /// Parsed representation of .devswarm/config.toml.
 pub const Config = struct {
     /// [provider] primary = "claude" | "codex" | "amp" | "auto"
-    primary:       ?[]const u8 = null,
+    primary: ?[]const u8 = null,
     /// [provider] claude_default = "sonnet" | "opus" | full model ID
     claude_default: ?[]const u8 = null,
     /// [provider] codex_default = "codex-mini-latest" | ...
-    codex_default:  ?[]const u8 = null,
+    codex_default: ?[]const u8 = null,
     /// [agents.<role>] sections, keyed by role name (owned strings)
     roles: std.StringHashMap(RoleConfig),
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
-        if (self.primary)        |p| alloc.free(p);
+        if (self.primary) |p| alloc.free(p);
         if (self.claude_default) |d| alloc.free(d);
-        if (self.codex_default)  |d| alloc.free(d);
+        if (self.codex_default) |d| alloc.free(d);
         var it = self.roles.iterator();
         while (it.next()) |e| {
             alloc.free(e.key_ptr.*);
             const rc = e.value_ptr;
-            if (rc.model)   |v| alloc.free(v);
+            if (rc.model) |v| alloc.free(v);
             if (rc.backend) |v| alloc.free(v);
             if (rc.sandbox) |v| alloc.free(v);
         }
@@ -91,9 +91,9 @@ fn parse(alloc: std.mem.Allocator, text: []const u8) !Config {
 
         // Key = value
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key   = std.mem.trim(u8, line[0..eq],    " \t");
-        const raw_v = std.mem.trim(u8, line[eq + 1..], " \t");
-        const val   = stripQuotes(raw_v);
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const raw_v = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        const val = stripQuotes(stripInlineComment(raw_v));
 
         try applyKV(alloc, &cfg, section, key, val);
     }
@@ -102,11 +102,11 @@ fn parse(alloc: std.mem.Allocator, text: []const u8) !Config {
 }
 
 fn applyKV(
-    alloc:   std.mem.Allocator,
-    cfg:     *Config,
+    alloc: std.mem.Allocator,
+    cfg: *Config,
     section: []const u8,
-    key:     []const u8,
-    val:     []const u8,
+    key: []const u8,
+    val: []const u8,
 ) !void {
     if (std.mem.eql(u8, section, "provider")) {
         if (std.mem.eql(u8, key, "primary")) {
@@ -140,8 +140,8 @@ fn applyKV(
 
         const rc = gop.value_ptr;
         if (std.mem.eql(u8, key, "model")) {
-            if (rc.model)   |old| alloc.free(old);
-            rc.model   = try alloc.dupe(u8, val);
+            if (rc.model) |old| alloc.free(old);
+            rc.model = try alloc.dupe(u8, val);
         } else if (std.mem.eql(u8, key, "backend")) {
             if (rc.backend) |old| alloc.free(old);
             rc.backend = try alloc.dupe(u8, val);
@@ -155,9 +155,22 @@ fn applyKV(
     }
 }
 
+/// Strip inline `# comment` suffix from a TOML value, respecting double-quoted strings.
+fn stripInlineComment(s: []const u8) []const u8 {
+    var in_quotes = false;
+    for (s, 0..) |ch, i| {
+        if (ch == '"') {
+            in_quotes = !in_quotes;
+        } else if (ch == '#' and !in_quotes) {
+            return std.mem.trimRight(u8, s[0..i], " \t");
+        }
+    }
+    return s;
+}
+
 /// Strip surrounding double or single quotes from a TOML string value.
 fn stripQuotes(s: []const u8) []const u8 {
-    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"')  return s[1 .. s.len - 1];
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
     if (s.len >= 2 and s[0] == '\'' and s[s.len - 1] == '\'') return s[1 .. s.len - 1];
     return s;
 }
@@ -224,4 +237,28 @@ test "config: loadDefault handles presence or absence of config file" {
         var c = @constCast(cfg);
         c.deinit(alloc);
     }
+}
+
+test "config: inline comments are stripped from values" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[provider]
+        \\primary = claude # my note
+    ;
+    var cfg = try parse(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqualStrings("claude", cfg.primary.?);
+}
+
+test "config: quoted values preserve # inside quotes" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[provider]
+        \\primary = "claude # not a comment"
+    ;
+    var cfg = try parse(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqualStrings("claude # not a comment", cfg.primary.?);
 }

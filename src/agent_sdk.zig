@@ -13,9 +13,7 @@
 //   {"type":"result","subtype":"success","result":"<final text>",...}
 
 const std = @import("std");
-const mj  = @import("mcp").json;
 
-/// Options for a Claude agent run via `claude -p`.
 /// Options for a Claude agent run via `claude -p`.
 pub const AgentOptions = struct {
     /// Comma-separated tool allowlist, e.g. "Bash,Read,Edit".
@@ -58,12 +56,6 @@ pub fn runAgent(
 
 /// Attempts to run the turn via `claude -p`. Returns false when claude is
 /// unavailable so the caller can fall back to codex_appserver.
-/// Attempts to run the turn via `claude -p`. Returns false when claude is
-/// unavailable so the caller can fall back to codex_appserver.
-/// Attempts to run the turn via `claude -p`. Returns false when claude is
-/// unavailable so the caller can fall back to codex_appserver.
-/// Attempts to run the turn via `claude -p`. Returns false when claude is
-/// unavailable so the caller can fall back to codex_appserver.
 pub fn tryClaudeAgent(
     alloc: std.mem.Allocator,
     prompt: []const u8,
@@ -83,25 +75,39 @@ pub fn tryClaudeAgent(
     // Build argv in a fixed-size stack buffer (22 slots is sufficient).
     var argv_buf: [22][]const u8 = undefined;
     var argc: usize = 0;
-    argv_buf[argc] = "claude";            argc += 1;
-    argv_buf[argc] = "-p";               argc += 1;
-    argv_buf[argc] = prompt;             argc += 1;
-    argv_buf[argc] = "--output-format";  argc += 1;
-    argv_buf[argc] = "stream-json";      argc += 1;
-    argv_buf[argc] = "--verbose";        argc += 1;
-    argv_buf[argc] = "--permission-mode"; argc += 1;
-    argv_buf[argc] = perm_mode;           argc += 1;
-    argv_buf[argc] = "--model";          argc += 1;
-    argv_buf[argc] = model;              argc += 1;
+    argv_buf[argc] = "claude";
+    argc += 1;
+    argv_buf[argc] = "-p";
+    argc += 1;
+    argv_buf[argc] = prompt;
+    argc += 1;
+    argv_buf[argc] = "--output-format";
+    argc += 1;
+    argv_buf[argc] = "stream-json";
+    argc += 1;
+    argv_buf[argc] = "--verbose";
+    argc += 1;
+    argv_buf[argc] = "--permission-mode";
+    argc += 1;
+    argv_buf[argc] = perm_mode;
+    argc += 1;
+    argv_buf[argc] = "--model";
+    argc += 1;
+    argv_buf[argc] = model;
+    argc += 1;
 
     if (opts.reasoning_effort) |effort| {
-        argv_buf[argc] = "--reasoning-effort"; argc += 1;
-        argv_buf[argc] = effort;               argc += 1;
+        argv_buf[argc] = "--reasoning-effort";
+        argc += 1;
+        argv_buf[argc] = effort;
+        argc += 1;
     }
 
     if (opts.allowed_tools) |at| {
-        argv_buf[argc] = "--allowedTools"; argc += 1;
-        argv_buf[argc] = at;               argc += 1;
+        argv_buf[argc] = "--allowedTools";
+        argc += 1;
+        argv_buf[argc] = at;
+        argc += 1;
     }
 
     // Inherit environment but strip CLAUDECODE (nested-session guard) and
@@ -113,10 +119,10 @@ pub fn tryClaudeAgent(
 
     // ── Option 1: direct spawn ────────────────────────────────────────────────
     var child = std.process.Child.init(argv_buf[0..argc], alloc);
-    child.stdin_behavior  = .Close;
+    child.stdin_behavior = .Close;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Close;
-    child.env_map         = &env_map;
+    child.env_map = &env_map;
     if (opts.cwd) |cwd| child.cwd = cwd;
 
     if (child.spawn()) |_| {
@@ -125,7 +131,9 @@ pub fn tryClaudeAgent(
         const proc_out = child.stdout orelse return false;
         streamClaudeOutput(alloc, proc_out, out);
         return true;
-    } else |_| {}
+    } else |err| {
+        std.log.warn("agent_sdk: spawn failed: {s}", .{@errorName(err)});
+    }
 
     // ── Option 2: login shell fallback ────────────────────────────────────────
     // Direct spawn failed — claude not on the trimmed PATH seen by this process.
@@ -153,10 +161,10 @@ pub fn tryClaudeAgent(
 
     const argv2 = [_][]const u8{ shell, "-lc", shell_cmd.items };
     var child2 = std.process.Child.init(&argv2, alloc);
-    child2.stdin_behavior  = .Close;
+    child2.stdin_behavior = .Close;
     child2.stdout_behavior = .Pipe;
     child2.stderr_behavior = .Close;
-    child2.env_map         = &env_map;
+    child2.env_map = &env_map;
     if (opts.cwd) |cwd| child2.cwd = cwd;
 
     child2.spawn() catch return false;
@@ -168,9 +176,6 @@ pub fn tryClaudeAgent(
     return true;
 }
 
-/// Reads NDJSON from `claude -p --output-format stream-json`.
-/// Extracts the agent's final text from the `{"type":"result"}` event.
-/// Falls back to accumulated assistant-message text if no result event arrives.
 /// Reads NDJSON from `claude -p --output-format stream-json`.
 /// Extracts the agent's final text from the `{"type":"result"}` event.
 /// Falls back to accumulated assistant-message text if no result event arrives.
@@ -197,7 +202,8 @@ fn streamClaudeOutput(
     // Append cumulative usage marker for telemetry extraction
     if (total_in > 0 or total_out > 0) {
         var buf: [128]u8 = undefined;
-        const marker = std.fmt.bufPrint(&buf,
+        const marker = std.fmt.bufPrint(
+            &buf,
             "\n__USAGE__:tokens_in={d},tokens_out={d}",
             .{ total_in, total_out },
         ) catch "";
@@ -211,27 +217,48 @@ fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
     var buf: [4096]u8 = undefined;
     var line: std.ArrayList(u8) = .empty;
     while (true) {
-        const n = file.read(&buf) catch { line.deinit(alloc); return null; };
+        const n = file.read(&buf) catch {
+            line.deinit(alloc);
+            return null;
+        };
         if (n == 0) {
-            if (line.items.len == 0) { line.deinit(alloc); return null; }
-            return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+            if (line.items.len == 0) {
+                line.deinit(alloc);
+                return null;
+            }
+            return line.toOwnedSlice(alloc) catch {
+                line.deinit(alloc);
+                return null;
+            };
         }
         // Scan the chunk for newline
         for (buf[0..n], 0..) |byte, i| {
             if (byte == '\n') {
                 // Append everything before the newline
-                line.appendSlice(alloc, buf[0..i]) catch { line.deinit(alloc); return null; };
+                line.appendSlice(alloc, buf[0..i]) catch {
+                    line.deinit(alloc);
+                    return null;
+                };
                 // Seek back to just after the newline so next read picks up there
                 const leftover = n - i - 1;
                 if (leftover > 0) {
                     file.seekBy(-@as(i64, @intCast(leftover))) catch {};
                 }
-                return line.toOwnedSlice(alloc) catch { line.deinit(alloc); return null; };
+                return line.toOwnedSlice(alloc) catch {
+                    line.deinit(alloc);
+                    return null;
+                };
             }
         }
         // No newline found — append entire chunk and keep reading
-        line.appendSlice(alloc, buf[0..n]) catch { line.deinit(alloc); return null; };
-        if (line.items.len > 8 * 1024 * 1024) { line.deinit(alloc); return null; }
+        line.appendSlice(alloc, buf[0..n]) catch {
+            line.deinit(alloc);
+            return null;
+        };
+        if (line.items.len > 8 * 1024 * 1024) {
+            line.deinit(alloc);
+            return null;
+        }
     }
 }
 
@@ -353,7 +380,6 @@ fn stripCodexEnv(alloc: std.mem.Allocator, env: *std.process.EnvMap) void {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
-
 
 test "agent_sdk: parseClaudeLine extracts result text" {
     const alloc = std.testing.allocator;
@@ -523,7 +549,7 @@ test "agent_sdk: streamClaudeOutput extracts result via pipe" {
     const alloc = std.testing.allocator;
 
     const pipe = try std.posix.pipe();
-    const read_fd  = std.fs.File{ .handle = pipe[0] };
+    const read_fd = std.fs.File{ .handle = pipe[0] };
     const write_fd = std.fs.File{ .handle = pipe[1] };
 
     const ndjson =
@@ -547,12 +573,10 @@ test "agent_sdk: streamClaudeOutput falls back to accumulated when no result eve
     const alloc = std.testing.allocator;
 
     const pipe = try std.posix.pipe();
-    const read_fd  = std.fs.File{ .handle = pipe[0] };
+    const read_fd = std.fs.File{ .handle = pipe[0] };
     const write_fd = std.fs.File{ .handle = pipe[1] };
 
-    _ = try write_fd.write(
-        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"fallback text\"}]},\"session_id\":\"s1\"}\n"
-    );
+    _ = try write_fd.write("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"fallback text\"}]},\"session_id\":\"s1\"}\n");
     write_fd.close();
 
     var out: std.ArrayList(u8) = .empty;
@@ -568,7 +592,7 @@ test "agent_sdk: readLine reads lines delimited by newline" {
     const alloc = std.testing.allocator;
 
     const pipe = try std.posix.pipe();
-    const read_fd  = std.fs.File{ .handle = pipe[0] };
+    const read_fd = std.fs.File{ .handle = pipe[0] };
     const write_fd = std.fs.File{ .handle = pipe[1] };
 
     _ = try write_fd.write("hello\nworld\n");
@@ -589,7 +613,7 @@ test "agent_sdk: readLine returns partial content on EOF without trailing newlin
     const alloc = std.testing.allocator;
 
     const pipe = try std.posix.pipe();
-    const read_fd  = std.fs.File{ .handle = pipe[0] };
+    const read_fd = std.fs.File{ .handle = pipe[0] };
     const write_fd = std.fs.File{ .handle = pipe[1] };
 
     _ = try write_fd.write("no newline at end");
@@ -605,7 +629,7 @@ test "agent_sdk: readLine returns null on immediate EOF" {
     const alloc = std.testing.allocator;
 
     const pipe = try std.posix.pipe();
-    const read_fd  = std.fs.File{ .handle = pipe[0] };
+    const read_fd = std.fs.File{ .handle = pipe[0] };
     const write_fd = std.fs.File{ .handle = pipe[1] };
 
     write_fd.close();
@@ -617,7 +641,7 @@ test "agent_sdk: readLine handles lines spanning read boundary" {
     const alloc = std.testing.allocator;
 
     const pipe = try std.posix.pipe();
-    const read_fd  = std.fs.File{ .handle = pipe[0] };
+    const read_fd = std.fs.File{ .handle = pipe[0] };
     const write_fd = std.fs.File{ .handle = pipe[1] };
 
     // Two lines: first is 5000 bytes (exceeds 4096 internal buffer), second is short
@@ -648,7 +672,8 @@ test "integration: agent_sdk round-trip — haiku replies to a simple prompt" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
-    runAgent(alloc,
+    runAgent(
+        alloc,
         "Reply with exactly the text TRANSPORT_OK and nothing else.",
         .{ .model = "haiku" },
         &out,
@@ -671,7 +696,7 @@ test "integration: agent_sdk model param is forwarded" {
     var out2: std.ArrayList(u8) = .empty;
     defer out2.deinit(alloc);
 
-    runAgent(alloc, "Reply with exactly: HAIKU_RESPONSE",  .{ .model = "haiku"  }, &out1);
+    runAgent(alloc, "Reply with exactly: HAIKU_RESPONSE", .{ .model = "haiku" }, &out1);
     runAgent(alloc, "Reply with exactly: SONNET_RESPONSE", .{ .model = "sonnet" }, &out2);
 
     if (out1.items.len == 0 and out2.items.len == 0) return; // soft skip
