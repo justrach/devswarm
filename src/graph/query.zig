@@ -41,29 +41,25 @@ pub fn symbolAt(
     line: u32,
     alloc: std.mem.Allocator,
 ) ![]SymbolResult {
-    // Find the file ID for this path
-    const file_id = findFileId(g, file_path) orelse return &.{};
+    const file_id = g.findFileByPath(file_path) orelse return &.{};
 
-    // Collect symbols at this file + line
     var results: std.ArrayList(SymbolResult) = .empty;
     defer results.deinit(alloc);
 
-    var sym_it = g.symbols.iterator();
-    while (sym_it.next()) |entry| {
-        const sym = entry.value_ptr.*;
-        if (sym.file_id == file_id and sym.line == line) {
+    const file_syms = g.symbolsInFile(file_id);
+    for (file_syms) |sid| {
+        const sym = g.getSymbol(sid) orelse continue;
+        if (sym.line == line) {
             try results.append(alloc, makeSymbolResult(g, sym));
         }
     }
 
-    // If no exact match, find closest symbol before this line
     if (results.items.len == 0) {
         var best: ?Symbol = null;
         var best_dist: u32 = std.math.maxInt(u32);
-        sym_it = g.symbols.iterator();
-        while (sym_it.next()) |entry| {
-            const sym = entry.value_ptr.*;
-            if (sym.file_id == file_id and sym.line <= line) {
+        for (file_syms) |sid| {
+            const sym = g.getSymbol(sid) orelse continue;
+            if (sym.line <= line) {
                 const dist = line - sym.line;
                 if (dist < best_dist) {
                     best_dist = dist;
@@ -148,14 +144,6 @@ pub fn findDependents(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn findFileId(g: *const CodeGraph, path: []const u8) ?u32 {
-    var it = g.files.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.value_ptr.path, path)) return entry.key_ptr.*;
-    }
-    return null;
-}
 
 fn makeSymbolResult(g: *const CodeGraph, sym: Symbol) SymbolResult {
     const file_path = if (g.getFile(sym.file_id)) |f| f.path else "";
