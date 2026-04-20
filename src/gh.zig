@@ -189,3 +189,85 @@ pub fn errorMessage(err: GhError) []const u8 {
         GhError.Unexpected       => "Unexpected gh error",
     };
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+test "classifyError: auth required" {
+    try std.testing.expectEqual(GhError.AuthRequired, classifyError("error: not logged in"));
+    try std.testing.expectEqual(GhError.AuthRequired, classifyError("authentication failed"));
+    try std.testing.expectEqual(GhError.AuthRequired, classifyError("GITHUB_TOKEN not set"));
+}
+
+test "classifyError: not found" {
+    try std.testing.expectEqual(GhError.NotFound, classifyError("resource not found"));
+    try std.testing.expectEqual(GhError.NotFound, classifyError("Could not resolve host"));
+    try std.testing.expectEqual(GhError.NotFound, classifyError("No such repository"));
+}
+
+test "classifyError: rate limited" {
+    try std.testing.expectEqual(GhError.RateLimited, classifyError("rate limit exceeded"));
+    try std.testing.expectEqual(GhError.RateLimited, classifyError("HTTP 429 Too Many Requests"));
+    try std.testing.expectEqual(GhError.RateLimited, classifyError("secondary rate limit"));
+}
+
+test "classifyError: permission denied" {
+    try std.testing.expectEqual(GhError.PermissionDenied, classifyError("403 Forbidden"));
+    try std.testing.expectEqual(GhError.PermissionDenied, classifyError("permission denied"));
+    try std.testing.expectEqual(GhError.PermissionDenied, classifyError("forbidden"));
+}
+
+test "classifyError: unexpected for unknown" {
+    try std.testing.expectEqual(GhError.Unexpected, classifyError("something went wrong"));
+    try std.testing.expectEqual(GhError.Unexpected, classifyError(""));
+    try std.testing.expectEqual(GhError.Unexpected, classifyError("unknown error occurred"));
+}
+
+test "classifyError: priority — auth beats not-found" {
+    try std.testing.expectEqual(GhError.AuthRequired, classifyError("not logged in, not found"));
+}
+
+test "classifyError: priority — not-found beats rate-limit" {
+    try std.testing.expectEqual(GhError.NotFound, classifyError("not found rate limit"));
+}
+
+test "errorMessage: all variants return non-empty" {
+    const errors = [_]GhError{
+        GhError.AuthRequired,
+        GhError.NotFound,
+        GhError.RateLimited,
+        GhError.PermissionDenied,
+        GhError.MalformedOutput,
+        GhError.SpawnFailed,
+        GhError.OutOfMemory,
+        GhError.Unexpected,
+    };
+    for (errors) |err| {
+        try std.testing.expect(errorMessage(err).len > 0);
+    }
+}
+
+test "errorMessage: specific strings" {
+    try std.testing.expectEqualStrings("GitHub auth required. Run: gh auth login", errorMessage(GhError.AuthRequired));
+    try std.testing.expectEqualStrings("Resource not found on GitHub", errorMessage(GhError.NotFound));
+    try std.testing.expectEqualStrings("Unexpected gh error", errorMessage(GhError.Unexpected));
+}
+
+test "containsAny: basic matching" {
+    try std.testing.expect(containsAny("hello world", &.{ "world", "foo" }));
+    try std.testing.expect(containsAny("hello world", &.{ "foo", "hello" }));
+    try std.testing.expect(!containsAny("hello world", &.{ "foo", "bar" }));
+}
+
+test "containsAny: empty inputs" {
+    try std.testing.expect(!containsAny("", &.{"something"}));
+    try std.testing.expect(!containsAny("hello", &.{}));
+    try std.testing.expect(!containsAny("", &.{}));
+}
+
+test "GhResult.deinit frees memory" {
+    const alloc = std.testing.allocator;
+    const stdout = try alloc.dupe(u8, "output");
+    const stderr = try alloc.dupe(u8, "error");
+    const result = GhResult{ .stdout = stdout, .stderr = stderr, .exit_code = 0 };
+    result.deinit(alloc);
+}
