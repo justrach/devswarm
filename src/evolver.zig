@@ -272,6 +272,117 @@ pub const Archive = struct {
     }
 };
 
+// ── Blast-radius fitness (#151) ───────────────────────────────────────────────
+//
+// Parses a unified diff to find changed files and symbols, then measures how
+// many other files reference those symbols (blast radius). Organisms that
+// touch only what they need score 1.0; sprawling changes score lower.
+
+const search = @import("search.zig");
+
+/// Extract file paths from `diff --git` lines.
+pub fn parseDiffFiles(alloc: std.mem.Allocator, diff_text: []const u8) std.ArrayList([]const u8) {
+    var result: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, diff_text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "diff --git ")) {
+            if (search.extractFilePath(line)) |path| {
+                for (result.items) |existing| {
+                    if (std.mem.eql(u8, existing, path)) break;
+                } else {
+                    result.append(alloc, path) catch {};
+                }
+            }
+        }
+    }
+    return result;
+}
+
+/// Extract symbol names from hunk headers and changed lines.
+pub fn parseDiffSymbols(alloc: std.mem.Allocator, diff_text: []const u8) std.ArrayList([]const u8) {
+    var result: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, diff_text, '\n');
+    while (lines.next()) |line| {
+        const sym = blk: {
+            if (std.mem.startsWith(u8, line, "@@")) {
+                break :blk search.extractHunkSymbol(line);
+            }
+            if (line.len > 1 and (line[0] == '+' or line[0] == '-') and line[1] != '+' and line[1] != '-') {
+                break :blk search.extractIdentifierFromContext(line[1..]);
+            }
+            break :blk null;
+        };
+        if (sym) |s| {
+            for (result.items) |existing| {
+                if (std.mem.eql(u8, existing, s)) break;
+            } else {
+                result.append(alloc, s) catch {};
+            }
+        }
+    }
+    return result;
+}
+
+/// Compute blast-radius score from touched files and blast files.
+///   score = 1.0 - (unrelated_blast / total_blast)   clamped to [0,1]
+/// Returns 1.0 when blast_files is empty (no external references).
+pub fn computeBlastScore(touched_files: []const []const u8, blast_files: []const []const u8) f64 {
+    if (blast_files.len == 0) return 1.0;
+
+    var unrelated: u32 = 0;
+    for (blast_files) |bf| {
+        var is_touched = false;
+        for (touched_files) |tf| {
+            if (std.mem.eql(u8, bf, tf)) {
+                is_touched = true;
+                break;
+            }
+        }
+        if (!is_touched) unrelated += 1;
+    }
+
+    const score = 1.0 - @as(f64, @floatFromInt(unrelated)) / @as(f64, @floatFromInt(blast_files.len));
+    return @max(0.0, @min(1.0, score));
+}
+
+/// Full blast-radius scoring: parse diff, search for references, compute score.
+/// Returns 1.0 if no symbols found (nothing to measure).
+pub fn blastRadiusScore(alloc: std.mem.Allocator, diff_text: []const u8) f64 {
+    const tool = search.probe(alloc);
+    if (tool == .none) return 1.0;
+
+    var touched = parseDiffFiles(alloc, diff_text);
+    defer touched.deinit(alloc);
+
+    var symbols = parseDiffSymbols(alloc, diff_text);
+    defer symbols.deinit(alloc);
+
+    if (symbols.items.len == 0) return 1.0;
+
+    var blast_set: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (blast_set.items) |p| alloc.free(p);
+        blast_set.deinit(alloc);
+    }
+
+    for (symbols.items) |sym| {
+        var refs = search.searchRefs(alloc, tool, sym, null) catch continue;
+        defer {
+            for (refs.items) |p| alloc.free(p);
+            refs.deinit();
+        }
+        for (refs.items) |ref_path| {
+            for (blast_set.items) |existing| {
+                if (std.mem.eql(u8, existing, ref_path)) break;
+            } else {
+                blast_set.append(alloc, alloc.dupe(u8, ref_path) catch continue) catch {};
+            }
+        }
+    }
+
+    return computeBlastScore(touched.items, blast_set.items);
+}
+
 // ── Core functions ─────────────────────────────────────────────────────────────
 
 /// Compute fitness ∈ [0, 1] from a worker's execution metrics.
@@ -792,4 +903,87 @@ test "evolver: archive sampling across multiple roles" {
         @as(?[]const u8, null),
         resolvePromptForRole(&ar, "nonexistent_role", rng),
     );
+}
+
+// ── blast-radius fitness tests (#151) ────────────────────────────────────────
+
+test "evolver: parseDiffFiles extracts unique paths" {
+    const alloc = std.testing.allocator;
+    const diff =
+        \\diff --git a/src/foo.zig b/src/foo.zig
+        \\--- a/src/foo.zig
+        \\+++ b/src/foo.zig
+        \\@@ -1,3 +1,4 @@
+        \\+pub fn bar() void {}
+        \\diff --git a/src/baz.zig b/src/baz.zig
+        \\--- a/src/baz.zig
+        \\+++ b/src/baz.zig
+        \\@@ -10,1 +10,1 @@
+        \\-old
+        \\+new
+        \\diff --git a/src/foo.zig b/src/foo.zig
+    ;
+    var files = parseDiffFiles(alloc, diff);
+    defer files.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), files.items.len);
+    try std.testing.expectEqualStrings("src/foo.zig", files.items[0]);
+    try std.testing.expectEqualStrings("src/baz.zig", files.items[1]);
+}
+
+test "evolver: parseDiffSymbols extracts from hunk headers and changed lines" {
+    const alloc = std.testing.allocator;
+    const diff =
+        \\@@ -1,3 +1,4 @@ pub fn computeScore
+        \\+pub fn bar() void {}
+        \\-const oldVar = 42;
+    ;
+    var syms = parseDiffSymbols(alloc, diff);
+    defer syms.deinit(alloc);
+    try std.testing.expect(syms.items.len >= 1);
+}
+
+test "evolver: computeBlastScore — empty blast returns 1.0" {
+    const touched = [_][]const u8{"src/foo.zig"};
+    const blast = [_][]const u8{};
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), computeBlastScore(&touched, &blast), 1e-9);
+}
+
+test "evolver: computeBlastScore — all blast files are touched" {
+    const touched = [_][]const u8{ "src/a.zig", "src/b.zig" };
+    const blast = [_][]const u8{ "src/a.zig", "src/b.zig" };
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), computeBlastScore(&touched, &blast), 1e-9);
+}
+
+test "evolver: computeBlastScore — none touched (worst case)" {
+    const touched = [_][]const u8{"src/foo.zig"};
+    const blast = [_][]const u8{ "src/x.zig", "src/y.zig", "src/z.zig" };
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), computeBlastScore(&touched, &blast), 1e-9);
+}
+
+test "evolver: computeBlastScore — partial overlap" {
+    const touched = [_][]const u8{ "src/a.zig", "src/b.zig" };
+    const blast = [_][]const u8{ "src/a.zig", "src/b.zig", "src/c.zig", "src/d.zig" };
+    // 2 unrelated out of 4 → score = 1.0 - 0.5 = 0.5
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), computeBlastScore(&touched, &blast), 1e-9);
+}
+
+test "evolver: computeBlastScore — single file, one unrelated" {
+    const touched = [_][]const u8{"src/main.zig"};
+    const blast = [_][]const u8{ "src/main.zig", "src/lib.zig" };
+    // 1 unrelated out of 2 → score = 0.5
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), computeBlastScore(&touched, &blast), 1e-9);
+}
+
+test "evolver: parseDiffFiles empty diff" {
+    const alloc = std.testing.allocator;
+    var files = parseDiffFiles(alloc, "");
+    defer files.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), files.items.len);
+}
+
+test "evolver: parseDiffSymbols empty diff" {
+    const alloc = std.testing.allocator;
+    var syms = parseDiffSymbols(alloc, "");
+    defer syms.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), syms.items.len);
 }
