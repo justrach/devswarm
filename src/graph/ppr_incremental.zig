@@ -26,6 +26,13 @@ pub const ScoredNode = struct {
     score: f32,
 };
 
+fn totalOutWeight(g: *const CodeGraph, u: u64) f32 {
+    const edges = g.outEdges(u);
+    var s: f32 = 0;
+    for (edges) |e| s += e.weight;
+    return s;
+}
+
 pub const IncrementalPpr = struct {
     scores: std.AutoHashMap(u64, f32),
     residuals: std.AutoHashMap(u64, f32),
@@ -69,13 +76,6 @@ pub const IncrementalPpr = struct {
 
     // ── Incremental update notifications ─────────────────────────────
 
-    /// Notify that an edge was added from src to dst with the given weight.
-    /// Injects residual at the source node so the next deltaUpdate propagates
-    /// the score change through the new edge.
-    /// Notify that an edge was added from src to dst with the given weight.
-    /// Injects residual at the source node so the next deltaUpdate propagates
-    /// the score change through the new edge.
-    /// Notify that an edge was added from src to dst with the given weight.
     /// Un-absorbs src's current score back to residual so that the next
     /// deltaUpdate re-pushes it through the updated edge list (including the
     /// new edge), faithfully applying the push rule:
@@ -98,15 +98,6 @@ pub const IncrementalPpr = struct {
         try self.dirty_nodes.put(src, {});
     }
 
-    /// Notify that an edge from src to dst was removed.
-    /// Marks the source node dirty so deltaUpdate can recompute its local
-    /// neighbourhood. Also redistributes the score that was flowing through
-    /// the removed edge back as residual on the source.
-    /// Notify that an edge from src to dst was removed.
-    /// Marks the source node dirty so deltaUpdate can recompute its local
-    /// neighbourhood. Also redistributes the score that was flowing through
-    /// the removed edge back as residual on the source.
-    /// Notify that an edge from src to dst was removed.
     /// Un-absorbs both src's and dst's current scores back to residual so
     /// that the next deltaUpdate re-pushes them through the updated topology,
     /// faithfully applying the push rule with no edge from src to dst.
@@ -138,13 +129,9 @@ pub const IncrementalPpr = struct {
         try self.dirty_nodes.put(dst, {});
     }
 
-    /// Notify that a file was invalidated (e.g. modified on disk).
-    /// All symbols belonging to that file are marked dirty with residual
-    /// injected based on their current scores.
-    /// Notify that a file was invalidated (e.g. modified on disk).
-    /// All symbols belonging to that file are marked dirty with residual
-    /// injected based on their current scores.
-    /// Pre-ensures capacity so the loop never leaves partial state on OOM.
+    /// Marks all symbols in the given file dirty and returns their absorbed
+    /// scores to residual for re-pushing. Pre-ensures capacity so the loop
+    /// never leaves partial state on OOM.
     pub fn onFileInvalidated(self: *IncrementalPpr, symbol_ids: []const u64) !void {
         // Pre-allocate worst-case capacity so the loop below cannot fail.
         try self.dirty_nodes.ensureUnusedCapacity(@intCast(symbol_ids.len));
@@ -206,11 +193,8 @@ pub const IncrementalPpr = struct {
             while (rit.next()) |entry| {
                 const u = entry.key_ptr.*;
                 const r_u = entry.value_ptr.*;
-                const deg = graph.outDegree(u);
-                const threshold = if (deg > 0)
-                    self.epsilon * @as(f32, @floatFromInt(deg))
-                else
-                    self.epsilon;
+                const w_out = totalOutWeight(graph, u);
+                const threshold = if (w_out > 0) self.epsilon * w_out else self.epsilon;
                 if (r_u > threshold) {
                     try to_push.append(self.alloc, u);
                 }
@@ -845,4 +829,62 @@ test "regression: edge removal - removed dst score decreases, topology reflected
     defer full1.deinit();
     try std.testing.expectEqual(@as(?f32, null), full1.get(3));
     try std.testing.expect((full1.get(2) orelse 0) > 0);
+}
+
+test "regression: weighted threshold — high-weight edge converges like batch PPR (#110)" {
+    const ppr_mod = @import("ppr.zig");
+    var g = makeTestGraph(std.testing.allocator);
+    defer g.deinit();
+
+    // 1 -> 2 with weight 10.0: W_out(1) = 10, so threshold = epsilon * 10.
+    // With degree-based threshold (epsilon * 1) too many micro-pushes fire.
+    try g.addEdge(.{ .src = 1, .dst = 2, .kind = .calls, .weight = 10.0 });
+
+    var full = try ppr_mod.pprPush(&g, 1, DEFAULT_ALPHA, DEFAULT_EPSILON, std.testing.allocator);
+    defer full.deinit();
+
+    var ippr = IncrementalPpr.init(std.testing.allocator);
+    defer ippr.deinit();
+    try ippr.residuals.put(1, 1.0);
+    try ippr.dirty_nodes.put(1, {});
+    try ippr.deltaUpdate(&g);
+
+    try std.testing.expectApproxEqAbs(full.get(1) orelse 0, ippr.getScore(1), 1e-3);
+    try std.testing.expectApproxEqAbs(full.get(2) orelse 0, ippr.getScore(2), 1e-3);
+}
+
+test "regression: incremental add then remove reflects topology (#166)" {
+    const ppr_mod = @import("ppr.zig");
+
+    var g = makeTestGraph(std.testing.allocator);
+    defer g.deinit();
+    try g.addEdge(.{ .src = 1, .dst = 2, .kind = .calls });
+
+    var full0 = try ppr_mod.pprPush(&g, 1, DEFAULT_ALPHA, DEFAULT_EPSILON, std.testing.allocator);
+    defer full0.deinit();
+
+    var ippr = try IncrementalPpr.initFromFull(full0, std.testing.allocator);
+    defer ippr.deinit();
+
+    // Add 1->3 then remove it — topology returns to original
+    try g.addEdge(.{ .src = 1, .dst = 3, .kind = .calls });
+    try ippr.onEdgeAdded(1, 3, 1.0);
+    try ippr.deltaUpdate(&g);
+
+    const s3_after_add = ippr.getScore(3);
+    try std.testing.expect(s3_after_add > 0);
+
+    // Remove 1->3 — rebuild graph without it
+    var g2 = makeTestGraph(std.testing.allocator);
+    defer g2.deinit();
+    try g2.addEdge(.{ .src = 1, .dst = 2, .kind = .calls });
+
+    try ippr.onEdgeRemoved(1, 3);
+    try ippr.deltaUpdate(&g2);
+
+    // Node 3 should lose most of its score (edge removed)
+    try std.testing.expect(ippr.getScore(3) < s3_after_add);
+    // Nodes 1 and 2 must remain positively scored
+    try std.testing.expect(ippr.getScore(1) > 0);
+    try std.testing.expect(ippr.getScore(2) > 0);
 }
