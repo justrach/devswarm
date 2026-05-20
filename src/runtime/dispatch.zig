@@ -13,14 +13,18 @@ const types = @import("types.zig");
 const Backend = types.Backend;
 const ResolvedAgent = types.ResolvedAgent;
 
+const usage = @import("usage.zig");
+
 /// Dispatch an agent run to the appropriate backend.
 /// Writes the agent's text output to `out`.
+/// Records usage for the dispatched backend.
 pub fn dispatch(
     alloc: std.mem.Allocator,
     resolved: ResolvedAgent,
     prompt: []const u8,
     out: *std.ArrayList(u8),
 ) void {
+    usage.global().record(resolved.backend);
     switch (resolved.backend) {
         .claude => spawnClaude(alloc, resolved, prompt, out),
         .codex => spawnCodex(alloc, resolved, prompt, out),
