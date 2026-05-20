@@ -272,6 +272,208 @@ pub const Archive = struct {
     }
 };
 
+// ── LearningLog ───────────────────────────────────────────────────────────────
+//
+// Append-only JSONL store of past mutation attempts and their outcomes.
+// Used by the mutator to avoid repeating failed strategies.
+
+pub const LearningLogEntry = struct {
+    organism_id: u64,
+    parent_id: ?u64,
+    generation: u32,
+    problem_hash: []const u8,
+    attempted_change: []const u8,
+    observed_outcome: []const u8,
+    fitness: f64,
+};
+
+pub const LearningLog = struct {
+    entries: std.ArrayList(LearningLogEntry),
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    max_per_problem: usize,
+
+    pub fn init(alloc: std.mem.Allocator, path: []const u8) LearningLog {
+        return .{
+            .entries = .empty,
+            .alloc = alloc,
+            .path = path,
+            .max_per_problem = 50,
+        };
+    }
+
+    pub fn deinit(self: *LearningLog) void {
+        for (self.entries.items) |e| {
+            self.alloc.free(e.problem_hash);
+            self.alloc.free(e.attempted_change);
+            self.alloc.free(e.observed_outcome);
+        }
+        self.entries.deinit(self.alloc);
+    }
+
+    pub fn append(self: *LearningLog, entry: LearningLogEntry) !void {
+        const owned = LearningLogEntry{
+            .organism_id = entry.organism_id,
+            .parent_id = entry.parent_id,
+            .generation = entry.generation,
+            .problem_hash = try self.alloc.dupe(u8, entry.problem_hash),
+            .attempted_change = try self.alloc.dupe(u8, entry.attempted_change),
+            .observed_outcome = try self.alloc.dupe(u8, entry.observed_outcome),
+            .fitness = entry.fitness,
+        };
+        try self.entries.append(self.alloc, owned);
+        try self.appendToFile(owned);
+    }
+
+    fn appendToFile(self: *LearningLog, entry: LearningLogEntry) !void {
+        const dir = std.fs.path.dirname(self.path);
+        if (dir) |d| std.fs.cwd().makePath(d) catch {};
+
+        const file = try std.fs.cwd().createFile(self.path, .{ .truncate = false });
+        defer file.close();
+        try file.seekFromEnd(0);
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+        try appendEntryJson(self.alloc, &buf, entry);
+        try buf.append(self.alloc, '\n');
+        try file.writeAll(buf.items);
+    }
+
+    /// Load entries from JSONL file on disk.
+    pub fn loadFromDisk(self: *LearningLog) !void {
+        const file = std.fs.cwd().openFile(self.path, .{}) catch |err| {
+            if (err == error.FileNotFound) return;
+            return err;
+        };
+        defer file.close();
+        const data = try file.readToEndAlloc(self.alloc, 8 * 1024 * 1024);
+        defer self.alloc.free(data);
+
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            self.parseLine(line) catch continue;
+        }
+    }
+
+    fn parseLine(self: *LearningLog, line: []const u8) !void {
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, line, .{});
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return,
+        };
+        const entry = LearningLogEntry{
+            .organism_id = @intCast(jInt(obj.get("organism_id") orelse return)),
+            .parent_id = blk: {
+                const pv = obj.get("parent_id") orelse break :blk null;
+                break :blk switch (pv) {
+                    .null => null,
+                    .integer => |i| @as(u64, @intCast(i)),
+                    else => null,
+                };
+            },
+            .generation = @intCast(jInt(obj.get("generation") orelse return)),
+            .problem_hash = try self.alloc.dupe(u8, jStr(obj.get("problem_hash") orelse return)),
+            .attempted_change = try self.alloc.dupe(u8, jStr(obj.get("attempted_change") orelse return)),
+            .observed_outcome = try self.alloc.dupe(u8, jStr(obj.get("observed_outcome") orelse return)),
+            .fitness = jFloat(obj.get("fitness") orelse return),
+        };
+        try self.entries.append(self.alloc, entry);
+    }
+
+    /// Return entries matching a problem hash, capped at max_per_problem.
+    pub fn queryByProblem(self: *const LearningLog, hash: []const u8, alloc: std.mem.Allocator) ![]const LearningLogEntry {
+        var results: std.ArrayList(LearningLogEntry) = .empty;
+        defer results.deinit(alloc);
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, e.problem_hash, hash)) {
+                try results.append(alloc, e);
+                if (results.items.len >= self.max_per_problem) break;
+            }
+        }
+        const out = try alloc.alloc(LearningLogEntry, results.items.len);
+        @memcpy(out, results.items);
+        return out;
+    }
+
+    /// Return ancestor chain for an organism (lineage via parent_id).
+    pub fn queryAncestors(self: *const LearningLog, organism_id: u64, alloc: std.mem.Allocator) ![]const LearningLogEntry {
+        var results: std.ArrayList(LearningLogEntry) = .empty;
+        defer results.deinit(alloc);
+        var current: ?u64 = organism_id;
+        while (current) |id| {
+            var found = false;
+            for (self.entries.items) |e| {
+                if (e.organism_id == id) {
+                    try results.append(alloc, e);
+                    current = e.parent_id;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break;
+        }
+        const out = try alloc.alloc(LearningLogEntry, results.items.len);
+        @memcpy(out, results.items);
+        return out;
+    }
+
+    /// Format entries into an LLM prompt block summarizing past failures.
+    pub fn formatForPrompt(self: *const LearningLog, hash: []const u8, alloc: std.mem.Allocator) ![]u8 {
+        const entries = try self.queryByProblem(hash, alloc);
+        defer alloc.free(entries);
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(alloc);
+
+        try buf.appendSlice(alloc, "Past attempts (do not repeat failed strategies):\n");
+        for (entries) |e| {
+            try buf.appendSlice(alloc, "- Generation ");
+            var num_buf: [16]u8 = undefined;
+            const gen_s = std.fmt.bufPrint(&num_buf, "{d}", .{e.generation}) catch continue;
+            try buf.appendSlice(alloc, gen_s);
+            try buf.appendSlice(alloc, ": ");
+            const change_limit = @min(e.attempted_change.len, 80);
+            try buf.appendSlice(alloc, e.attempted_change[0..change_limit]);
+            try buf.appendSlice(alloc, " → ");
+            const outcome_limit = @min(e.observed_outcome.len, 60);
+            try buf.appendSlice(alloc, e.observed_outcome[0..outcome_limit]);
+            try buf.appendSlice(alloc, " (score: ");
+            var fit_buf: [16]u8 = undefined;
+            const fit_s = std.fmt.bufPrint(&fit_buf, "{d:.2}", .{e.fitness}) catch continue;
+            try buf.appendSlice(alloc, fit_s);
+            try buf.appendSlice(alloc, ")\n");
+        }
+
+        return try buf.toOwnedSlice(alloc);
+    }
+};
+
+fn appendEntryJson(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), e: LearningLogEntry) !void {
+    var tmp: [64]u8 = undefined;
+    try buf.appendSlice(alloc, "{\"organism_id\":");
+    try buf.appendSlice(alloc, std.fmt.bufPrint(&tmp, "{d}", .{e.organism_id}) catch return error.OutOfMemory);
+    try buf.appendSlice(alloc, ",\"parent_id\":");
+    if (e.parent_id) |p| {
+        try buf.appendSlice(alloc, std.fmt.bufPrint(&tmp, "{d}", .{p}) catch return error.OutOfMemory);
+    } else {
+        try buf.appendSlice(alloc, "null");
+    }
+    try buf.appendSlice(alloc, ",\"generation\":");
+    try buf.appendSlice(alloc, std.fmt.bufPrint(&tmp, "{d}", .{e.generation}) catch return error.OutOfMemory);
+    try buf.appendSlice(alloc, ",\"problem_hash\":\"");
+    try appendEscaped(alloc, buf, e.problem_hash);
+    try buf.appendSlice(alloc, "\",\"attempted_change\":\"");
+    try appendEscaped(alloc, buf, e.attempted_change);
+    try buf.appendSlice(alloc, "\",\"observed_outcome\":\"");
+    try appendEscaped(alloc, buf, e.observed_outcome);
+    try buf.appendSlice(alloc, "\",\"fitness\":");
+    try buf.appendSlice(alloc, std.fmt.bufPrint(&tmp, "{d:.6}", .{e.fitness}) catch return error.OutOfMemory);
+    try buf.appendSlice(alloc, "}");
+}
+
 // ── Core functions ─────────────────────────────────────────────────────────────
 
 /// Compute fitness ∈ [0, 1] from a worker's execution metrics.
@@ -792,4 +994,124 @@ test "evolver: archive sampling across multiple roles" {
         @as(?[]const u8, null),
         resolvePromptForRole(&ar, "nonexistent_role", rng),
     );
+}
+
+// ── LearningLog tests ─────────────────────────────────────────────────────────
+
+test "evolver: LearningLog append and query by problem" {
+    const alloc = std.testing.allocator;
+    const tmp = "/tmp/_learning_log_test_q.jsonl";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    var log = LearningLog.init(alloc, tmp);
+    defer log.deinit();
+
+    for (0..5) |i| {
+        try log.append(.{
+            .organism_id = i + 1,
+            .parent_id = if (i > 0) @as(?u64, i) else null,
+            .generation = @intCast(i),
+            .problem_hash = "bug-42",
+            .attempted_change = "add null check",
+            .observed_outcome = "test still fails",
+            .fitness = @as(f64, @floatFromInt(i)) * 0.1,
+        });
+    }
+    try log.append(.{
+        .organism_id = 99,
+        .parent_id = null,
+        .generation = 0,
+        .problem_hash = "other-bug",
+        .attempted_change = "unrelated",
+        .observed_outcome = "passed",
+        .fitness = 0.9,
+    });
+
+    const results = try log.queryByProblem("bug-42", alloc);
+    defer alloc.free(results);
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+}
+
+test "evolver: LearningLog ancestor query" {
+    const alloc = std.testing.allocator;
+    const tmp = "/tmp/_learning_log_test_a.jsonl";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    var log = LearningLog.init(alloc, tmp);
+    defer log.deinit();
+
+    try log.append(.{ .organism_id = 1, .parent_id = null, .generation = 0, .problem_hash = "p", .attempted_change = "a1", .observed_outcome = "o1", .fitness = 0.1 });
+    try log.append(.{ .organism_id = 2, .parent_id = 1, .generation = 1, .problem_hash = "p", .attempted_change = "a2", .observed_outcome = "o2", .fitness = 0.2 });
+    try log.append(.{ .organism_id = 3, .parent_id = 2, .generation = 2, .problem_hash = "p", .attempted_change = "a3", .observed_outcome = "o3", .fitness = 0.3 });
+    try log.append(.{ .organism_id = 99, .parent_id = null, .generation = 0, .problem_hash = "p", .attempted_change = "unrelated", .observed_outcome = "ok", .fitness = 0.5 });
+
+    const chain = try log.queryAncestors(3, alloc);
+    defer alloc.free(chain);
+    try std.testing.expectEqual(@as(usize, 3), chain.len);
+    try std.testing.expectEqual(@as(u64, 3), chain[0].organism_id);
+    try std.testing.expectEqual(@as(u64, 2), chain[1].organism_id);
+    try std.testing.expectEqual(@as(u64, 1), chain[2].organism_id);
+}
+
+test "evolver: LearningLog JSONL persistence round-trip" {
+    const alloc = std.testing.allocator;
+    const tmp = "/tmp/_learning_log_test_p.jsonl";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    {
+        var log = LearningLog.init(alloc, tmp);
+        defer log.deinit();
+        try log.append(.{ .organism_id = 10, .parent_id = null, .generation = 0, .problem_hash = "hash1", .attempted_change = "try X", .observed_outcome = "fail Y", .fitness = 0.3 });
+        try log.append(.{ .organism_id = 11, .parent_id = 10, .generation = 1, .problem_hash = "hash1", .attempted_change = "try Z", .observed_outcome = "pass", .fitness = 0.8 });
+    }
+
+    var log2 = LearningLog.init(alloc, tmp);
+    defer log2.deinit();
+    try log2.loadFromDisk();
+
+    try std.testing.expectEqual(@as(usize, 2), log2.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 10), log2.entries.items[0].organism_id);
+    try std.testing.expectEqual(@as(u64, 11), log2.entries.items[1].organism_id);
+    try std.testing.expectEqualStrings("hash1", log2.entries.items[0].problem_hash);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), log2.entries.items[1].fitness, 1e-4);
+}
+
+test "evolver: LearningLog formatForPrompt under 2000 chars for 10 entries" {
+    const alloc = std.testing.allocator;
+    const tmp = "/tmp/_learning_log_test_f.jsonl";
+    defer std.fs.cwd().deleteFile(tmp) catch {};
+
+    var log = LearningLog.init(alloc, tmp);
+    defer log.deinit();
+
+    for (0..10) |i| {
+        try log.append(.{
+            .organism_id = i + 1,
+            .parent_id = if (i > 0) @as(?u64, i) else null,
+            .generation = @intCast(i),
+            .problem_hash = "test-problem",
+            .attempted_change = "add null check on line 42 in parseToken",
+            .observed_outcome = "compile error: unused variable",
+            .fitness = @as(f64, @floatFromInt(i)) * 0.1,
+        });
+    }
+
+    const prompt = try log.formatForPrompt("test-problem", alloc);
+    defer alloc.free(prompt);
+    try std.testing.expect(prompt.len > 0);
+    try std.testing.expect(prompt.len < 2000);
+}
+
+test "evolver: LearningLog empty query returns empty" {
+    const alloc = std.testing.allocator;
+    var log = LearningLog.init(alloc, "/tmp/_nonexistent_log.jsonl");
+    defer log.deinit();
+
+    const results = try log.queryByProblem("missing", alloc);
+    defer alloc.free(results);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+
+    const ancestors = try log.queryAncestors(999, alloc);
+    defer alloc.free(ancestors);
+    try std.testing.expectEqual(@as(usize, 0), ancestors.len);
 }
