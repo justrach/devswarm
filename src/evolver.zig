@@ -63,6 +63,24 @@ pub const PromptVariant = struct {
     behavior: BehaviorDescriptor,
 };
 
+/// A code-patch organism: a candidate solution to a coding problem.
+/// Used by the Mutator / PopulationManager for evolutionary code improvement.
+pub const Organism = struct {
+    id: u64,
+    parent_id: ?u64 = null,
+    generation: u32 = 0,
+    explanation: []const u8 = "",
+    diff: []const u8 = "",
+    fitness: f64 = 0.0,
+    problem_hash: []const u8 = "",
+};
+
+/// A single test failure extracted by the Evaluator.
+pub const FailureCase = struct {
+    test_name: []const u8,
+    snippet: []const u8,
+};
+
 pub const EvaluationResult = struct {
     success: bool,
     tokens_in: u64,
@@ -269,6 +287,147 @@ pub const Archive = struct {
             };
             _ = try self.insert(v);
         }
+    }
+};
+
+// ── Mutator (#153) ────────────────────────────────────────────────────────────
+//
+// LLM-driven mutation: builds a prompt from parent organism + failure cases +
+// learning log, calls an LLM, and parses the response into a new Organism.
+// Prompt construction and response parsing are pure functions for testability.
+
+const MAX_PROMPT_LEN: usize = 12_000;
+const MAX_HISTORY_LEN: usize = 2_000;
+
+/// Build the mutation prompt from parent, failures, and learning history.
+/// All inputs are slices; no allocations needed for the template.
+pub fn buildMutationPrompt(
+    alloc: std.mem.Allocator,
+    problem: []const u8,
+    parent: *const Organism,
+    failures: []const FailureCase,
+    history: []const u8,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(alloc);
+
+    try w.writeAll("Problem:\n");
+    try w.writeAll(if (problem.len > 1000) problem[0..1000] else problem);
+    try w.writeAll("\n\nCurrent solution (parent organism):\n  Explanation: ");
+    try w.writeAll(if (parent.explanation.len > 500) parent.explanation[0..500] else parent.explanation);
+    try w.writeAll("\n  Diff:\n");
+    try w.writeAll(if (parent.diff.len > 3000) parent.diff[0..3000] else parent.diff);
+
+    if (failures.len > 0) {
+        try w.writeAll("\n\nTest failures:\n");
+        const max_failures = @min(failures.len, 5);
+        for (failures[0..max_failures]) |f| {
+            try w.writeAll("  - ");
+            try w.writeAll(f.test_name);
+            try w.writeAll(": ");
+            try w.writeAll(if (f.snippet.len > 200) f.snippet[0..200] else f.snippet);
+            try w.writeAll("\n");
+        }
+    }
+
+    if (history.len > 0) {
+        try w.writeAll("\nPast attempts that did NOT work:\n");
+        try w.writeAll(if (history.len > MAX_HISTORY_LEN) history[0..MAX_HISTORY_LEN] else history);
+        try w.writeAll("\n");
+    }
+
+    try w.writeAll(
+        \\
+        \\Your task:
+        \\1. Diagnose why the current solution fails these tests
+        \\2. Formulate a hypothesis for a better approach
+        \\3. Respond with EXACTLY this format:
+        \\
+        \\EXPLANATION:
+        \\<your explanation here>
+        \\
+        \\DIFF:
+        \\```diff
+        \\<your unified diff here>
+        \\```
+    );
+
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Parse LLM response to extract explanation and diff sections.
+/// Returns null if the response doesn't contain the expected markers.
+pub fn parseMutationResponse(response: []const u8) ?struct { explanation: []const u8, diff: []const u8 } {
+    const expl_start = std.mem.indexOf(u8, response, "EXPLANATION:") orelse return null;
+    const expl_body_start = expl_start + "EXPLANATION:".len;
+
+    const diff_marker = std.mem.indexOf(u8, response[expl_body_start..], "DIFF:") orelse return null;
+    const explanation = std.mem.trim(u8, response[expl_body_start .. expl_body_start + diff_marker], " \t\r\n");
+
+    const diff_section_start = expl_body_start + diff_marker + "DIFF:".len;
+    const diff_content = std.mem.trim(u8, response[diff_section_start..], " \t\r\n");
+
+    // Strip ```diff ... ``` wrapper if present
+    const stripped = blk: {
+        if (std.mem.startsWith(u8, diff_content, "```diff")) {
+            const inner_start = std.mem.indexOf(u8, diff_content, "\n") orelse break :blk diff_content;
+            if (std.mem.lastIndexOf(u8, diff_content, "```")) |end| {
+                if (end > inner_start) {
+                    break :blk std.mem.trim(u8, diff_content[inner_start + 1 .. end], " \t\r\n");
+                }
+            }
+            break :blk std.mem.trim(u8, diff_content[inner_start + 1 ..], " \t\r\n");
+        }
+        if (std.mem.startsWith(u8, diff_content, "```")) {
+            const inner_start = std.mem.indexOf(u8, diff_content, "\n") orelse break :blk diff_content;
+            if (std.mem.lastIndexOf(u8, diff_content, "```")) |end| {
+                if (end > inner_start) {
+                    break :blk std.mem.trim(u8, diff_content[inner_start + 1 .. end], " \t\r\n");
+                }
+            }
+        }
+        break :blk diff_content;
+    };
+
+    if (stripped.len == 0) return null;
+
+    return .{ .explanation = explanation, .diff = stripped };
+}
+
+pub const Mutator = struct {
+    model: []const u8,
+    alloc: std.mem.Allocator,
+    next_id: u64 = 1000,
+
+    pub fn init(alloc: std.mem.Allocator, model: []const u8) Mutator {
+        return .{ .model = model, .alloc = alloc };
+    }
+
+    /// Create a mutated offspring from a parent organism.
+    /// In production this calls the LLM; the prompt and parsing are testable separately.
+    pub fn mutate(
+        self: *Mutator,
+        parent: *const Organism,
+        failures: []const FailureCase,
+        log_history: []const u8,
+        problem: []const u8,
+    ) !Organism {
+        const prompt = try buildMutationPrompt(self.alloc, problem, parent, failures, log_history);
+        defer self.alloc.free(prompt);
+
+        // Placeholder: in production, this calls the LLM via agent_sdk or direct API.
+        // For now, return a skeleton organism indicating a mutation was attempted.
+        const id = self.next_id;
+        self.next_id += 1;
+        return Organism{
+            .id = id,
+            .parent_id = parent.id,
+            .generation = parent.generation + 1,
+            .explanation = "mutation pending LLM integration",
+            .diff = "",
+            .fitness = 0.0,
+            .problem_hash = parent.problem_hash,
+        };
     }
 };
 
@@ -792,4 +951,118 @@ test "evolver: archive sampling across multiple roles" {
         @as(?[]const u8, null),
         resolvePromptForRole(&ar, "nonexistent_role", rng),
     );
+}
+
+// ── Mutator tests (#153) ─────────────────────────────────────────────────────
+
+test "evolver: buildMutationPrompt contains all sections" {
+    const alloc = std.testing.allocator;
+    const parent = Organism{
+        .id = 1,
+        .explanation = "tried adding null check",
+        .diff = "--- a/foo.zig\n+++ b/foo.zig\n@@ -1 +1 @@\n-old\n+new",
+        .problem_hash = "abc",
+    };
+    const failures = [_]FailureCase{
+        .{ .test_name = "test_login", .snippet = "expected 200, got 401" },
+    };
+    const prompt = try buildMutationPrompt(alloc, "Fix the login bug", &parent, &failures, "attempt 1: failed");
+    defer alloc.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Problem:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Fix the login bug") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "null check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "test_login") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "attempt 1: failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "EXPLANATION:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "DIFF:") != null);
+}
+
+test "evolver: buildMutationPrompt truncates long inputs" {
+    const alloc = std.testing.allocator;
+    var long_problem: [2000]u8 = undefined;
+    @memset(&long_problem, 'x');
+    const parent = Organism{
+        .id = 1,
+        .explanation = "",
+        .diff = "",
+        .problem_hash = "abc",
+    };
+    const prompt = try buildMutationPrompt(alloc, &long_problem, &parent, &.{}, "");
+    defer alloc.free(prompt);
+
+    // Problem should be truncated to 1000 chars
+    try std.testing.expect(prompt.len < 2000 + 500);
+}
+
+test "evolver: buildMutationPrompt no failures or history" {
+    const alloc = std.testing.allocator;
+    const parent = Organism{ .id = 1, .problem_hash = "x" };
+    const prompt = try buildMutationPrompt(alloc, "simple fix", &parent, &.{}, "");
+    defer alloc.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Test failures:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Past attempts") == null);
+}
+
+test "evolver: parseMutationResponse valid response" {
+    const response =
+        \\EXPLANATION:
+        \\The null check was missing for the user object.
+        \\
+        \\DIFF:
+        \\```diff
+        \\--- a/src/auth.zig
+        \\+++ b/src/auth.zig
+        \\@@ -42,1 +42,2 @@
+        \\+if (user == null) return error.Unauthorized;
+        \\```
+    ;
+    const parsed = parseMutationResponse(response) orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, parsed.explanation, "null check") != null);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.diff, "--- a/src/auth.zig"));
+}
+
+test "evolver: parseMutationResponse no markers returns null" {
+    try std.testing.expect(parseMutationResponse("just some text without markers") == null);
+}
+
+test "evolver: parseMutationResponse empty diff returns null" {
+    const response =
+        \\EXPLANATION:
+        \\Something
+        \\
+        \\DIFF:
+        \\```diff
+        \\```
+    ;
+    try std.testing.expect(parseMutationResponse(response) == null);
+}
+
+test "evolver: parseMutationResponse no code fence" {
+    const response =
+        \\EXPLANATION:
+        \\Fixed the bug
+        \\
+        \\DIFF:
+        \\--- a/x.zig
+        \\+++ b/x.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    ;
+    const parsed = parseMutationResponse(response) orelse unreachable;
+    try std.testing.expect(std.mem.startsWith(u8, parsed.diff, "--- a/x.zig"));
+}
+
+test "evolver: Mutator.mutate returns child with incremented generation" {
+    const alloc = std.testing.allocator;
+    var m = Mutator.init(alloc, "claude-test");
+    const parent = Organism{ .id = 42, .generation = 3, .problem_hash = "hash1" };
+    const child = try m.mutate(&parent, &.{}, "", "fix bug");
+
+    try std.testing.expectEqual(@as(u64, 42), child.parent_id.?);
+    try std.testing.expectEqual(@as(u32, 4), child.generation);
+    try std.testing.expectEqualStrings("hash1", child.problem_hash);
+    try std.testing.expect(child.id >= 1000);
 }
