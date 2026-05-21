@@ -157,6 +157,13 @@ pub const CachedSymbol = struct {
     line: u32,
 };
 
+fn hotCachePutNoLeakOnFailure(allocator: std.mem.Allocator) !void {
+    var cache = LruCache(u32).init(allocator, 4);
+    defer cache.deinit();
+
+    try cache.put(1, 100);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "basic put and get" {
@@ -217,6 +224,10 @@ test "put updates existing key" {
 
     try std.testing.expectEqual(@as(usize, 1), cache.count());
     try std.testing.expectEqual(@as(?u32, 200), cache.get(1));
+}
+
+test "put cleans up pool entry when map.put fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hotCachePutNoLeakOnFailure, .{});
 }
 
 test "remove deletes entry" {
